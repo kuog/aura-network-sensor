@@ -7,9 +7,22 @@ pub mod report;
 use pcap::Capture;
 use etherparse::{PacketHeaders, NetHeaders, TransportHeader};
 use l3_defrag::Defragmenter;
-use l4_reassembly::{Reassembler, FlowKey};
+use l4_reassembly::Reassembler;
 use crate::protocols::dns;
 use crate::report::{AiHint, Context, Report, Telemetry};
+
+fn is_local_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ipv4) => {
+            let octets = ipv4.octets();
+            // 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12
+            (octets[0] == 10) ||
+            (octets[0] == 192 && octets[1] == 168) ||
+            (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
+        },
+        _ => false, 
+    }
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -50,10 +63,37 @@ fn main() {
                             //    continue;
                             // }
 
-                            let key = FlowKey {
-                                src: src_ip, dst: dst_ip,
-                                src_port: tcp.source_port, dst_port: tcp.destination_port,
-                            };
+                            // Determine direction for stats
+                            let is_upload = is_local_ip(&src_ip);
+                            let packet_len = full_ip_payload.len() as u64;
+
+                            // Update stats and check for Exfiltration
+                            if let Some((up, down, ratio)) = tcp_reassembler.update_stats(src_ip, dst_ip, tcp.source_port, tcp.destination_port, packet_len, is_upload) {
+                                let mut context = Context::default();
+                                context.fields.insert("src_ip".to_string(), src_ip.to_string());
+                                context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
+                                context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
+                                context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
+                                context.fields.insert("protocol".to_string(), "tcp".to_string());
+                                context.fields.insert("total_uploaded_mb".to_string(), format!("{:.2}", up as f64 / 1_000_000.0));
+                                context.fields.insert("total_downloaded_mb".to_string(), format!("{:.2}", down as f64 / 1_000_000.0));
+                                context.fields.insert("ratio".to_string(), format!("{:.2}", ratio));
+
+                                let telemetry = Telemetry {
+                                    entropy: None,
+                                    jitter: None,
+                                    ja3: None,
+                                };
+
+                                let ai_hint = AiHint {
+                                    trigger: "exfiltration".to_string(),
+                                    suspected_techniques: vec!["T1041".to_string()],
+                                    logic: "Asymmetric outbound flow detected".to_string(),
+                                };
+
+                                let report = Report::new(context, telemetry, vec![ai_hint]);
+                                println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                            }
 
                             // We need to strip the TCP header from the reassembled IP payload
                             // before adding it to the stream buffer
@@ -61,7 +101,7 @@ fn main() {
                             if full_ip_payload.len() > tcp_data_offset {
                                 let app_data = &full_ip_payload[tcp_data_offset..];
                                 
-                                if let Some((session_data, b_score)) = tcp_reassembler.add_segment(key, app_data, ts) {
+                                if let Some((session_data, b_score)) = tcp_reassembler.add_segment(src_ip, dst_ip, tcp.source_port, tcp.destination_port, app_data, ts) {
                                     
                                     let entropy = telemetry::shannon_entropy(&session_data);
                                     let port = tcp.destination_port;
