@@ -11,6 +11,7 @@ use l4_reassembly::Reassembler;
 use crate::protocols::dns;
 use crate::protocols::scan::ScannerTracker;
 use crate::protocols::arp::{ArpTracker, parse_arp};
+use crate::protocols::shell;
 use std::time::Duration;
 use crate::report::{AiHint, Context, Report, Telemetry};
 
@@ -181,6 +182,11 @@ fn main() {
                                     
                                     let entropy = telemetry::shannon_entropy(&session_data);
                                     let port = tcp.destination_port;
+
+                                    // T1059 Interactive Shell Detection
+                                    if let Some(shell_alert) = shell::detect_interactive_shell(&session_data) {
+                                        println!("{}", serde_json::to_string_pretty(&shell_alert).unwrap());
+                                    }
 
                                     // Check for Port Misuse (T1571) using the Matrix
                                     if let Some(anomaly) = matrix.check(port, entropy, &session_data) {
