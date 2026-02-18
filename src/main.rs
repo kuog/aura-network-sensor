@@ -5,7 +5,7 @@ pub mod protocols;
 pub mod report;
 
 use pcap::Capture;
-use etherparse::{PacketHeaders, NetHeaders, TransportHeader, LinkHeader};
+use etherparse::{PacketHeaders, NetHeaders, TransportHeader, LinkHeader, VlanHeader};
 use l3_defrag::Defragmenter;
 use l4_reassembly::Reassembler;
 use crate::protocols::dns;
@@ -51,12 +51,51 @@ fn main() {
 
         if let Ok(headers) = PacketHeaders::from_ethernet_slice(packet.data) {
             
+            let mut is_arp = false;
+            
             if let Some(LinkHeader::Ethernet2(ether)) = &headers.link {
                 if ether.ether_type.0 == 0x0806 {
-                    if let Some((opcode, sender_mac, sender_ip, target_mac, target_ip)) = parse_arp(headers.payload.slice()) {
-                        if let Some(alert) = arp_tracker.handle_packet(sender_mac, sender_ip, target_mac, target_ip, opcode) {
-                            println!("{}", serde_json::to_string_pretty(&alert).unwrap());
+                    is_arp = true;
+                }
+            }
+
+            if let Some(vlan) = headers.vlan() {
+                match vlan {
+                    VlanHeader::Single(single) => {
+                        if single.ether_type.0 == 0x0806 {
+                            is_arp = true;
                         }
+                    },
+                    VlanHeader::Double(double) => {
+                        if double.inner.ether_type.0 == 0x0806 {
+                            is_arp = true;
+                        }
+                    }
+                }
+            }
+
+            if is_arp {
+                // Calculate offset manually as fallback if payload is empty
+                let payload = if headers.payload.slice().len() > 0 {
+                    headers.payload.slice()
+                } else {
+                    let mut offset = 14; // Ethernet header
+                    if let Some(vlan) = headers.vlan() {
+                        match vlan {
+                            VlanHeader::Single(_) => offset += 4,
+                            VlanHeader::Double(_) => offset += 8,
+                        }
+                    }
+                    if packet.data.len() > offset {
+                        &packet.data[offset..]
+                    } else {
+                        &[]
+                    }
+                };
+
+                if let Some((opcode, sender_mac, sender_ip, target_mac, target_ip)) = parse_arp(payload) {
+                    if let Some(alert) = arp_tracker.handle_packet(sender_mac, sender_ip, target_mac, target_ip, opcode) {
+                        println!("{}", serde_json::to_string_pretty(&alert).unwrap());
                     }
                 }
             }
