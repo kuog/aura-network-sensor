@@ -28,13 +28,22 @@ impl Reassembler {
         Self { streams: LruCache::new(cap) }
     }
 
-    pub fn add_segment(&mut self, key: FlowKey, payload: &[u8]) -> Option<Vec<u8>> {
+    pub fn add_segment(&mut self, key: FlowKey, payload: &[u8], ts: f64) -> Option<(Vec<u8>, f64)> {
         let stream = self.streams.get_or_insert_mut(key, || TcpStream {
             bytes: Vec::with_capacity(4096),
             analyzed: false,
             last_seen_ts: None,
             intervals: Vec::new(),
         });
+
+        // Update timing stats
+        if let Some(last_ts) = stream.last_seen_ts {
+            let delta = ts - last_ts;
+            if delta > 0.001 { // Ignore simultaneous packets
+                stream.intervals.push(delta);
+            }
+        }
+        stream.last_seen_ts = Some(ts);
 
         if stream.analyzed { return None; }
 
@@ -44,10 +53,14 @@ impl Reassembler {
         if stream.bytes.windows(4).any(|w| w == b"\r\n\r\n") || stream.bytes.len() > 10240 {
             stream.analyzed = true;
             let result = stream.bytes.clone();
+            
+            // Calculate beacon score
+            let score = crate::telemetry::calculate_beacon_score(&stream.intervals);
+
             // Free memory but keep the entry to avoid re-analyzing the same flow
             stream.bytes.clear();
             stream.bytes.shrink_to_fit();
-            return Some(result);
+            return Some((result, score));
         }
         None
     }

@@ -7,7 +7,7 @@ pub mod report;
 use pcap::Capture;
 use etherparse::{PacketHeaders, NetHeaders, TransportHeader};
 use l3_defrag::Defragmenter;
-use l4_reassembly::{Reassembler, FlowKey, TcpStream};
+use l4_reassembly::{Reassembler, FlowKey};
 use crate::protocols::dns;
 use crate::report::{AiHint, Context, Report, Telemetry};
 
@@ -54,64 +54,23 @@ fn main() {
                                 src_port: tcp.source_port, dst_port: tcp.destination_port,
                             };
 
-                            // Beaconing Detection Logic
-                            {
-                                let stream = tcp_reassembler.streams.get_or_insert_mut(key.clone(), || TcpStream {
-                                    bytes: Vec::with_capacity(4096),
-                                    analyzed: false,
-                                    last_seen_ts: Some(ts),
-                                    intervals: Vec::new(),
-                                });
-
-                                if let Some(last_ts) = stream.last_seen_ts {
-                                    let delta = ts - last_ts;
-                                    if delta > 0.001 { // Ignore simultaneous packets
-                                        stream.intervals.push(delta);
-                                    }
-                                }
-                                stream.last_seen_ts = Some(ts);
-
-                                // Periodic rhythm check (e.g., every 10 packets)
-                                if stream.intervals.len() >= 10 {
-                                    let score = telemetry::calculate_beacon_score(&stream.intervals);
-                                    if score < 0.15 {
-                                        println!("BEACONING DETECTED: T1011 | Score: {:.2} | Flow: {} -> {}", 
-                                                 score, src_ip, dst_ip);
-                                        
-                                        let mut context = Context::default();
-                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
-                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
-                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
-                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
-                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
-
-                                        let telemetry = Telemetry {
-                                            entropy: None,
-                                            jitter: Some((score * 100.0).round() / 100.0),
-                                            ja3: None,
-                                        };
-
-                                        let ai_hints = vec![AiHint {
-                                            trigger: "beaconing".to_string(),
-                                            suspected_techniques: vec!["T1011".to_string()],
-                                            logic: "Periodic communication detected".to_string(),
-                                        }];
-
-                                        let report = Report::new(context, telemetry, ai_hints);
-                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-
-                                        stream.intervals.clear(); // Reset to avoid double alerts
-                                    }
-                                }
-                            }
-
                             // We need to strip the TCP header from the reassembled IP payload
                             // before adding it to the stream buffer
                             let tcp_data_offset = tcp.header_len() as usize;
                             if full_ip_payload.len() > tcp_data_offset {
                                 let app_data = &full_ip_payload[tcp_data_offset..];
                                 
-                                if let Some(session_data) = tcp_reassembler.add_segment(key, app_data) {
+                                if let Some((session_data, b_score)) = tcp_reassembler.add_segment(key, app_data, ts) {
+                                    
+                                    // 1. Analyze for HTTP anomalies
+                                    if let Some(http_report) = protocols::http::analyze_http(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
+                                         println!("{}", serde_json::to_string_pretty(&http_report).unwrap());
+                                    }
+
+                                    // 2. Beaconing check (Timing)
+                                    if b_score < 0.15 {
+                                        println!("BEACON DETECTED: T1011 | Score: {:.2}", b_score);
+                                    }
                                     
                                     // Check for TLS JA3
                                     let mut ja3_hash_str = None;
@@ -133,7 +92,7 @@ fn main() {
                                     let high_entropy_trigger = ent > 7.5 && !is_standard_tls;
 
                                     // Threshold for non-standard encrypted tunnels
-                                    if high_entropy_trigger || ja3_hash_str.is_some() {
+                                    if high_entropy_trigger || ja3_hash_str.is_some() || b_score < 0.15 {
                                         let mut context = Context::default();
                                         context.fields.insert("src_ip".to_string(), src_ip.to_string());
                                         context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
@@ -143,7 +102,7 @@ fn main() {
 
                                         let telemetry = Telemetry {
                                             entropy: Some((ent * 100.0).round() / 100.0),
-                                            jitter: None,
+                                            jitter: Some((b_score * 100.0).round() / 100.0),
                                             ja3: ja3_hash_str,
                                         };
 
@@ -153,6 +112,14 @@ fn main() {
                                                 trigger: "high_entropy".to_string(),
                                                 suspected_techniques: vec!["T1573".to_string()],
                                                 logic: "Encrypted payload on non-standard port".to_string(),
+                                            });
+                                        }
+                                        
+                                        if b_score < 0.15 {
+                                            ai_hints.push(AiHint {
+                                                trigger: "beaconing".to_string(),
+                                                suspected_techniques: vec!["T1011".to_string()],
+                                                logic: "Periodic communication detected".to_string(),
                                             });
                                         }
 
