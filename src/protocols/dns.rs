@@ -1,14 +1,7 @@
-use serde::Serialize;
+use crate::report::{AiHint, Context, Report, Telemetry};
 use crate::telemetry::shannon_entropy;
 
-#[derive(Serialize)]
-pub struct DnsTunnelReport {
-    pub technique: &'static str,
-    pub domain: String,
-    pub entropy: f64,
-}
-
-pub fn analyze_dns(payload: &[u8]) -> Option<DnsTunnelReport> {
+pub fn analyze_dns(payload: &[u8]) -> Option<Report> {
     if payload.len() < 12 { return None; }
 
     // DNS wire format: [len]label[len]label...
@@ -37,12 +30,23 @@ pub fn analyze_dns(payload: &[u8]) -> Option<DnsTunnelReport> {
     let entropy = shannon_entropy(full_domain.as_bytes());
 
     // Tunneling usually has very high entropy (> 5.0) and weird subdomains
-    if entropy > 5.2 { 
-        Some(DnsTunnelReport {
-            technique: "T1071.004 (DNS Tunneling)",
-            domain: full_domain,
-            entropy: (entropy * 100.0).round() / 100.0,
-        })
+    if entropy > 5.2 {
+        let mut context = Context::default();
+        context.fields.insert("protocol".to_string(), "dns".to_string());
+        context.fields.insert("domain".to_string(), full_domain);
+
+        let telemetry = Telemetry {
+            entropy: Some((entropy * 100.0).round() / 100.0),
+            jitter: None,
+        };
+
+        let ai_hints = vec![AiHint {
+            trigger: "high_entropy".to_string(),
+            suspected_techniques: vec!["T1071.004".to_string()],
+            logic: "Domain appears algorithmic or encoded (DNS tunneling)".to_string(),
+        }];
+
+        Some(Report::new(context, telemetry, ai_hints))
     } else {
         None
     }

@@ -2,12 +2,14 @@ pub mod l3_defrag;
 pub mod l4_reassembly;
 pub mod telemetry;
 pub mod protocols;
+pub mod report;
 
 use pcap::Capture;
 use etherparse::{PacketHeaders, NetHeaders, TransportHeader};
 use l3_defrag::Defragmenter;
 use l4_reassembly::{Reassembler, FlowKey};
 use crate::protocols::dns;
+use crate::report::{AiHint, Context, Report, Telemetry};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -57,11 +59,29 @@ fn main() {
                                 
                                 if let Some(session_data) = tcp_reassembler.add_segment(key, app_data) {
                                     let ent = telemetry::shannon_entropy(&session_data);
-                                    
+                                     
                                     // Threshold for non-standard encrypted tunnels
                                     if ent > 6.0 {
-                                        println!("SUSPICIOUS TCP: From {} to {}, Port: {}, Entropy: {:.2}", 
-                                            src_ip, dst_ip, tcp.destination_port, ent);
+                                        let mut context = Context::default();
+                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
+                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
+                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
+                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
+                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
+
+                                        let telemetry = Telemetry {
+                                            entropy: Some((ent * 100.0).round() / 100.0),
+                                            jitter: None,
+                                        };
+
+                                        let ai_hints = vec![AiHint {
+                                            trigger: "high_entropy".to_string(),
+                                            suspected_techniques: vec!["T1573".to_string(), "T1041".to_string()],
+                                            logic: "Payload appears encrypted or obfuscated".to_string(),
+                                        }];
+
+                                        let report = Report::new(context, telemetry, ai_hints);
+                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
                                     }
                                 }
                             }
