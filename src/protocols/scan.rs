@@ -97,11 +97,14 @@ impl ScannerTracker {
 
         // Now update stats
         let stats = self.scanners.get_mut(&src_ip).unwrap();
-        stats.connection_attempts += 1;
-        stats.dst_ports_per_ip
+        
+        let ports = stats.dst_ports_per_ip
             .entry(dst_ip)
-            .or_insert_with(HashSet::new)
-            .insert(dst_port);
+            .or_insert_with(HashSet::new);
+            
+        if ports.insert(dst_port) {
+            stats.connection_attempts += 1;
+        }
 
         // Check triggers
         let unique_targets = stats.dst_ports_per_ip.len();
