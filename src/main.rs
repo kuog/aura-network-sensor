@@ -41,6 +41,7 @@ fn main() {
     let matrix = protocols::port_anomaly::ExpectationMatrix::new();
     let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
     let mut arp_tracker = ArpTracker::new();
+    let mut smb_tracker = protocols::smb::SmbTracker::new();
     
     let mut cap = Capture::from_file(&args[1]).expect("Failed to open PCAP file");
 
@@ -237,6 +238,14 @@ fn main() {
 
                                         let report = Report::new(context, telemetry, vec![ai_hint]);
                                         println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                                    }
+
+                                    // T1039 SMB/RPC Anomaly Detection
+                                    if tcp.source_port == 445 || tcp.destination_port == 445 {
+                                        let anomalies = smb_tracker.analyze_smb(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port);
+                                        for anomaly in anomalies {
+                                            println!("{}", serde_json::to_string_pretty(&anomaly).unwrap());
+                                        }
                                     }
 
                                     // 1. Analyze for HTTP anomalies

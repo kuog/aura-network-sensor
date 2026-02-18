@@ -1,7 +1,7 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Default, Debug, Clone)]
 pub struct Context {
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub fields: BTreeMap<String, String>,

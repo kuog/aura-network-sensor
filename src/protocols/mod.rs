@@ -6,4 +6,5 @@ pub mod scan;
 pub mod arp;
 pub mod obfuscation;
 pub mod shell;
+pub mod smb;
 
