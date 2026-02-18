@@ -4,7 +4,7 @@ pub mod telemetry;
 pub mod protocols;
 
 use pcap::Capture;
-use etherparse::{PacketHeaders, NetHeaders, TransportHeader, PayloadSlice};
+use etherparse::{PacketHeaders, NetHeaders, TransportHeader};
 use l3_defrag::Defragmenter;
 use l4_reassembly::{Reassembler, FlowKey};
 use crate::protocols::dns;
@@ -17,7 +17,8 @@ fn main() {
     }
 
     let mut defrag = Defragmenter::new();
-    let mut tcp_reassembler = Reassembler::new(5000); // Track 5000 concurrent flows
+    // Increase capacity for real-world traffic
+    let mut tcp_reassembler = Reassembler::new(10000); 
     
     let mut cap = Capture::from_file(&args[1]).expect("Failed to open PCAP file");
 
@@ -26,19 +27,10 @@ fn main() {
     while let Ok(packet) = cap.next_packet() {
         if let Ok(headers) = PacketHeaders::from_ethernet_slice(packet.data) {
             
-            // Step 1: L3 Defragmentation
             if let Some(NetHeaders::Ipv4(ip_hdr, _)) = headers.net {
-                // Convert the typed payload into a raw byte slice for defragmentation
-                let ip_payload_bytes: &[u8] = match headers.payload.clone() {
-                    PayloadSlice::Empty => &[],
-                    PayloadSlice::Ether(ep) => ep.payload,
-                    PayloadSlice::MacsecMod(b) => b,
-                    PayloadSlice::Ip(ip) => ip.payload,
-                    PayloadSlice::Udp(b)
-                    | PayloadSlice::Tcp(b)
-                    | PayloadSlice::Icmpv4(b)
-                    | PayloadSlice::Icmpv6(b) => b,
-                };
+                // Determine the L4 payload (the data after IP header)
+                // Etherparse headers.payload is the raw slice after IP
+                let ip_payload_bytes = headers.payload.slice();
 
                 if let Some(full_ip_payload) = defrag.process(&ip_hdr, ip_payload_bytes) {
                     
@@ -46,24 +38,42 @@ fn main() {
                     let dst_ip = std::net::IpAddr::V4(ip_hdr.destination.into());
 
                     match headers.transport {
-                        // Step 2a: TCP Reassembly (e.g., for HTTP T1071.001)
                         Some(TransportHeader::Tcp(tcp)) => {
+                            // SKIP analysis for standard HTTPS to avoid False Positives
+                            if tcp.destination_port == 443 || tcp.source_port == 443 {
+                                continue;
+                            }
+
                             let key = FlowKey {
                                 src: src_ip, dst: dst_ip,
                                 src_port: tcp.source_port, dst_port: tcp.destination_port,
                             };
-                            if let Some(session_data) = tcp_reassembler.add_segment(key, &full_ip_payload) {
-                                let ent = telemetry::shannon_entropy(&session_data);
-                                if ent > 5.0 {
-                                    println!("SUSPICIOUS TCP: From {} to {}, Entropy: {}", src_ip, dst_ip, ent);
+
+                            // We need to strip the TCP header from the reassembled IP payload
+                            // before adding it to the stream buffer
+                            let tcp_data_offset = tcp.header_len() as usize;
+                            if full_ip_payload.len() > tcp_data_offset {
+                                let app_data = &full_ip_payload[tcp_data_offset..];
+                                
+                                if let Some(session_data) = tcp_reassembler.add_segment(key, app_data) {
+                                    let ent = telemetry::shannon_entropy(&session_data);
+                                    
+                                    // Threshold for non-standard encrypted tunnels
+                                    if ent > 6.0 {
+                                        println!("SUSPICIOUS TCP: From {} to {}, Port: {}, Entropy: {:.2}", 
+                                            src_ip, dst_ip, tcp.destination_port, ent);
+                                    }
                                 }
                             }
                         }
-                        // Step 2b: UDP Stateless Analysis (e.g., for DNS T1071.004)
                         Some(TransportHeader::Udp(udp)) => {
                             if udp.destination_port == 53 || udp.source_port == 53 {
-                                if let Some(report) = dns::analyze_dns(&full_ip_payload) {
-                                    println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                                let udp_data_offset = 8; // UDP header is always 8 bytes
+                                if full_ip_payload.len() > udp_data_offset {
+                                    let dns_data = &full_ip_payload[udp_data_offset..];
+                                    if let Some(report) = dns::analyze_dns(dns_data) {
+                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                                    }
                                 }
                             }
                         }
