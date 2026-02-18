@@ -253,7 +253,12 @@ fn main() {
                                          println!("{}", serde_json::to_string_pretty(&http_report).unwrap());
                                     }
 
-                                    // 2. Beaconing check (Timing)
+                                    // 2. Analyze for SSL Stripping (T1562.001)
+                                    if let Some(stripping_alert) = protocols::stripping::analyze(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
+                                         println!("{}", serde_json::to_string_pretty(&stripping_alert).unwrap());
+                                    }
+
+                                    // 3. Beaconing check (Timing)
                                     if b_score < 0.15 {
                                         println!("BEACON DETECTED: T1011 | Score: {:.2}", b_score);
                                     }
