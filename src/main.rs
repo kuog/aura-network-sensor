@@ -62,6 +62,34 @@ fn main() {
                                 
                                 if let Some((session_data, b_score)) = tcp_reassembler.add_segment(key, app_data, ts) {
                                     
+                                    let entropy = telemetry::shannon_entropy(&session_data);
+                                    let port = tcp.destination_port;
+
+                                    // Check for Port Misuse (T1571)
+                                    if let Some(anomaly) = protocols::port_anomaly::check_port_misuse(port, entropy, &session_data) {
+                                        let mut context = Context::default();
+                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
+                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
+                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
+                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
+                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
+
+                                        let telemetry = Telemetry {
+                                            entropy: Some((entropy * 100.0).round() / 100.0),
+                                            jitter: Some((b_score * 100.0).round() / 100.0),
+                                            ja3: None,
+                                        };
+
+                                        let ai_hint = AiHint {
+                                            trigger: "port_anomaly".to_string(),
+                                            suspected_techniques: vec![anomaly.technique.to_string()],
+                                            logic: anomaly.observation,
+                                        };
+
+                                        let report = Report::new(context, telemetry, vec![ai_hint]);
+                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                                    }
+
                                     // 1. Analyze for HTTP anomalies
                                     if let Some(http_report) = protocols::http::analyze_http(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
                                          println!("{}", serde_json::to_string_pretty(&http_report).unwrap());
@@ -86,7 +114,7 @@ fn main() {
                                         ja3_hash_str = Some(ja3_hash);
                                     }
 
-                                    let ent = telemetry::shannon_entropy(&session_data);
+                                    let ent = entropy;
                                      
                                     let is_standard_tls = [443, 8443, 465].contains(&tcp.source_port) || [443, 8443, 465].contains(&tcp.destination_port);
                                     let high_entropy_trigger = ent > 7.5 && !is_standard_tls;
