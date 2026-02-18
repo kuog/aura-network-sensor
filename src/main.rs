@@ -207,6 +207,32 @@ fn main() {
                                         println!("{}", serde_json::to_string_pretty(&report).unwrap());
                                     }
 
+                                    // T1001 Obfuscation / Steganography Check
+                                    if let Some(steg) = protocols::obfuscation::analyze_steganography(&session_data, port) {
+                                        let mut context = Context::default();
+                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
+                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
+                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
+                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
+                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
+                                        context.fields.insert("pattern_type".to_string(), steg.pattern_type);
+
+                                        let telemetry = Telemetry {
+                                            entropy: Some((steg.observed_entropy * 100.0).round() / 100.0),
+                                            jitter: Some((b_score * 100.0).round() / 100.0),
+                                            ja3: None,
+                                        };
+
+                                        let ai_hint = AiHint {
+                                            trigger: "obfuscation_detected".to_string(),
+                                            suspected_techniques: vec![steg.technique_id],
+                                            logic: steg.reason,
+                                        };
+
+                                        let report = Report::new(context, telemetry, vec![ai_hint]);
+                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+                                    }
+
                                     // 1. Analyze for HTTP anomalies
                                     if let Some(http_report) = protocols::http::analyze_http(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
                                          println!("{}", serde_json::to_string_pretty(&http_report).unwrap());
