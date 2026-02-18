@@ -5,11 +5,12 @@ pub mod protocols;
 pub mod report;
 
 use pcap::Capture;
-use etherparse::{PacketHeaders, NetHeaders, TransportHeader};
+use etherparse::{PacketHeaders, NetHeaders, TransportHeader, LinkHeader};
 use l3_defrag::Defragmenter;
 use l4_reassembly::Reassembler;
 use crate::protocols::dns;
 use crate::protocols::scan::ScannerTracker;
+use crate::protocols::arp::{ArpTracker, parse_arp};
 use std::time::Duration;
 use crate::report::{AiHint, Context, Report, Telemetry};
 
@@ -38,6 +39,7 @@ fn main() {
     let mut tcp_reassembler = Reassembler::new(10000); 
     let matrix = protocols::port_anomaly::ExpectationMatrix::new();
     let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
+    let mut arp_tracker = ArpTracker::new();
     
     let mut cap = Capture::from_file(&args[1]).expect("Failed to open PCAP file");
 
@@ -49,6 +51,16 @@ fn main() {
 
         if let Ok(headers) = PacketHeaders::from_ethernet_slice(packet.data) {
             
+            if let Some(LinkHeader::Ethernet2(ether)) = &headers.link {
+                if ether.ether_type.0 == 0x0806 {
+                    if let Some((opcode, sender_mac, sender_ip, target_mac, target_ip)) = parse_arp(headers.payload.slice()) {
+                        if let Some(alert) = arp_tracker.handle_packet(sender_mac, sender_ip, target_mac, target_ip, opcode) {
+                            println!("{}", serde_json::to_string_pretty(&alert).unwrap());
+                        }
+                    }
+                }
+            }
+
             if let Some(NetHeaders::Ipv4(ip_hdr, _)) = headers.net {
                 // T1046 Scanning Detection
                 let scan_src = std::net::IpAddr::V4(ip_hdr.source.into());
