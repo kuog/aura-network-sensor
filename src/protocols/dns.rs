@@ -38,6 +38,7 @@ pub fn analyze_dns(payload: &[u8]) -> Option<Report> {
         let telemetry = Telemetry {
             entropy: Some((entropy * 100.0).round() / 100.0),
             jitter: None,
+            ja3: None,
         };
 
         let ai_hints = vec![AiHint {

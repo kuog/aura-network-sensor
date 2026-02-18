@@ -13,6 +13,8 @@ pub struct Telemetry {
     pub entropy: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jitter: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ja3: Option<String>,
 }
 
 #[derive(Serialize)]

@@ -45,9 +45,9 @@ fn main() {
                     match headers.transport {
                         Some(TransportHeader::Tcp(tcp)) => {
                             // SKIP analysis for standard HTTPS to avoid False Positives
-                            if tcp.destination_port == 443 || tcp.source_port == 443 {
-                                continue;
-                            }
+                            // if tcp.destination_port == 443 || tcp.source_port == 443 {
+                            //    continue;
+                            // }
 
                             let key = FlowKey {
                                 src: src_ip, dst: dst_ip,
@@ -88,6 +88,7 @@ fn main() {
                                         let telemetry = Telemetry {
                                             entropy: None,
                                             jitter: Some((score * 100.0).round() / 100.0),
+                                            ja3: None,
                                         };
 
                                         let ai_hints = vec![AiHint {
@@ -111,10 +112,25 @@ fn main() {
                                 let app_data = &full_ip_payload[tcp_data_offset..];
                                 
                                 if let Some(session_data) = tcp_reassembler.add_segment(key, app_data) {
+                                    
+                                    // Check for TLS JA3
+                                    let mut ja3_hash_str = None;
+                                    if let Some(ja3_hash) = protocols::tls::calculate_ja3(&session_data) {
+                                        println!("TLS FINGERPRINT (JA3): {}", ja3_hash);
+                                        
+                                        // MITRE T1011 Hint:
+                                        // Many C2 agents have fixed JA3 hashes. 
+                                        // e.g., "a0e9f5d64349fb12a91c..." is a known Meterpreter hash.
+                                        if ja3_hash == "a0e9f5d64349fb12a91c13d332612953" {
+                                            println!("ALERT: Known Malware JA3 detected! (T1573.002)");
+                                        }
+                                        ja3_hash_str = Some(ja3_hash);
+                                    }
+
                                     let ent = telemetry::shannon_entropy(&session_data);
                                      
                                     // Threshold for non-standard encrypted tunnels
-                                    if ent > 6.0 {
+                                    if ent > 6.0 || ja3_hash_str.is_some() {
                                         let mut context = Context::default();
                                         context.fields.insert("src_ip".to_string(), src_ip.to_string());
                                         context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
@@ -125,6 +141,7 @@ fn main() {
                                         let telemetry = Telemetry {
                                             entropy: Some((ent * 100.0).round() / 100.0),
                                             jitter: None,
+                                            ja3: ja3_hash_str,
                                         };
 
                                         let ai_hints = vec![AiHint {
