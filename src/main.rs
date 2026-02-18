@@ -21,6 +21,7 @@ fn main() {
     let mut defrag = Defragmenter::new();
     // Increase capacity for real-world traffic
     let mut tcp_reassembler = Reassembler::new(10000); 
+    let matrix = protocols::port_anomaly::ExpectationMatrix::new();
     
     let mut cap = Capture::from_file(&args[1]).expect("Failed to open PCAP file");
 
@@ -65,8 +66,8 @@ fn main() {
                                     let entropy = telemetry::shannon_entropy(&session_data);
                                     let port = tcp.destination_port;
 
-                                    // Check for Port Misuse (T1571)
-                                    if let Some(anomaly) = protocols::port_anomaly::check_port_misuse(port, entropy, &session_data) {
+                                    // Check for Port Misuse (T1571) using the Matrix
+                                    if let Some(anomaly) = matrix.check(port, entropy, &session_data) {
                                         let mut context = Context::default();
                                         context.fields.insert("src_ip".to_string(), src_ip.to_string());
                                         context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
@@ -82,7 +83,7 @@ fn main() {
 
                                         let ai_hint = AiHint {
                                             trigger: "port_anomaly".to_string(),
-                                            suspected_techniques: vec![anomaly.technique.to_string()],
+                                            suspected_techniques: vec![anomaly.technique.clone()],
                                             logic: anomaly.observation,
                                         };
 
