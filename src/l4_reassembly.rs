@@ -13,6 +13,8 @@ pub struct FlowKey {
 pub struct TcpStream {
     pub bytes: Vec<u8>,
     pub analyzed: bool,
+    pub last_seen_ts: Option<f64>, // Time of the last packet
+    pub intervals: Vec<f64>,        // List of deltas in seconds
 }
 
 /// Manages TCP flows using an LRU cache to bound memory usage.
@@ -30,6 +32,8 @@ impl Reassembler {
         let stream = self.streams.get_or_insert_mut(key, || TcpStream {
             bytes: Vec::with_capacity(4096),
             analyzed: false,
+            last_seen_ts: None,
+            intervals: Vec::new(),
         });
 
         if stream.analyzed { return None; }

@@ -7,7 +7,7 @@ pub mod report;
 use pcap::Capture;
 use etherparse::{PacketHeaders, NetHeaders, TransportHeader};
 use l3_defrag::Defragmenter;
-use l4_reassembly::{Reassembler, FlowKey};
+use l4_reassembly::{Reassembler, FlowKey, TcpStream};
 use crate::protocols::dns;
 use crate::report::{AiHint, Context, Report, Telemetry};
 
@@ -27,6 +27,9 @@ fn main() {
     println!("--- AI Sensor Analysis Started ---");
 
     while let Ok(packet) = cap.next_packet() {
+        // Extract timestamp from pcap header
+        let ts = packet.header.ts.tv_sec as f64 + (packet.header.ts.tv_usec as f64 / 1_000_000.0);
+
         if let Ok(headers) = PacketHeaders::from_ethernet_slice(packet.data) {
             
             if let Some(NetHeaders::Ipv4(ip_hdr, _)) = headers.net {
@@ -50,6 +53,56 @@ fn main() {
                                 src: src_ip, dst: dst_ip,
                                 src_port: tcp.source_port, dst_port: tcp.destination_port,
                             };
+
+                            // Beaconing Detection Logic
+                            {
+                                let stream = tcp_reassembler.streams.get_or_insert_mut(key.clone(), || TcpStream {
+                                    bytes: Vec::with_capacity(4096),
+                                    analyzed: false,
+                                    last_seen_ts: Some(ts),
+                                    intervals: Vec::new(),
+                                });
+
+                                if let Some(last_ts) = stream.last_seen_ts {
+                                    let delta = ts - last_ts;
+                                    if delta > 0.001 { // Ignore simultaneous packets
+                                        stream.intervals.push(delta);
+                                    }
+                                }
+                                stream.last_seen_ts = Some(ts);
+
+                                // Periodic rhythm check (e.g., every 10 packets)
+                                if stream.intervals.len() >= 10 {
+                                    let score = telemetry::calculate_beacon_score(&stream.intervals);
+                                    if score < 0.15 {
+                                        println!("BEACONING DETECTED: T1011 | Score: {:.2} | Flow: {} -> {}", 
+                                                 score, src_ip, dst_ip);
+                                        
+                                        let mut context = Context::default();
+                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
+                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
+                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
+                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
+                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
+
+                                        let telemetry = Telemetry {
+                                            entropy: None,
+                                            jitter: Some((score * 100.0).round() / 100.0),
+                                        };
+
+                                        let ai_hints = vec![AiHint {
+                                            trigger: "beaconing".to_string(),
+                                            suspected_techniques: vec!["T1011".to_string()],
+                                            logic: "Periodic communication detected".to_string(),
+                                        }];
+
+                                        let report = Report::new(context, telemetry, ai_hints);
+                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
+
+                                        stream.intervals.clear(); // Reset to avoid double alerts
+                                    }
+                                }
+                            }
 
                             // We need to strip the TCP header from the reassembled IP payload
                             // before adding it to the stream buffer
