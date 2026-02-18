@@ -9,6 +9,8 @@ use etherparse::{PacketHeaders, NetHeaders, TransportHeader};
 use l3_defrag::Defragmenter;
 use l4_reassembly::Reassembler;
 use crate::protocols::dns;
+use crate::protocols::scan::ScannerTracker;
+use std::time::Duration;
 use crate::report::{AiHint, Context, Report, Telemetry};
 
 fn is_local_ip(ip: &std::net::IpAddr) -> bool {
@@ -35,6 +37,7 @@ fn main() {
     // Increase capacity for real-world traffic
     let mut tcp_reassembler = Reassembler::new(10000); 
     let matrix = protocols::port_anomaly::ExpectationMatrix::new();
+    let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
     
     let mut cap = Capture::from_file(&args[1]).expect("Failed to open PCAP file");
 
@@ -47,6 +50,28 @@ fn main() {
         if let Ok(headers) = PacketHeaders::from_ethernet_slice(packet.data) {
             
             if let Some(NetHeaders::Ipv4(ip_hdr, _)) = headers.net {
+                // T1046 Scanning Detection
+                let scan_src = std::net::IpAddr::V4(ip_hdr.source.into());
+                let scan_dst = std::net::IpAddr::V4(ip_hdr.destination.into());
+                
+                if is_local_ip(&scan_src) {
+                     match &headers.transport {
+                        Some(TransportHeader::Tcp(tcp)) => {
+                            if tcp.syn && !tcp.ack {
+                                if let Some(alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port) {
+                                    println!("{}", serde_json::to_string_pretty(&alert).unwrap());
+                                }
+                            }
+                        },
+                        Some(TransportHeader::Udp(udp)) => {
+                            if let Some(alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port) {
+                                println!("{}", serde_json::to_string_pretty(&alert).unwrap());
+                            }
+                        },
+                        _ => {}
+                    }
+                }
+
                 // Determine the L4 payload (the data after IP header)
                 // Etherparse headers.payload is the raw slice after IP
                 let ip_payload_bytes = headers.payload.slice();
