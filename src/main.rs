@@ -129,8 +129,11 @@ fn main() {
 
                                     let ent = telemetry::shannon_entropy(&session_data);
                                      
+                                    let is_standard_tls = [443, 8443, 465].contains(&tcp.source_port) || [443, 8443, 465].contains(&tcp.destination_port);
+                                    let high_entropy_trigger = ent > 7.5 && !is_standard_tls;
+
                                     // Threshold for non-standard encrypted tunnels
-                                    if ent > 6.0 || ja3_hash_str.is_some() {
+                                    if high_entropy_trigger || ja3_hash_str.is_some() {
                                         let mut context = Context::default();
                                         context.fields.insert("src_ip".to_string(), src_ip.to_string());
                                         context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
@@ -144,11 +147,14 @@ fn main() {
                                             ja3: ja3_hash_str,
                                         };
 
-                                        let ai_hints = vec![AiHint {
-                                            trigger: "high_entropy".to_string(),
-                                            suspected_techniques: vec!["T1573".to_string(), "T1041".to_string()],
-                                            logic: "Payload appears encrypted or obfuscated".to_string(),
-                                        }];
+                                        let mut ai_hints = Vec::new();
+                                        if high_entropy_trigger {
+                                            ai_hints.push(AiHint {
+                                                trigger: "high_entropy".to_string(),
+                                                suspected_techniques: vec!["T1573".to_string()],
+                                                logic: "Encrypted payload on non-standard port".to_string(),
+                                            });
+                                        }
 
                                         let report = Report::new(context, telemetry, ai_hints);
                                         println!("{}", serde_json::to_string_pretty(&report).unwrap());
