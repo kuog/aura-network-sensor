@@ -236,9 +236,8 @@ pub async fn run(
             }
         }
 
-        // 1. Console output (pretty JSON)
-        let json = alert.to_json_pretty();
-        println!("{}", json);
+        // 1. Console output (colored human-readable format)
+        super::console_fmt::print_alert(&alert);
         stats.console_writes.fetch_add(1, Ordering::Relaxed);
 
         // 2. SQLite persistence

@@ -16,6 +16,7 @@
 //! Graceful shutdown is coordinated via `Arc<AtomicBool>`.
 
 pub mod alert;
+pub mod console_fmt;
 pub mod engine;
 pub mod exporter;
 pub mod sniffer;

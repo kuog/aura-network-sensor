@@ -38,33 +38,13 @@ const SNIFFER_CORE: usize = 0;
 const ENGINE_CORE: usize = 1;
 
 fn print_usage() {
-    eprintln!("Usage:");
-    eprintln!("  Live capture (default):  mcp-network-sensor -i <interface>");
-    eprintln!("  Read pcap file:          mcp-network-sensor -f <path_to_pcap>");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  -i <interface>   Capture live traffic from the specified network interface");
-    eprintln!("  -f <file>        Analyze traffic from a pcap file");
-    eprintln!("  -d <db_path>     SQLite database path (default: alerts.db)");
-    eprintln!("  -l               List available network interfaces");
-    eprintln!("  -h, --help       Show this help message");
+    pipeline::console_fmt::print_usage();
 }
 
 fn list_interfaces() {
     match pcap::Device::list() {
         Ok(devices) => {
-            println!("Available network interfaces:");
-            for dev in &devices {
-                let desc = dev.desc.as_deref().unwrap_or("");
-                let addrs: Vec<String> =
-                    dev.addresses.iter().map(|a| format!("{}", a.addr)).collect();
-                let addr_str = if addrs.is_empty() {
-                    String::from("no addresses")
-                } else {
-                    addrs.join(", ")
-                };
-                println!("  {} - {} [{}]", dev.name, desc, addr_str);
-            }
+            pipeline::console_fmt::print_interfaces(&devices);
         }
         Err(e) => {
             eprintln!("Error listing interfaces: {}", e);
@@ -134,11 +114,11 @@ fn main() {
     }
 
     // ── Determine capture source ──────────────────────────────────────
-    let source = if let Some(file) = pcap_file {
+    let (source, source_type, source_name) = if let Some(file) = pcap_file {
         match CaptureSource::file(&file) {
             Ok(s) => {
                 info!("Reading from pcap file: {}", file);
-                s
+                (s, "PCAP file", file)
             }
             Err(e) => {
                 error!("Failed to open PCAP file '{}': {}", file, e);
@@ -149,7 +129,7 @@ fn main() {
         match CaptureSource::live(&iface) {
             Ok(s) => {
                 info!("Capturing live traffic on interface: {}", iface);
-                s
+                (s, "Live capture", iface)
             }
             Err(e) => {
                 error!("Failed to open capture device '{}': {}", iface, e);
@@ -157,7 +137,8 @@ fn main() {
             }
         }
     } else {
-        eprintln!("Error: no capture source specified.");
+        use colored::Colorize;
+        eprintln!("{} {}", "Error:".red().bold(), "no capture source specified.".white());
         eprintln!();
         print_usage();
         return;
@@ -167,7 +148,8 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
-        eprintln!("\n--- Ctrl+C received, initiating graceful shutdown ---");
+        use colored::Colorize;
+        eprintln!("\n  {} {}", "[STOP]".yellow().bold(), "Ctrl+C received, initiating graceful shutdown...".yellow());
         r.store(false, Ordering::SeqCst);
     })
     .expect("Error setting Ctrl-C handler");
@@ -189,11 +171,9 @@ fn main() {
     // ── Channel: Engine → Exporter (tokio unbounded mpsc) ─────────────
     let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    info!("=== MCP Network Sensor — 3-Stage Pipeline ===");
-    info!(
-        "Ring buffer capacity: {} packets | Sniffer→Core {} | Engine→Core {}",
-        RING_BUFFER_CAPACITY, SNIFFER_CORE, ENGINE_CORE
-    );
+    pipeline::console_fmt::print_banner();
+    pipeline::console_fmt::print_source_info(&source_type, &source_name);
+    pipeline::console_fmt::print_pipeline_config(RING_BUFFER_CAPACITY, SNIFFER_CORE, ENGINE_CORE);
 
     // ── Stage 3: Async Exporter (Tokio runtime on remaining cores) ────
     //
@@ -240,19 +220,19 @@ fn main() {
         .expect("Failed to spawn sniffer thread");
 
     // ── Wait for all stages to complete ───────────────────────────────
-    info!("All pipeline stages running. Press Ctrl+C to stop.");
+    pipeline::console_fmt::print_ready();
 
     // Stage 1 finishes first (EOF or Ctrl+C)
     if let Err(e) = sniffer_thread.join() {
         error!("Sniffer thread panicked: {:?}", e);
     }
-    info!("Sniffer thread finished");
+    pipeline::console_fmt::print_stage_done("Sniffer thread");
 
     // Stage 2 finishes when the crossbeam channel is drained + disconnected
     if let Err(e) = engine_thread.join() {
         error!("Engine thread panicked: {:?}", e);
     }
-    info!("Engine thread finished");
+    pipeline::console_fmt::print_stage_done("Engine thread");
 
     // Stage 3 finishes when the tokio mpsc channel is drained
     // (the Engine dropped alert_tx when it exited)
@@ -261,29 +241,17 @@ fn main() {
             error!("Exporter task panicked: {:?}", e);
         }
     });
-    info!("Exporter task finished");
+    pipeline::console_fmt::print_stage_done("Exporter task");
 
     // ── Final summary ─────────────────────────────────────────────────
-    info!("=== Pipeline Shutdown Summary ===");
-    info!(
-        "Sniffer  — Captured: {}, Dropped: {}",
+    pipeline::console_fmt::print_shutdown_summary(
         sniffer_stats.captured.load(Ordering::Relaxed),
         sniffer_stats.dropped.load(Ordering::Relaxed),
-    );
-    info!(
-        "Engine   — Analyzed: {}, Alerts: {}",
         engine_stats.analyzed.load(Ordering::Relaxed),
         engine_stats.alerts.load(Ordering::Relaxed),
-    );
-    info!(
-        "Exporter — Console: {}, DB writes: {}, DB errors: {}",
         exporter_stats.console_writes.load(Ordering::Relaxed),
         exporter_stats.db_writes.load(Ordering::Relaxed),
         exporter_stats.db_errors.load(Ordering::Relaxed),
-    );
-    info!(
-        "DNS      — Cache entries: {}",
         dns_tracker.len(),
     );
-    info!("=== MCP Network Sensor stopped ===");
 }
