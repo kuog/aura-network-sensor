@@ -302,7 +302,7 @@ fn main() {
                                     let port = tcp.destination_port;
 
                                     // T1059 Interactive Shell Detection
-                                    if let Some(shell_alert) = shell::detect_interactive_shell(&session_data) {
+                                    if let Some(shell_alert) = shell::detect_interactive_shell(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
                                         println!("{}", serde_json::to_string_pretty(&shell_alert).unwrap());
                                     }
 

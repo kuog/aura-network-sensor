@@ -1,4 +1,11 @@
 use serde::Serialize;
+use std::collections::BTreeMap;
+
+#[derive(Serialize, Debug)]
+pub struct ShellContext {
+    #[serde(flatten)]
+    pub fields: BTreeMap<String, String>,
+}
 
 #[derive(Serialize, Debug)]
 pub struct ShellDetectionResult {
@@ -6,9 +13,10 @@ pub struct ShellDetectionResult {
     pub shell_type: String,
     pub matched_patterns: Vec<String>,
     pub severity: String,
+    pub context: ShellContext,
 }
 
-pub fn detect_interactive_shell(payload: &[u8]) -> Option<ShellDetectionResult> {
+pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_port: u16, dst_port: u16) -> Option<ShellDetectionResult> {
     if payload.is_empty() {
         return None;
     }
@@ -85,11 +93,19 @@ pub fn detect_interactive_shell(payload: &[u8]) -> Option<ShellDetectionResult> 
             shell_type = "Unknown Shell".to_string();
         }
 
+        let mut fields = BTreeMap::new();
+        fields.insert("src_ip".to_string(), src_ip.to_string());
+        fields.insert("dst_ip".to_string(), dst_ip.to_string());
+        fields.insert("src_port".to_string(), src_port.to_string());
+        fields.insert("dst_port".to_string(), dst_port.to_string());
+        fields.insert("protocol".to_string(), "tcp".to_string());
+
         return Some(ShellDetectionResult {
             technique_id: "T1059".to_string(),
             shell_type,
             matched_patterns,
             severity: "CRITICAL".to_string(),
+            context: ShellContext { fields },
         });
     }
 
