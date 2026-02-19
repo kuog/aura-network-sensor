@@ -1,36 +1,39 @@
+//! # MCP Network Sensor — High-Performance NDR Pipeline
+//!
+//! A three-stage pipeline architecture for network detection and response:
+//!
+//! ```text
+//! Stage 1 (Core 0)          Stage 2 (Core 1)          Stage 3 (Tokio, Cores 2-N)
+//! ┌─────────────┐  ring buf ┌─────────────┐  mpsc     ┌─────────────┐
+//! │   Sniffer   │──────────▶│   Engine    │──────────▶│  Exporter   │
+//! │   (pcap)    │ crossbeam │  (MITRE)    │  tokio    │ Console+DB  │
+//! └─────────────┘           └─────────────┘           └─────────────┘
+//! ```
+//!
+//! Graceful shutdown via `Arc<AtomicBool>` + Ctrl+C handler.
+
 pub mod l3_defrag;
 pub mod l4_reassembly;
 pub mod telemetry;
 pub mod protocols;
 pub mod report;
 pub mod analysis;
+pub mod pipeline;
 
-use pcap::{Capture, Active, Offline};
-use etherparse::{PacketHeaders, NetHeaders, TransportHeader, LinkHeader, VlanHeader};
-use l3_defrag::Defragmenter;
-use l4_reassembly::Reassembler;
-use crate::protocols::dns;
-use crate::protocols::scan::ScannerTracker;
-use crate::protocols::arp::{ArpTracker, parse_arp};
-use crate::protocols::shell;
-use std::time::Duration;
-use crate::report::{AiHint, Context, Report, Telemetry};
-use crate::analysis::enrichment::{self, ScoringInput};
+use log::{error, info};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
-/// Capture source: either a live interface or a pcap file.
-enum CaptureSource {
-    Live(Capture<Active>),
-    File(Capture<Offline>),
-}
+use pipeline::engine::EngineStats;
+use pipeline::exporter::ExporterStats;
+use pipeline::sniffer::{CaptureSource, SnifferStats};
 
-impl CaptureSource {
-    fn next_packet(&mut self) -> Result<pcap::Packet<'_>, pcap::Error> {
-        match self {
-            CaptureSource::Live(cap) => cap.next_packet(),
-            CaptureSource::File(cap) => cap.next_packet(),
-        }
-    }
-}
+// ── Ring buffer capacity (packets) ────────────────────────────────────────
+const RING_BUFFER_CAPACITY: usize = 10_000;
+
+// ── Default core assignments ──────────────────────────────────────────────
+const SNIFFER_CORE: usize = 0;
+const ENGINE_CORE: usize = 1;
 
 fn print_usage() {
     eprintln!("Usage:");
@@ -40,6 +43,7 @@ fn print_usage() {
     eprintln!("Options:");
     eprintln!("  -i <interface>   Capture live traffic from the specified network interface");
     eprintln!("  -f <file>        Analyze traffic from a pcap file");
+    eprintln!("  -d <db_path>     SQLite database path (default: alerts.db)");
     eprintln!("  -l               List available network interfaces");
     eprintln!("  -h, --help       Show this help message");
 }
@@ -50,8 +54,13 @@ fn list_interfaces() {
             println!("Available network interfaces:");
             for dev in &devices {
                 let desc = dev.desc.as_deref().unwrap_or("");
-                let addrs: Vec<String> = dev.addresses.iter().map(|a| format!("{}", a.addr)).collect();
-                let addr_str = if addrs.is_empty() { String::from("no addresses") } else { addrs.join(", ") };
+                let addrs: Vec<String> =
+                    dev.addresses.iter().map(|a| format!("{}", a.addr)).collect();
+                let addr_str = if addrs.is_empty() {
+                    String::from("no addresses")
+                } else {
+                    addrs.join(", ")
+                };
                 println!("  {} - {} [{}]", dev.name, desc, addr_str);
             }
         }
@@ -61,27 +70,19 @@ fn list_interfaces() {
     }
 }
 
-fn is_local_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(ipv4) => {
-            let octets = ipv4.octets();
-            // 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12
-            (octets[0] == 10) ||
-            (octets[0] == 192 && octets[1] == 168) ||
-            (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
-        },
-        _ => false, 
-    }
-}
-
 fn main() {
+    // ── Initialize logging ────────────────────────────────────────────
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .init();
+
+    // ── Parse CLI arguments ───────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
-    
-    // Parse command-line arguments
     let mut interface: Option<String> = None;
     let mut pcap_file: Option<String> = None;
+    let mut db_path: Option<String> = None;
     let mut i = 1;
-    
+
     while i < args.len() {
         match args[i].as_str() {
             "-i" => {
@@ -104,6 +105,16 @@ fn main() {
                     return;
                 }
             }
+            "-d" => {
+                if i + 1 < args.len() {
+                    db_path = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: -d requires a database path");
+                    print_usage();
+                    return;
+                }
+            }
             "-l" => {
                 list_interfaces();
                 return;
@@ -120,369 +131,142 @@ fn main() {
         }
     }
 
-    // Determine capture source
-    let mut source = if let Some(file) = pcap_file {
-        let cap = Capture::from_file(&file).expect("Failed to open PCAP file");
-        eprintln!("Reading from pcap file: {}", file);
-        CaptureSource::File(cap)
+    // ── Determine capture source ──────────────────────────────────────
+    let source = if let Some(file) = pcap_file {
+        match CaptureSource::file(&file) {
+            Ok(s) => {
+                info!("Reading from pcap file: {}", file);
+                s
+            }
+            Err(e) => {
+                error!("Failed to open PCAP file '{}': {}", file, e);
+                return;
+            }
+        }
     } else if let Some(iface) = interface {
-        let cap = Capture::from_device(iface.as_str())
-            .expect("Failed to open capture device")
-            .promisc(true)
-            .snaplen(65535)
-            .timeout(1000)
-            .open()
-            .expect("Failed to activate capture on interface");
-        eprintln!("Capturing live traffic on interface: {}", iface);
-        CaptureSource::Live(cap)
+        match CaptureSource::live(&iface) {
+            Ok(s) => {
+                info!("Capturing live traffic on interface: {}", iface);
+                s
+            }
+            Err(e) => {
+                error!("Failed to open capture device '{}': {}", iface, e);
+                return;
+            }
+        }
     } else {
-        eprintln!("Error: no capture source specified. Use -i <interface> for live capture or -f <file> for pcap analysis.");
+        eprintln!("Error: no capture source specified.");
         eprintln!();
         print_usage();
         return;
     };
 
-    let mut defrag = Defragmenter::new();
-    // Increase capacity for real-world traffic
-    let mut tcp_reassembler = Reassembler::new(10000); 
-    let matrix = protocols::port_anomaly::ExpectationMatrix::new();
-    let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
-    let mut arp_tracker = ArpTracker::new();
-    let mut smb_tracker = protocols::smb::SmbTracker::new();
-
-    // Install Ctrl+C handler for graceful shutdown during live capture
-    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    // ── Shared shutdown flag ──────────────────────────────────────────
+    let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
     ctrlc::set_handler(move || {
-        eprintln!("\n--- Capture interrupted, shutting down ---");
-        r.store(false, std::sync::atomic::Ordering::SeqCst);
-    }).expect("Error setting Ctrl-C handler");
+        eprintln!("\n--- Ctrl+C received, initiating graceful shutdown ---");
+        r.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
 
-    eprintln!("--- AI Sensor Analysis Started ---");
+    // ── Shared stats ──────────────────────────────────────────────────
+    let sniffer_stats = Arc::new(SnifferStats::new());
+    let engine_stats = Arc::new(EngineStats::new());
+    let exporter_stats = Arc::new(ExporterStats::new());
 
-    while running.load(std::sync::atomic::Ordering::SeqCst) {
-        let packet = match source.next_packet() {
-            Ok(p) => p,
-            Err(pcap::Error::TimeoutExpired) => continue,  // live capture timeout, retry
-            Err(_) => break,  // EOF or error
-        };
+    // ── Channel: Sniffer → Engine (bounded crossbeam ring buffer) ─────
+    let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(RING_BUFFER_CAPACITY);
 
-        // Extract timestamp from pcap header
-        let ts = packet.header.ts.tv_sec as f64 + (packet.header.ts.tv_usec as f64 / 1_000_000.0);
+    // ── Channel: Engine → Exporter (tokio unbounded mpsc) ─────────────
+    let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel();
 
-        if let Ok(headers) = PacketHeaders::from_ethernet_slice(packet.data) {
-            
-            let mut is_arp = false;
-            
-            if let Some(LinkHeader::Ethernet2(ether)) = &headers.link {
-                if ether.ether_type.0 == 0x0806 {
-                    is_arp = true;
-                }
-            }
+    info!("=== MCP Network Sensor — 3-Stage Pipeline ===");
+    info!(
+        "Ring buffer capacity: {} packets | Sniffer→Core {} | Engine→Core {}",
+        RING_BUFFER_CAPACITY, SNIFFER_CORE, ENGINE_CORE
+    );
 
-            if let Some(vlan) = headers.vlan() {
-                match vlan {
-                    VlanHeader::Single(single) => {
-                        if single.ether_type.0 == 0x0806 {
-                            is_arp = true;
-                        }
-                    },
-                    VlanHeader::Double(double) => {
-                        if double.inner.ether_type.0 == 0x0806 {
-                            is_arp = true;
-                        }
-                    }
-                }
-            }
+    // ── Stage 3: Async Exporter (Tokio runtime on remaining cores) ────
+    //
+    // We build the Tokio runtime first so we can spawn the exporter task,
+    // then launch the synchronous threads for Stages 1 and 2.
+    let exporter_stats_clone = exporter_stats.clone();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2) // Use 2 threads (cores 2-3 on a 4-core system)
+        .enable_all()
+        .thread_name("exporter")
+        .build()
+        .expect("Failed to build Tokio runtime");
 
-            if is_arp {
-                // Calculate offset manually as fallback if payload is empty
-                let payload = if headers.payload.slice().len() > 0 {
-                    headers.payload.slice()
-                } else {
-                    let mut offset = 14; // Ethernet header
-                    if let Some(vlan) = headers.vlan() {
-                        match vlan {
-                            VlanHeader::Single(_) => offset += 4,
-                            VlanHeader::Double(_) => offset += 8,
-                        }
-                    }
-                    if packet.data.len() > offset {
-                        &packet.data[offset..]
-                    } else {
-                        &[]
-                    }
-                };
+    // Spawn the exporter task inside the runtime
+    let exporter_handle = rt.spawn(pipeline::exporter::run(
+        alert_rx,
+        exporter_stats_clone,
+        db_path,
+    ));
 
-                if let Some((opcode, sender_mac, sender_ip, target_mac, target_ip)) = parse_arp(payload) {
-                    if let Some(alert) = arp_tracker.handle_packet(sender_mac, sender_ip, target_mac, target_ip, opcode) {
-                        println!("{}", serde_json::to_string_pretty(&alert).unwrap());
-                    }
-                }
-            }
+    // ── Stage 2: MITRE Analysis Engine (Core 1) ───────────────────────
+    let engine_running = running.clone();
+    let engine_stats_clone = engine_stats.clone();
+    let engine_thread = std::thread::Builder::new()
+        .name("engine".to_string())
+        .spawn(move || {
+            pipeline::engine::run(pkt_rx, alert_tx, engine_running, engine_stats_clone, ENGINE_CORE);
+        })
+        .expect("Failed to spawn engine thread");
 
-            if let Some(NetHeaders::Ipv4(ip_hdr, _)) = headers.net {
-                // T1046 Scanning Detection
-                let scan_src = std::net::IpAddr::V4(ip_hdr.source.into());
-                let scan_dst = std::net::IpAddr::V4(ip_hdr.destination.into());
-                
-                if is_local_ip(&scan_src) {
-                     match &headers.transport {
-                        Some(TransportHeader::Tcp(tcp)) => {
-                            if tcp.syn && !tcp.ack {
-                                if let Some(alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port) {
-                                    println!("{}", serde_json::to_string_pretty(&alert).unwrap());
-                                }
-                            }
-                        },
-                        Some(TransportHeader::Udp(udp)) => {
-                            if let Some(alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port) {
-                                println!("{}", serde_json::to_string_pretty(&alert).unwrap());
-                            }
-                        },
-                        _ => {}
-                    }
-                }
+    // ── Stage 1: Sniffer (Core 0) ─────────────────────────────────────
+    let sniffer_running = running.clone();
+    let sniffer_stats_clone = sniffer_stats.clone();
+    let sniffer_thread = std::thread::Builder::new()
+        .name("sniffer".to_string())
+        .spawn(move || {
+            pipeline::sniffer::run(source, pkt_tx, sniffer_running, sniffer_stats_clone, SNIFFER_CORE);
+        })
+        .expect("Failed to spawn sniffer thread");
 
-                // Determine the L4 payload (the data after IP header)
-                // Etherparse headers.payload is the raw slice after IP
-                let ip_payload_bytes = headers.payload.slice();
+    // ── Wait for all stages to complete ───────────────────────────────
+    info!("All pipeline stages running. Press Ctrl+C to stop.");
 
-                if let Some(full_ip_payload) = defrag.process(&ip_hdr, ip_payload_bytes) {
-                    
-                    let src_ip = std::net::IpAddr::V4(ip_hdr.source.into());
-                    let dst_ip = std::net::IpAddr::V4(ip_hdr.destination.into());
-
-                    match headers.transport {
-                        Some(TransportHeader::Tcp(tcp)) => {
-                            // SKIP analysis for standard HTTPS to avoid False Positives
-                            // if tcp.destination_port == 443 || tcp.source_port == 443 {
-                            //    continue;
-                            // }
-
-                            // Determine direction for stats
-                            let is_upload = is_local_ip(&src_ip);
-                            let packet_len = full_ip_payload.len() as u64;
-
-                            // Update stats and check for Exfiltration
-                            if let Some((up, down, ratio)) = tcp_reassembler.update_stats(src_ip, dst_ip, tcp.source_port, tcp.destination_port, packet_len, is_upload) {
-                                let mut context = Context::default();
-                                context.fields.insert("src_ip".to_string(), src_ip.to_string());
-                                context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
-                                context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
-                                context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
-                                context.fields.insert("protocol".to_string(), "tcp".to_string());
-                                context.fields.insert("total_uploaded_mb".to_string(), format!("{:.2}", up as f64 / 1_000_000.0));
-                                context.fields.insert("total_downloaded_mb".to_string(), format!("{:.2}", down as f64 / 1_000_000.0));
-                                context.fields.insert("ratio".to_string(), format!("{:.2}", ratio));
-
-                                let telemetry = Telemetry {
-                                    entropy: None,
-                                    jitter: None,
-                                    ja3: None,
-                                };
-
-                                let ai_hint = AiHint {
-                                    trigger: "exfiltration".to_string(),
-                                    suspected_techniques: vec!["T1041".to_string()],
-                                    logic: "Asymmetric outbound flow detected".to_string(),
-                                };
-
-                                let report = Report::new(context, telemetry, vec![ai_hint]);
-                                println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                            }
-
-                            // We need to strip the TCP header from the reassembled IP payload
-                            // before adding it to the stream buffer
-                            let tcp_data_offset = tcp.header_len() as usize;
-                            if full_ip_payload.len() > tcp_data_offset {
-                                let app_data = &full_ip_payload[tcp_data_offset..];
-                                
-                                if let Some((session_data, b_score)) = tcp_reassembler.add_segment(src_ip, dst_ip, tcp.source_port, tcp.destination_port, app_data, ts) {
-                                    
-                                    let entropy = telemetry::shannon_entropy(&session_data);
-                                    let port = tcp.destination_port;
-
-                                    // T1059 Interactive Shell Detection
-                                    if let Some(shell_alert) = shell::detect_interactive_shell(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
-                                        println!("{}", serde_json::to_string_pretty(&shell_alert).unwrap());
-                                    }
-
-                                    // Check for Port Misuse (T1571) using the Matrix
-                                    if let Some(anomaly) = matrix.check(port, entropy, &session_data) {
-                                        let mut context = Context::default();
-                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
-                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
-                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
-                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
-                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
-
-                                        let telemetry = Telemetry {
-                                            entropy: Some((entropy * 100.0).round() / 100.0),
-                                            jitter: Some((b_score * 100.0).round() / 100.0),
-                                            ja3: None,
-                                        };
-
-                                        let ai_hint = AiHint {
-                                            trigger: "port_anomaly".to_string(),
-                                            suspected_techniques: vec![anomaly.technique.clone()],
-                                            logic: anomaly.observation,
-                                        };
-
-                                        let report = Report::new(context, telemetry, vec![ai_hint]);
-                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                                    }
-
-                                    // T1001 Obfuscation / Steganography Check
-                                    if let Some(steg) = protocols::obfuscation::analyze_steganography(&session_data, port) {
-                                        let mut context = Context::default();
-                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
-                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
-                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
-                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
-                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
-                                        context.fields.insert("pattern_type".to_string(), steg.pattern_type);
-
-                                        let telemetry = Telemetry {
-                                            entropy: Some((steg.observed_entropy * 100.0).round() / 100.0),
-                                            jitter: Some((b_score * 100.0).round() / 100.0),
-                                            ja3: None,
-                                        };
-
-                                        let ai_hint = AiHint {
-                                            trigger: "obfuscation_detected".to_string(),
-                                            suspected_techniques: vec![steg.technique_id],
-                                            logic: steg.reason,
-                                        };
-
-                                        let report = Report::new(context, telemetry, vec![ai_hint]);
-                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                                    }
-
-                                    // T1039 SMB/RPC Anomaly Detection
-                                    if tcp.source_port == 445 || tcp.destination_port == 445 {
-                                        let anomalies = smb_tracker.analyze_smb(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port);
-                                        for anomaly in anomalies {
-                                            println!("{}", serde_json::to_string_pretty(&anomaly).unwrap());
-                                        }
-                                    }
-
-                                    // 1. Analyze for HTTP anomalies
-                                    if let Some(http_report) = protocols::http::analyze_http(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
-                                         println!("{}", serde_json::to_string_pretty(&http_report).unwrap());
-                                    }
-
-                                    // 2. Analyze for SSL Stripping (T1562.001)
-                                    if let Some(stripping_alert) = protocols::stripping::analyze(&session_data, &src_ip.to_string(), &dst_ip.to_string(), tcp.source_port, tcp.destination_port) {
-                                         println!("{}", serde_json::to_string_pretty(&stripping_alert).unwrap());
-                                    }
-
-                                    // 3. Beaconing check (Timing)
-                                    let is_beaconing = b_score < 0.15;
-                                    if is_beaconing {
-                                        eprintln!("BEACON CANDIDATE: T1011 | Score: {:.2} (enriching...)", b_score);
-                                    }
-                                    
-                                    // Check for TLS JA3
-                                    let mut ja3_hash_str = None;
-                                    if let Some(ja3_hash) = protocols::tls::calculate_ja3(&session_data) {
-                                        eprintln!("TLS FINGERPRINT (JA3): {}", ja3_hash);
-                                        
-                                        // MITRE T1011 Hint:
-                                        // Many C2 agents have fixed JA3 hashes.
-                                        // e.g., "a0e9f5d64349fb12a91c..." is a known Meterpreter hash.
-                                        if ja3_hash == "a0e9f5d64349fb12a91c13d332612953" {
-                                            eprintln!("ALERT: Known Malware JA3 detected! (T1573.002)");
-                                        }
-                                        ja3_hash_str = Some(ja3_hash);
-                                    }
-
-                                    let ent = entropy;
-                                     
-                                    let is_standard_tls = [443, 8443, 465].contains(&tcp.source_port) || [443, 8443, 465].contains(&tcp.destination_port);
-                                    let high_entropy_trigger = ent > 7.5 && !is_standard_tls;
-
-                                    // Threshold for non-standard encrypted tunnels
-                                    if high_entropy_trigger || ja3_hash_str.is_some() || is_beaconing {
-                                        // --- Enrichment: SNI + Reputation + Confidence Scoring ---
-                                        let scoring_input = ScoringInput {
-                                            tls_payload: &session_data,
-                                            dst_port: tcp.destination_port,
-                                            is_beaconing,
-                                            session_data: &session_data,
-                                        };
-                                        let enrichment_result = enrichment::enrich(&scoring_input);
-
-                                        let mut context = Context::default();
-                                        context.fields.insert("src_ip".to_string(), src_ip.to_string());
-                                        context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
-                                        context.fields.insert("src_port".to_string(), tcp.source_port.to_string());
-                                        context.fields.insert("dst_port".to_string(), tcp.destination_port.to_string());
-                                        context.fields.insert("protocol".to_string(), "tcp".to_string());
-
-                                        let telemetry = Telemetry {
-                                            entropy: Some((ent * 100.0).round() / 100.0),
-                                            jitter: Some((b_score * 100.0).round() / 100.0),
-                                            ja3: ja3_hash_str,
-                                        };
-
-                                        let mut ai_hints = Vec::new();
-                                        if high_entropy_trigger {
-                                            ai_hints.push(AiHint {
-                                                trigger: "high_entropy".to_string(),
-                                                suspected_techniques: vec!["T1573".to_string()],
-                                                logic: "Encrypted payload on non-standard port".to_string(),
-                                            });
-                                        }
-                                        
-                                        if is_beaconing {
-                                            let beacon_logic = if enrichment_result.confidence_score < 40 {
-                                                format!(
-                                                    "Periodic communication detected — likely legitimate {} traffic (confidence_score: {})",
-                                                    enrichment_result.enriched_context.provider.as_deref().unwrap_or("unknown"),
-                                                    enrichment_result.confidence_score
-                                                )
-                                            } else {
-                                                "Periodic communication detected".to_string()
-                                            };
-                                            ai_hints.push(AiHint {
-                                                trigger: "beaconing".to_string(),
-                                                suspected_techniques: vec!["T1011".to_string()],
-                                                logic: beacon_logic,
-                                            });
-                                        }
-
-                                        let report = Report::new_enriched(
-                                            context,
-                                            telemetry,
-                                            ai_hints,
-                                            enrichment_result.confidence_score,
-                                            enrichment_result.enriched_context,
-                                            enrichment_result.severity,
-                                            enrichment_result.scoring_notes,
-                                        );
-                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                                    }
-                                }
-                            }
-                        }
-                        Some(TransportHeader::Udp(udp)) => {
-                            if udp.destination_port == 53 || udp.source_port == 53 {
-                                let udp_data_offset = 8; // UDP header is always 8 bytes
-                                if full_ip_payload.len() > udp_data_offset {
-                                    let dns_data = &full_ip_payload[udp_data_offset..];
-                                    if let Some(report) = dns::analyze_dns(dns_data) {
-                                        println!("{}", serde_json::to_string_pretty(&report).unwrap());
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
+    // Stage 1 finishes first (EOF or Ctrl+C)
+    if let Err(e) = sniffer_thread.join() {
+        error!("Sniffer thread panicked: {:?}", e);
     }
+    info!("Sniffer thread finished");
 
-    eprintln!("--- AI Sensor Analysis Finished ---");
+    // Stage 2 finishes when the crossbeam channel is drained + disconnected
+    if let Err(e) = engine_thread.join() {
+        error!("Engine thread panicked: {:?}", e);
+    }
+    info!("Engine thread finished");
+
+    // Stage 3 finishes when the tokio mpsc channel is drained
+    // (the Engine dropped alert_tx when it exited)
+    rt.block_on(async {
+        if let Err(e) = exporter_handle.await {
+            error!("Exporter task panicked: {:?}", e);
+        }
+    });
+    info!("Exporter task finished");
+
+    // ── Final summary ─────────────────────────────────────────────────
+    info!("=== Pipeline Shutdown Summary ===");
+    info!(
+        "Sniffer  — Captured: {}, Dropped: {}",
+        sniffer_stats.captured.load(Ordering::Relaxed),
+        sniffer_stats.dropped.load(Ordering::Relaxed),
+    );
+    info!(
+        "Engine   — Analyzed: {}, Alerts: {}",
+        engine_stats.analyzed.load(Ordering::Relaxed),
+        engine_stats.alerts.load(Ordering::Relaxed),
+    );
+    info!(
+        "Exporter — Console: {}, DB writes: {}, DB errors: {}",
+        exporter_stats.console_writes.load(Ordering::Relaxed),
+        exporter_stats.db_writes.load(Ordering::Relaxed),
+        exporter_stats.db_errors.load(Ordering::Relaxed),
+    );
+    info!("=== MCP Network Sensor stopped ===");
 }
