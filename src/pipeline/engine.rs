@@ -227,11 +227,21 @@ pub fn run(
                     Some(TransportHeader::Tcp(tcp)) => {
                         if tcp.syn && !tcp.ack {
                             if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port) {
+                                // ── Importance-lowering: local-to-local scanning ────
+                                let dst_local = is_local_ip(&scan_dst);
+                                let (severity, confidence) = if dst_local {
+                                    // Internal network discovery — routine IT activity
+                                    (Severity::Low, 30u8)
+                                } else {
+                                    // Scanning external hosts — more suspicious
+                                    (Severity::Medium, 70u8)
+                                };
+
                                 let mut alert = MitreAlert::new(
                                     "T1046",
                                     "Network Service Discovery",
-                                    Severity::Medium,
-                                    70,
+                                    severity,
+                                    confidence,
                                     scan_src.to_string(),
                                     scan_dst.to_string(),
                                     tcp.source_port,
@@ -239,7 +249,8 @@ pub fn run(
                                     "tcp",
                                     "port_scan",
                                     serde_json::to_string(&scan_alert).unwrap_or_default(),
-                                );
+                                )
+                                .with_meta("dst_is_local", dst_local.to_string());
                                 enrich_alert_with_dns(&dns_tracker, &mut alert, None);
                                 emit(alert, &stats);
                             }
@@ -247,11 +258,19 @@ pub fn run(
                     }
                     Some(TransportHeader::Udp(udp)) => {
                         if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port) {
+                            // ── Importance-lowering: local-to-local scanning ────
+                            let dst_local = is_local_ip(&scan_dst);
+                            let (severity, confidence) = if dst_local {
+                                (Severity::Low, 30u8)
+                            } else {
+                                (Severity::Medium, 70u8)
+                            };
+
                             let mut alert = MitreAlert::new(
                                 "T1046",
                                 "Network Service Discovery",
-                                Severity::Medium,
-                                70,
+                                severity,
+                                confidence,
                                 scan_src.to_string(),
                                 scan_dst.to_string(),
                                 udp.source_port,
@@ -259,7 +278,8 @@ pub fn run(
                                 "udp",
                                 "port_scan",
                                 serde_json::to_string(&scan_alert).unwrap_or_default(),
-                            );
+                            )
+                            .with_meta("dst_is_local", dst_local.to_string());
                             enrich_alert_with_dns(&dns_tracker, &mut alert, None);
                             emit(alert, &stats);
                         }
@@ -304,11 +324,28 @@ pub fn run(
 
                                 // ── T1071.004: DNS tunneling / anomaly detection ────
                                 if let Some(dns_report) = dns::analyze_dns(dns_data) {
+                                    // ── Importance-lowering: known DNS resolver ──────
+                                    // DNS queries to well-known public resolvers
+                                    // (Google, Cloudflare, etc.) on standard port 53
+                                    // are far less likely to be tunneling.
+                                    let dst_rep = reputation::lookup_ip(&dst_ip);
+                                    let is_standard_dns = udp.destination_port == 53;
+                                    let (severity, confidence) = if dst_rep.is_trusted && is_standard_dns {
+                                        // Known resolver on standard port — likely benign
+                                        (Severity::Low, 20u8)
+                                    } else if dst_rep.is_trusted {
+                                        // Known resolver on non-standard port — mild suspicion
+                                        (Severity::Medium, 45u8)
+                                    } else {
+                                        // Unknown resolver — full severity
+                                        (Severity::High, 80u8)
+                                    };
+
                                     let mut alert = MitreAlert::new(
                                         "T1071.004",
                                         "Application Layer Protocol: DNS",
-                                        Severity::High,
-                                        80,
+                                        severity,
+                                        confidence,
                                         src_ip.to_string(),
                                         dst_ip.to_string(),
                                         udp.source_port,
@@ -316,7 +353,8 @@ pub fn run(
                                         "udp",
                                         "dns_anomaly",
                                         serde_json::to_string(&dns_report).unwrap_or_default(),
-                                    );
+                                    )
+                                    .with_meta("dst_provider", &dst_rep.provider);
 
                                     // Enrich with DNS names for src/dst IPs
                                     enrich_alert_with_dns(&dns_tracker, &mut alert, None);
@@ -367,11 +405,29 @@ fn analyze_tcp(
         packet_len,
         is_upload,
     ) {
+        // ── Importance-lowering: known provider + standard port ─────────
+        let dst_rep = reputation::lookup_ip(&dst_ip);
+        let is_standard_port = reputation::is_expected_encrypted_port(tcp.destination_port)
+            || matches!(tcp.destination_port, 80 | 443 | 8080 | 8443);
+        let (severity, confidence) = if dst_rep.is_trusted && is_standard_port {
+            // Trusted cloud/CDN on standard port — very likely backup/sync
+            (Severity::Low, 15u8)
+        } else if dst_rep.is_trusted {
+            // Trusted provider but unusual port — still suspicious
+            (Severity::Medium, 40u8)
+        } else if is_standard_port {
+            // Standard port but unknown provider — moderate suspicion
+            (Severity::Medium, 55u8)
+        } else {
+            // Unknown provider + non-standard port — full severity
+            (Severity::High, 75u8)
+        };
+
         let mut alert = MitreAlert::new(
             "T1041",
             "Exfiltration Over C2 Channel",
-            Severity::High,
-            75,
+            severity,
+            confidence,
             src_ip.to_string(),
             dst_ip.to_string(),
             tcp.source_port,
@@ -382,7 +438,8 @@ fn analyze_tcp(
         )
         .with_meta("total_uploaded_mb", format!("{:.2}", up as f64 / 1_000_000.0))
         .with_meta("total_downloaded_mb", format!("{:.2}", down as f64 / 1_000_000.0))
-        .with_meta("ratio", format!("{:.2}", ratio));
+        .with_meta("ratio", format!("{:.2}", ratio))
+        .with_meta("dst_provider", &dst_rep.provider);
         enrich_alert_with_dns(dns_tracker, &mut alert, None);
         emit(alert, stats);
     }
@@ -543,11 +600,21 @@ fn analyze_tcp(
 
     // ── T1571 Port Anomaly ────────────────────────────────────────────
     if let Some(anomaly) = matrix.check(port, entropy, &session_data) {
+        // ── Importance-lowering: known provider → downgrade ─────────────
+        let dst_rep = reputation::lookup_ip(&dst_ip);
+        let (severity, confidence) = if dst_rep.is_trusted {
+            // Trusted provider — port anomaly is likely benign protocol variation
+            (Severity::Low, 20u8)
+        } else {
+            // Unknown provider — keep original severity
+            (Severity::High, 80u8)
+        };
+
         let mut alert = MitreAlert::new(
             &anomaly.technique,
             "Non-Standard Port",
-            Severity::High,
-            80,
+            severity,
+            confidence,
             src_ip.to_string(),
             dst_ip.to_string(),
             tcp.source_port,
@@ -557,7 +624,8 @@ fn analyze_tcp(
             &anomaly.observation,
         )
         .with_meta("entropy", format!("{:.2}", entropy))
-        .with_meta("jitter", format!("{:.2}", b_score));
+        .with_meta("jitter", format!("{:.2}", b_score))
+        .with_meta("dst_provider", &dst_rep.provider);
         enrich_alert_with_dns(dns_tracker, &mut alert, Some(entropy));
         emit(alert, stats);
     }
@@ -770,11 +838,21 @@ fn analyze_tcp(
             tcp.destination_port,
         );
         for smb_anomaly in anomalies {
-            let alert = MitreAlert::new(
+            // ── Importance-lowering: local-to-local SMB on standard port ──
+            let both_local = is_local_ip(&src_ip) && is_local_ip(&dst_ip);
+            let (severity, confidence) = if both_local {
+                // Internal file sharing on standard SMB port — routine traffic
+                (Severity::Low, 20u8)
+            } else {
+                // SMB to/from external IP — much more suspicious
+                (Severity::High, 75u8)
+            };
+
+            let mut alert = MitreAlert::new(
                 "T1039",
                 "Data from Network Shared Drive",
-                Severity::High,
-                75,
+                severity,
+                confidence,
                 src_ip.to_string(),
                 dst_ip.to_string(),
                 tcp.source_port,
@@ -782,7 +860,9 @@ fn analyze_tcp(
                 "tcp",
                 "smb_anomaly",
                 serde_json::to_string(&smb_anomaly).unwrap_or_default(),
-            );
+            )
+            .with_meta("both_local", both_local.to_string());
+            enrich_alert_with_dns(dns_tracker, &mut alert, None);
             emit(alert, stats);
         }
     }
@@ -795,11 +875,25 @@ fn analyze_tcp(
         tcp.source_port,
         tcp.destination_port,
     ) {
-        let alert = MitreAlert::new(
+        // ── Importance-lowering: known provider + standard HTTP port ────
+        let dst_rep = reputation::lookup_ip(&dst_ip);
+        let is_standard_http = matches!(tcp.destination_port, 80 | 443 | 8080 | 8443);
+        let (severity, confidence) = if dst_rep.is_trusted && is_standard_http {
+            // Trusted provider on standard HTTP port — likely benign
+            (Severity::Low, 15u8)
+        } else if dst_rep.is_trusted {
+            // Trusted provider on non-standard port — mild suspicion
+            (Severity::Medium, 40u8)
+        } else {
+            // Unknown provider — full severity
+            (Severity::High, 80u8)
+        };
+
+        let mut alert = MitreAlert::new(
             "T1071.001",
             "Application Layer Protocol: Web Protocols",
-            Severity::High,
-            80,
+            severity,
+            confidence,
             src_ip.to_string(),
             dst_ip.to_string(),
             tcp.source_port,
@@ -807,7 +901,9 @@ fn analyze_tcp(
             "tcp",
             "http_anomaly",
             "HTTP anomaly detected",
-        );
+        )
+        .with_meta("dst_provider", &dst_rep.provider);
+        enrich_alert_with_dns(dns_tracker, &mut alert, None);
         emit(alert, stats);
     }
 
@@ -819,11 +915,30 @@ fn analyze_tcp(
         tcp.source_port,
         tcp.destination_port,
     ) {
-        let alert = MitreAlert::new(
+        // ── Importance-lowering: known provider + standard port ─────────
+        // SSL stripping from a trusted CDN/cloud provider on port 80/443
+        // is almost certainly a legitimate HTTP→HTTPS redirect, not an attack.
+        let dst_rep = reputation::lookup_ip(&dst_ip);
+        let src_rep = reputation::lookup_ip(&src_ip);
+        let is_standard_http = matches!(tcp.destination_port, 80 | 443 | 8080 | 8443)
+            || matches!(tcp.source_port, 80 | 443 | 8080 | 8443);
+        let either_trusted = dst_rep.is_trusted || src_rep.is_trusted;
+        let (severity, confidence) = if either_trusted && is_standard_http {
+            // Trusted provider on standard HTTP port — likely legitimate redirect
+            (Severity::Low, 15u8)
+        } else if either_trusted {
+            // Trusted provider on non-standard port — mild suspicion
+            (Severity::Medium, 45u8)
+        } else {
+            // Unknown provider — full severity
+            (Severity::High, 85u8)
+        };
+
+        let mut alert = MitreAlert::new(
             "T1562.001",
             "Impair Defenses: SSL Stripping",
-            Severity::High,
-            85,
+            severity,
+            confidence,
             src_ip.to_string(),
             dst_ip.to_string(),
             tcp.source_port,
@@ -831,7 +946,10 @@ fn analyze_tcp(
             "tcp",
             "ssl_stripping",
             "SSL stripping attack detected",
-        );
+        )
+        .with_meta("dst_provider", &dst_rep.provider)
+        .with_meta("src_provider", &src_rep.provider);
+        enrich_alert_with_dns(dns_tracker, &mut alert, None);
         emit(alert, stats);
     }
 
@@ -1035,8 +1153,26 @@ fn analyze_tcp(
 
         // ── Beaconing detection (T1011) — also enriched with reputation ─
         if is_beaconing {
+            // ── Importance-lowering: trusted provider + standard port ───
+            // Beaconing to known cloud/CDN on standard encrypted ports is
+            // almost always legitimate keep-alive / polling traffic.
+            let is_standard_port = reputation::is_expected_encrypted_port(tcp.destination_port)
+                || matches!(tcp.destination_port, 80 | 8080 | 8443);
+            let effective_confidence = if flow_rep.is_whitelisted {
+                // Whitelisted flow (trusted IP + expected port, or trusted SNI on 443)
+                enrichment_result.confidence_score.min(10)
+            } else if flow_rep.dst_reputation.is_trusted && is_standard_port {
+                // Trusted provider on standard port — cap confidence
+                enrichment_result.confidence_score.min(20)
+            } else if flow_rep.dst_reputation.is_trusted {
+                // Trusted provider on non-standard port — moderate cap
+                enrichment_result.confidence_score.min(45)
+            } else {
+                enrichment_result.confidence_score
+            };
+
             // Updated severity thresholds: HIGH only if confidence > 75
-            let severity = match enrichment_result.confidence_score {
+            let severity = match effective_confidence {
                 0..=29 => Severity::Debug,
                 30..=49 => Severity::Low,
                 50..=75 => Severity::Medium,
@@ -1044,11 +1180,11 @@ fn analyze_tcp(
                 _ => Severity::Critical,
             };
 
-            let logic = if enrichment_result.confidence_score < 40 {
+            let logic = if effective_confidence < 40 {
                 format!(
                     "Periodic communication detected — likely legitimate {} traffic (confidence_score: {})",
                     flow_rep.provider,
-                    enrichment_result.confidence_score
+                    effective_confidence
                 )
             } else {
                 "Periodic communication detected".to_string()
@@ -1058,7 +1194,7 @@ fn analyze_tcp(
                 "T1011",
                 "Exfiltration Over Other Network Medium",
                 severity,
-                enrichment_result.confidence_score,
+                effective_confidence,
                 src_ip.to_string(),
                 dst_ip.to_string(),
                 tcp.source_port,

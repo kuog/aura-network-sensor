@@ -463,10 +463,42 @@ pub struct DnsConfidenceAdjustment {
 /// Service keywords in domains that strongly indicate legitimate traffic.
 /// If a resolved domain contains any of these, confidence is reduced by 90 points.
 const SERVICE_KEYWORDS: &[&str] = &[
+    // Email / messaging
     "exchange",
     "outlook",
     "mail",
     "imap",
+    "smtp",
+    "pop3",
+    "postfix",
+    "mimecast",
+    "protonmail",
+    // Collaboration / productivity
+    "teams",
+    "sharepoint",
+    "onedrive",
+    "slack",
+    "zoom",
+    // Updates / telemetry
+    "update",
+    "windowsupdate",
+    "swscan",       // Apple software update
+    "mesu.apple",   // Apple software update
+    "officecdn",
+    "delivery.mp.microsoft",
+    // Authentication / SSO
+    "login",
+    "auth",
+    "sso",
+    "adfs",
+    "microsoftonline",
+    "okta",
+    // DNS / NTP infrastructure
+    "ntp",
+    "time.apple",
+    "time.windows",
+    "dns",
+    "resolver",
 ];
 
 /// Known benign domain suffixes that reduce suspicion.

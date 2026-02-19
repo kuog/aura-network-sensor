@@ -18,8 +18,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::analysis::dns_resolver::{self, DnsCache};
 use crate::analysis::dns_tracker::{self, DnsTracker};
+use crate::analysis::enrichment;
+use crate::analysis::reputation;
 
-use super::alert::MitreAlert;
+use super::alert::{MitreAlert, Severity};
 
 /// Shared counters for the exporter.
 pub struct ExporterStats {
@@ -173,6 +175,13 @@ pub async fn run(
         // detection, and domain squatting analysis.
         dns_resolver::enrich_alert(&mut alert, &dns_cache).await;
 
+        // ── Post-enrichment importance-lowering ─────────────────────────
+        // After DNS resolution, apply service-keyword and domain-reputation
+        // based confidence adjustments. This catches cases where the engine
+        // couldn't resolve the domain (no SNI, IP not in CIDR ranges) but
+        // the async resolver found a legitimate service domain.
+        post_enrichment_adjust(&mut alert);
+
         // ── Passive DNS Fallback (legacy dns_tracker) ─────────────────
         // If the active resolver didn't resolve a DNS name for dst_ip,
         // fall back to the passive DNS tracker + libc getnameinfo.
@@ -273,4 +282,159 @@ pub async fn run(
     }
 
     info!("[Exporter] Async exporter task finished");
+}
+
+// ── Post-Enrichment Importance Lowering ────────────────────────────────────
+
+/// Service keywords in resolved domain names that strongly indicate legitimate
+/// traffic. If the resolved domain contains any of these AND the traffic is on
+/// a standard port, confidence is significantly reduced.
+const SERVICE_KEYWORDS: &[&str] = &[
+    // Email / messaging
+    "exchange",
+    "outlook",
+    "mail",
+    "imap",
+    "smtp",
+    "pop3",
+    "mimecast",
+    "protonmail",
+    // Collaboration / productivity
+    "teams",
+    "sharepoint",
+    "onedrive",
+    "slack",
+    "zoom",
+    // Updates / telemetry
+    "update",
+    "windowsupdate",
+    "swscan",
+    "officecdn",
+    // Authentication / SSO
+    "login",
+    "auth",
+    "sso",
+    "adfs",
+    "microsoftonline",
+    "okta",
+    // DNS / NTP infrastructure
+    "ntp",
+    "dns",
+    "resolver",
+];
+
+/// Standard ports where service-keyword traffic is expected and benign.
+const STANDARD_SERVICE_PORTS: &[u16] = &[
+    25, 80, 110, 143, 443, 465, 587, 853, 993, 995,
+    8080, 8443,
+];
+
+/// Apply post-enrichment importance-lowering based on resolved domain names.
+///
+/// This function is called after the async DNS resolver has enriched the alert
+/// with `dns_resolver_dst` / `dns_dst` metadata. It checks whether the resolved
+/// domain contains service keywords (exchange, outlook, mail, etc.) and whether
+/// the traffic is on a standard port, then reduces confidence and severity
+/// accordingly.
+///
+/// This catches the case where the engine couldn't identify the domain (no SNI
+/// extracted, IP not in known CIDR ranges) but the async resolver found a
+/// legitimate service domain like `exchange.aspose.com`.
+fn post_enrichment_adjust(alert: &mut MitreAlert) {
+    // Get the resolved domain from any available source
+    let domain = alert
+        .metadata
+        .get("dns_resolver_dst")
+        .or_else(|| alert.metadata.get("dns_dst"))
+        .cloned();
+
+    let domain = match domain {
+        Some(d) => d,
+        None => return, // No domain resolved — nothing to adjust
+    };
+
+    let domain_lower = domain.to_lowercase();
+
+    // ── Check 1: Service keyword match ──────────────────────────────────
+    let matched_keyword = SERVICE_KEYWORDS
+        .iter()
+        .find(|kw| domain_lower.contains(**kw));
+
+    if let Some(keyword) = matched_keyword {
+        let is_standard_port = STANDARD_SERVICE_PORTS.contains(&alert.dst_port)
+            || STANDARD_SERVICE_PORTS.contains(&alert.src_port);
+
+        let (new_confidence, reason) = if is_standard_port {
+            // Service keyword + standard port → very likely legitimate
+            let reduced = alert.confidence.saturating_sub(80);
+            (
+                reduced,
+                format!(
+                    "Domain '{}' contains service keyword '{}' on standard port {} (-80 confidence)",
+                    domain, keyword, alert.dst_port
+                ),
+            )
+        } else {
+            // Service keyword but non-standard port → moderate reduction
+            let reduced = alert.confidence.saturating_sub(50);
+            (
+                reduced,
+                format!(
+                    "Domain '{}' contains service keyword '{}' on non-standard port {} (-50 confidence)",
+                    domain, keyword, alert.dst_port
+                ),
+            )
+        };
+
+        if new_confidence < alert.confidence {
+            alert.metadata.insert(
+                "post_enrichment_reason".to_string(),
+                reason,
+            );
+            alert.confidence = new_confidence;
+        }
+    }
+
+    // ── Check 2: Safe domain suffix match ───────────────────────────────
+    // Also check if the resolved domain matches known-safe suffixes from
+    // the enrichment module (e.g. .microsoft.com, .google.com, etc.)
+    if matched_keyword.is_none() && enrichment::is_safe_domain(&domain_lower) {
+        let is_standard_port = STANDARD_SERVICE_PORTS.contains(&alert.dst_port)
+            || reputation::is_expected_encrypted_port(alert.dst_port);
+
+        if is_standard_port {
+            let reduced = alert.confidence.saturating_sub(60);
+            if reduced < alert.confidence {
+                alert.metadata.insert(
+                    "post_enrichment_reason".to_string(),
+                    format!(
+                        "Domain '{}' matches safe domain list on standard port {} (-60 confidence)",
+                        domain, alert.dst_port
+                    ),
+                );
+                alert.confidence = reduced;
+            }
+        }
+    }
+
+    // ── Re-evaluate severity based on new confidence ────────────────────
+    // Only downgrade severity, never upgrade it (to avoid masking the
+    // original engine's assessment when confidence wasn't changed).
+    let new_severity = match alert.confidence {
+        0..=9 => Severity::Debug,
+        10..=29 => Severity::Info,
+        30..=49 => Severity::Low,
+        50..=75 => Severity::Medium,
+        76..=89 => Severity::High,
+        _ => Severity::Critical,
+    };
+
+    // Only downgrade, never upgrade
+    if new_severity < alert.severity {
+        alert.metadata.insert(
+            "severity_adjusted".to_string(),
+            format!("{} → {}", alert.severity, new_severity),
+        );
+        alert.severity = new_severity;
+    }
 }
