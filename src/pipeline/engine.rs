@@ -543,23 +543,68 @@ fn analyze_tcp(
     }
 
     // ── T1001 Obfuscation / Steganography ─────────────────────────────
-    if let Some(steg) = protocols::obfuscation::analyze_steganography(&session_data, port) {
-        let alert = MitreAlert::new(
-            &steg.technique_id,
-            "Data Obfuscation",
-            Severity::High,
-            80,
-            src_ip.to_string(),
-            dst_ip.to_string(),
-            tcp.source_port,
-            tcp.destination_port,
-            "tcp",
-            "obfuscation_detected",
-            &steg.reason,
-        )
-        .with_meta("pattern_type", steg.pattern_type)
-        .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy));
-        emit(alert, stats);
+    // Build context for TLS-padding CDN heuristic (SNI extracted earlier
+    // in the enrichment path would be ideal, but we extract it here too
+    // to keep the obfuscation module self-contained for the fast path).
+    let sni_for_steg = crate::analysis::enrichment::extract_sni(&session_data);
+    let steg_ctx = protocols::obfuscation::StegContext {
+        sni: sni_for_steg.as_deref(),
+        dst_ip: &dst_ip.to_string(),
+    };
+    if let Some(steg) = protocols::obfuscation::analyze_steganography_with_context(
+        &session_data,
+        port,
+        Some(&steg_ctx),
+    ) {
+        if steg.is_benign {
+            // TLS padding from a known CDN — emit as INFO / BENIGN
+            let mut alert = MitreAlert::new(
+                &steg.technique_id,
+                "Data Obfuscation",
+                Severity::Info,
+                5, // very low confidence — essentially benign
+                src_ip.to_string(),
+                dst_ip.to_string(),
+                tcp.source_port,
+                tcp.destination_port,
+                "tcp",
+                "obfuscation_benign",
+                &steg.reason,
+            )
+            .with_meta("pattern_type", &steg.pattern_type)
+            .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy))
+            .with_meta("verdict", "BENIGN");
+
+            if let Some(ref feature) = steg.protocol_feature {
+                alert = alert.with_meta("protocol_feature", feature);
+            }
+            if let Some(ref cdn) = steg.cdn_provider {
+                alert = alert.with_meta("cdn_provider", cdn);
+            }
+            if let Some(ref sni) = sni_for_steg {
+                alert = alert.with_meta("sni", sni);
+            }
+
+            emit(alert, stats);
+        } else {
+            // Genuine obfuscation / steganography — emit at full severity
+            let alert = MitreAlert::new(
+                &steg.technique_id,
+                "Data Obfuscation",
+                Severity::High,
+                80,
+                src_ip.to_string(),
+                dst_ip.to_string(),
+                tcp.source_port,
+                tcp.destination_port,
+                "tcp",
+                "obfuscation_detected",
+                &steg.reason,
+            )
+            .with_meta("pattern_type", steg.pattern_type)
+            .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy));
+            emit(alert, stats);
+        }
     }
 
     // ── T1039 SMB/RPC Anomaly ─────────────────────────────────────────

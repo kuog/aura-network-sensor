@@ -5,9 +5,65 @@ pub struct StegResult {
     pub reason: String,
     pub observed_entropy: f64,
     pub pattern_type: String,
+    /// When `true`, the detection is considered benign (e.g. TLS padding from
+    /// a known CDN on port 443 with consistently high entropy).
+    pub is_benign: bool,
+    /// Optional protocol-level feature tag (e.g. "TLS Padding detected").
+    pub protocol_feature: Option<String>,
+    /// CDN provider name when the benign heuristic matched.
+    pub cdn_provider: Option<String>,
+}
+
+/// Additional context passed into the steganography analyser so it can
+/// distinguish legitimate TLS padding from real obfuscation.
+pub struct StegContext<'a> {
+    /// SNI hostname extracted from the TLS Client Hello, if available.
+    pub sni: Option<&'a str>,
+    /// Destination IP address (as string) — used for IP-based CDN matching.
+    pub dst_ip: &'a str,
+}
+
+// ---------------------------------------------------------------------------
+// Known CDN SNI suffixes (Cloudflare, Akamai, Fastly)
+// ---------------------------------------------------------------------------
+
+const CDN_SNI_SUFFIXES: &[(&str, &str)] = &[
+    // Cloudflare
+    (".cloudflare.com", "Cloudflare"),
+    (".cloudflare-dns.com", "Cloudflare"),
+    (".cloudflareinsights.com", "Cloudflare"),
+    // Akamai
+    (".akamai.net", "Akamai"),
+    (".akamaized.net", "Akamai"),
+    (".akamaiedge.net", "Akamai"),
+    (".akamaitechnologies.com", "Akamai"),
+    // Fastly
+    (".fastly.net", "Fastly"),
+    (".fastlylb.net", "Fastly"),
+    (".fastly.com", "Fastly"),
+];
+
+/// Check if the SNI belongs to a known CDN (Cloudflare, Akamai, Fastly).
+/// Returns the provider name on match.
+fn match_cdn_sni(sni: &str) -> Option<&'static str> {
+    let lower = sni.to_lowercase();
+    for &(suffix, provider) in CDN_SNI_SUFFIXES {
+        if lower.ends_with(suffix) || lower == suffix.trim_start_matches('.') {
+            return Some(provider);
+        }
+    }
+    None
 }
 
 pub fn analyze_steganography(payload: &[u8], port: u16) -> Option<StegResult> {
+    analyze_steganography_with_context(payload, port, None)
+}
+
+pub fn analyze_steganography_with_context(
+    payload: &[u8],
+    port: u16,
+    ctx: Option<&StegContext>,
+) -> Option<StegResult> {
     if payload.is_empty() {
         return None;
     }
@@ -24,6 +80,9 @@ pub fn analyze_steganography(payload: &[u8], port: u16) -> Option<StegResult> {
                 reason: "Entropy dilution detected".to_string(),
                 observed_entropy: entropy,
                 pattern_type: format!("Low entropy {} file", format),
+                is_benign: false,
+                protocol_feature: None,
+                cdn_provider: None,
             });
         }
     }
@@ -31,12 +90,37 @@ pub fn analyze_steganography(payload: &[u8], port: u16) -> Option<StegResult> {
     // Trigger 3: Null Byte Padding
     // Detect large blocks of null bytes (0x00) used as padding
     if has_null_block(payload, 32) {
-         return Some(StegResult {
-                technique_id: "T1001".to_string(),
-                reason: "Entropy dilution detected".to_string(),
-                observed_entropy: entropy,
-                pattern_type: "Null byte padding".to_string(),
-            });
+        // ── TLS Padding CDN heuristic (T1001 benign) ───────────────────
+        // If null-byte padding is detected on port 443 while communicating
+        // with a known CDN (Cloudflare, Akamai, Fastly) AND entropy is
+        // consistently high (> 7.9), this is legitimate TLS record padding
+        // and should be marked BENIGN.
+        if port == 443 && entropy > 7.9 {
+            if let Some(cdn_provider) = ctx.and_then(|c| c.sni).and_then(match_cdn_sni) {
+                return Some(StegResult {
+                    technique_id: "T1001".to_string(),
+                    reason: format!(
+                        "TLS null-byte padding on port 443 to known CDN '{}' with high entropy ({:.2}) — benign",
+                        cdn_provider, entropy,
+                    ),
+                    observed_entropy: entropy,
+                    pattern_type: "Null byte padding".to_string(),
+                    is_benign: true,
+                    protocol_feature: Some("TLS Padding detected".to_string()),
+                    cdn_provider: Some(cdn_provider.to_string()),
+                });
+            }
+        }
+
+        return Some(StegResult {
+            technique_id: "T1001".to_string(),
+            reason: "Entropy dilution detected".to_string(),
+            observed_entropy: entropy,
+            pattern_type: "Null byte padding".to_string(),
+            is_benign: false,
+            protocol_feature: None,
+            cdn_provider: None,
+        });
     }
 
     // Trigger 2: Hidden Strings
@@ -51,6 +135,9 @@ pub fn analyze_steganography(payload: &[u8], port: u16) -> Option<StegResult> {
                 reason: "Entropy dilution detected".to_string(),
                 observed_entropy: entropy,
                 pattern_type: "Hidden strings in encrypted channel".to_string(),
+                is_benign: false,
+                protocol_feature: None,
+                cdn_provider: None,
             });
         }
     }
