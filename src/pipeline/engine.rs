@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::analysis::enrichment::{self, ScoringInput};
 use crate::analysis::protocol_filter::{self, FilterVerdict};
+use crate::analysis::reputation::{self, ReputationVerdict};
 use crate::l3_defrag::Defragmenter;
 use crate::l4_reassembly::Reassembler;
 use crate::protocols;
@@ -602,7 +603,7 @@ fn analyze_tcp(
         emit(alert, stats);
     }
 
-    // ── Beaconing + TLS + Enrichment ──────────────────────────────────
+    // ── Beaconing + TLS + Enrichment + IP Reputation ─────────────────
     let is_beaconing = b_score < 0.15;
     let mut ja3_hash_str = None;
 
@@ -629,12 +630,13 @@ fn analyze_tcp(
         }
     }
 
-    let is_standard_tls = [443, 8443, 465].contains(&tcp.source_port)
-        || [443, 8443, 465].contains(&tcp.destination_port);
-    let high_entropy_trigger = entropy > 7.5 && !is_standard_tls;
+    // Expand "standard TLS" to include all well-known encrypted ports
+    let is_standard_encrypted = reputation::is_expected_encrypted_port(tcp.source_port)
+        || reputation::is_expected_encrypted_port(tcp.destination_port);
+    let high_entropy_trigger = entropy > 7.5 && !is_standard_encrypted;
 
     if high_entropy_trigger || ja3_hash_str.is_some() || is_beaconing {
-        // Run enrichment scoring
+        // ── Step 1: Context Enrichment (SNI + domain reputation) ───────
         let scoring_input = ScoringInput {
             tls_payload: &session_data,
             dst_port: tcp.destination_port,
@@ -642,54 +644,146 @@ fn analyze_tcp(
             session_data: &session_data,
         };
         let enrichment_result = enrichment::enrich(&scoring_input);
+        let sni_ref = enrichment_result.enriched_context.sni.as_deref();
 
-        let severity = match enrichment_result.confidence_score {
-            0..=39 => Severity::Low,
-            40..=69 => Severity::Medium,
-            70..=89 => Severity::High,
-            _ => Severity::Critical,
-        };
+        // ── Step 1b: IP Reputation Lookup ─────────────────────────────
+        let flow_rep = reputation::evaluate_flow(
+            &src_ip.to_string(),
+            &dst_ip.to_string(),
+            tcp.destination_port,
+            sni_ref,
+        );
 
-        if high_entropy_trigger {
-            let alert = MitreAlert::new(
-                "T1573",
-                "Encrypted Channel",
-                severity,
-                enrichment_result.confidence_score,
-                src_ip.to_string(),
-                dst_ip.to_string(),
-                tcp.source_port,
+        // ── Step 2: Heuristic Adjustment for T1573 ───────────────────
+        if high_entropy_trigger || (entropy > 7.5 && is_standard_encrypted) {
+            let verdict = reputation::adjust_t1573(
+                &flow_rep,
                 tcp.destination_port,
-                "tcp",
-                "high_entropy",
-                "Encrypted payload on non-standard port",
-            )
-            .with_meta("entropy", format!("{:.2}", entropy))
-            .with_meta("jitter", format!("{:.2}", b_score))
-            .with_meta(
-                "sni",
-                enrichment_result
-                    .enriched_context
-                    .sni
-                    .clone()
-                    .unwrap_or_default(),
-            )
-            .with_meta(
-                "provider",
-                enrichment_result
-                    .enriched_context
-                    .provider
-                    .clone()
-                    .unwrap_or_default(),
+                entropy,
+                sni_ref,
             );
-            emit(alert, stats);
+
+            match verdict {
+                ReputationVerdict::Suppress { reason } => {
+                    // Do NOT emit T1573 — this is trusted encrypted traffic
+                    debug!(
+                        "[Engine] T1573 suppressed: {} ({}:{} → {}:{})",
+                        reason,
+                        src_ip, tcp.source_port,
+                        dst_ip, tcp.destination_port,
+                    );
+                }
+                ReputationVerdict::Downgrade { reason } => {
+                    // Emit as INFO with confidence 0
+                    let alert = MitreAlert::new(
+                        "T1573",
+                        "Encrypted Channel",
+                        Severity::Info,
+                        0,
+                        src_ip.to_string(),
+                        dst_ip.to_string(),
+                        tcp.source_port,
+                        tcp.destination_port,
+                        "tcp",
+                        "high_entropy",
+                        &reason,
+                    )
+                    .with_meta("entropy", format!("{:.2}", entropy))
+                    .with_meta("jitter", format!("{:.2}", b_score))
+                    .with_meta("provider", &flow_rep.provider)
+                    .with_meta("port_service", &flow_rep.port_service)
+                    .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string())
+                    .with_meta(
+                        "sni",
+                        sni_ref.unwrap_or(""),
+                    );
+                    emit(alert, stats);
+                }
+                ReputationVerdict::Adjust {
+                    severity_hint,
+                    confidence,
+                    reason,
+                } => {
+                    let severity = match severity_hint {
+                        "INFO" => Severity::Info,
+                        "LOW" => Severity::Low,
+                        "MEDIUM" => Severity::Medium,
+                        "HIGH" => Severity::High,
+                        "CRITICAL" => Severity::Critical,
+                        _ => Severity::Medium,
+                    };
+                    let alert = MitreAlert::new(
+                        "T1573",
+                        "Encrypted Channel",
+                        severity,
+                        confidence,
+                        src_ip.to_string(),
+                        dst_ip.to_string(),
+                        tcp.source_port,
+                        tcp.destination_port,
+                        "tcp",
+                        "high_entropy",
+                        &reason,
+                    )
+                    .with_meta("entropy", format!("{:.2}", entropy))
+                    .with_meta("jitter", format!("{:.2}", b_score))
+                    .with_meta("provider", &flow_rep.provider)
+                    .with_meta("port_service", &flow_rep.port_service)
+                    .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string())
+                    .with_meta(
+                        "sni",
+                        sni_ref.unwrap_or(""),
+                    );
+                    emit(alert, stats);
+                }
+                ReputationVerdict::NoChange => {
+                    // Use original enrichment-based severity
+                    let severity = match enrichment_result.confidence_score {
+                        0..=39 => Severity::Low,
+                        40..=69 => Severity::Medium,
+                        70..=89 => Severity::High,
+                        _ => Severity::Critical,
+                    };
+                    let alert = MitreAlert::new(
+                        "T1573",
+                        "Encrypted Channel",
+                        severity,
+                        enrichment_result.confidence_score,
+                        src_ip.to_string(),
+                        dst_ip.to_string(),
+                        tcp.source_port,
+                        tcp.destination_port,
+                        "tcp",
+                        "high_entropy",
+                        "Encrypted payload on non-standard port",
+                    )
+                    .with_meta("entropy", format!("{:.2}", entropy))
+                    .with_meta("jitter", format!("{:.2}", b_score))
+                    .with_meta("provider", &flow_rep.provider)
+                    .with_meta("port_service", &flow_rep.port_service)
+                    .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string())
+                    .with_meta(
+                        "sni",
+                        sni_ref.unwrap_or(""),
+                    );
+                    emit(alert, stats);
+                }
+            }
         }
 
+        // ── Beaconing detection (T1011) — also enriched with reputation ─
         if is_beaconing {
+            let severity = match enrichment_result.confidence_score {
+                0..=39 => Severity::Low,
+                40..=69 => Severity::Medium,
+                70..=89 => Severity::High,
+                _ => Severity::Critical,
+            };
+
             let logic = if enrichment_result.confidence_score < 40 {
                 format!(
                     "Periodic communication detected — likely legitimate {} traffic (confidence_score: {})",
-                    enrichment_result.enriched_context.provider.as_deref().unwrap_or("unknown"),
+                    flow_rep.provider,
                     enrichment_result.confidence_score
                 )
             } else {
@@ -709,7 +803,10 @@ fn analyze_tcp(
                 "beaconing",
                 logic,
             )
-            .with_meta("jitter_score", format!("{:.2}", b_score));
+            .with_meta("jitter_score", format!("{:.2}", b_score))
+            .with_meta("provider", &flow_rep.provider)
+            .with_meta("port_service", &flow_rep.port_service)
+            .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string());
             emit(alert, stats);
         }
     }
