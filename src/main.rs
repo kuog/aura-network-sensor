@@ -8,6 +8,12 @@
 //! │   Sniffer   │──────────▶│   Engine    │──────────▶│  Exporter   │
 //! │   (pcap)    │ crossbeam │  (MITRE)    │  tokio    │ Console+DB  │
 //! └─────────────┘           └─────────────┘           └─────────────┘
+//!                                 │
+//!                                 ▼
+//!                           ┌─────────────┐  background  ┌─────────────┐
+//!                           │ FlowTracker │─────────────▶│  Isolation  │
+//!                           │  (DashMap)  │   flush      │  Forest ML  │
+//!                           └─────────────┘              └─────────────┘
 //! ```
 //!
 //! Graceful shutdown via `Arc<AtomicBool>` + Ctrl+C handler.
@@ -18,6 +24,7 @@ pub mod telemetry;
 pub mod protocols;
 pub mod report;
 pub mod analysis;
+pub mod anomaly;
 pub mod pipeline;
 
 use log::{error, info};
@@ -26,6 +33,8 @@ use std::sync::Arc;
 
 use analysis::dns_resolver::DnsCache;
 use analysis::dns_tracker::DnsTracker;
+use anomaly::detector::AnomalyDetector;
+use anomaly::flow_tracker::FlowTracker;
 use pipeline::engine::EngineStats;
 use pipeline::exporter::ExporterStats;
 use pipeline::sniffer::{CaptureSource, SnifferStats};
@@ -36,6 +45,12 @@ const RING_BUFFER_CAPACITY: usize = 10_000;
 // ── Default core assignments ──────────────────────────────────────────────
 const SNIFFER_CORE: usize = 0;
 const ENGINE_CORE: usize = 1;
+
+// ── Default learning time (minutes) ───────────────────────────────────────
+const DEFAULT_LEARNING_TIME_MINUTES: u64 = 10;
+
+// ── Default flow flush interval (seconds) ─────────────────────────────────
+const FLOW_FLUSH_INTERVAL_SECS: u64 = 5;
 
 fn print_usage() {
     pipeline::console_fmt::print_usage();
@@ -63,6 +78,7 @@ fn main() {
     let mut interface: Option<String> = None;
     let mut pcap_file: Option<String> = None;
     let mut db_path: Option<String> = None;
+    let mut learning_time: u64 = DEFAULT_LEARNING_TIME_MINUTES;
     let mut i = 1;
 
     while i < args.len() {
@@ -93,6 +109,25 @@ fn main() {
                     i += 2;
                 } else {
                     eprintln!("Error: -d requires a database path");
+                    print_usage();
+                    return;
+                }
+            }
+            "--learning-time" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u64>() {
+                        Ok(minutes) => {
+                            learning_time = minutes;
+                            i += 2;
+                        }
+                        Err(_) => {
+                            eprintln!("Error: --learning-time requires a number (minutes)");
+                            print_usage();
+                            return;
+                        }
+                    }
+                } else {
+                    eprintln!("Error: --learning-time requires a value in minutes");
                     print_usage();
                     return;
                 }
@@ -165,6 +200,22 @@ fn main() {
     // ── Shared DNS resolver cache (active, hickory-resolver) ────────────
     let dns_cache = DnsCache::shared();
 
+    // ── Anomaly Detection: FlowTracker + AnomalyDetector ───────────────
+    let flow_tracker = FlowTracker::shared();
+    let anomaly_detector = AnomalyDetector::shared(learning_time, None);
+
+    // Try to load a previously trained model
+    if anomaly_detector.try_load_model() {
+        info!(
+            "Loaded pre-trained anomaly model — skipping learning phase"
+        );
+    } else {
+        info!(
+            "Anomaly detection: learning phase = {} minutes",
+            learning_time
+        );
+    }
+
     // ── Channel: Sniffer → Engine (bounded crossbeam ring buffer) ─────
     let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(RING_BUFFER_CAPACITY);
 
@@ -190,22 +241,50 @@ fn main() {
     // Spawn the exporter task inside the runtime
     let dns_tracker_exporter = dns_tracker.clone();
     let dns_cache_exporter = dns_cache.clone();
+    let anomaly_detector_exporter = anomaly_detector.clone();
     let exporter_handle = rt.spawn(pipeline::exporter::run(
         alert_rx,
         exporter_stats_clone,
-        db_path,
+        db_path.clone(),
         dns_tracker_exporter,
         dns_cache_exporter,
+        anomaly_detector_exporter,
+    ));
+
+    // Spawn the anomaly detection background flush task
+    let features_db_path = anomaly::db::ensure_db_path(
+        db_path.as_deref().unwrap_or("alerts.db"),
+    );
+    let anomaly_detector_bg = anomaly_detector.clone();
+    let flow_tracker_bg = flow_tracker.clone();
+    let running_bg = running.clone();
+    let _anomaly_handle = rt.spawn(anomaly::detector::background_flush_task(
+        anomaly_detector_bg,
+        flow_tracker_bg,
+        features_db_path,
+        running_bg,
+        FLOW_FLUSH_INTERVAL_SECS,
     ));
 
     // ── Stage 2: MITRE Analysis Engine (Core 1) ───────────────────────
     let engine_running = running.clone();
     let engine_stats_clone = engine_stats.clone();
     let dns_tracker_engine = dns_tracker.clone();
+    let flow_tracker_engine = flow_tracker.clone();
+    let anomaly_detector_engine = anomaly_detector.clone();
     let engine_thread = std::thread::Builder::new()
         .name("engine".to_string())
         .spawn(move || {
-            pipeline::engine::run(pkt_rx, alert_tx, engine_running, engine_stats_clone, ENGINE_CORE, dns_tracker_engine);
+            pipeline::engine::run(
+                pkt_rx,
+                alert_tx,
+                engine_running,
+                engine_stats_clone,
+                ENGINE_CORE,
+                dns_tracker_engine,
+                flow_tracker_engine,
+                anomaly_detector_engine,
+            );
         })
         .expect("Failed to spawn engine thread");
 

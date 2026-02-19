@@ -507,8 +507,31 @@ pub fn print_usage() {
     );
     println!(
         "  {}   {}",
+        "--learning-time <min>".cyan(),
+        "AI learning phase duration in minutes (default: 10)".white(),
+    );
+    println!(
+        "  {}   {}",
         "-h, --help    ".cyan(),
         "Show this help message".white(),
+    );
+    println!();
+    println!("{}", "Anomaly Detection:".bright_white().bold());
+    println!(
+        "  {}",
+        "The sensor includes an Isolation Forest ML model for automatic".dimmed(),
+    );
+    println!(
+        "  {}",
+        "false-positive suppression. During --learning-time, it collects".dimmed(),
+    );
+    println!(
+        "  {}",
+        "baseline traffic patterns. After training, it scores each alert".dimmed(),
+    );
+    println!(
+        "  {}",
+        "and suppresses those matching normal network behavior.".dimmed(),
     );
     println!();
 }

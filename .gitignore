@@ -1,3 +1,5 @@
 target/
 alerts.db
 suppressed.log
+alerts_features.db
+anomaly_model.bin

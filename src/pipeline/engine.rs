@@ -22,6 +22,9 @@ use crate::analysis::dns_tracker::{self, DnsTracker};
 use crate::analysis::enrichment::{self, ScoringInput};
 use crate::analysis::protocol_filter::{self, FilterVerdict};
 use crate::analysis::reputation::{self, ReputationVerdict};
+use crate::anomaly::detector::AnomalyDetector;
+use crate::anomaly::flow_tracker::FlowTracker;
+use crate::anomaly::types::Protocol;
 use crate::l3_defrag::Defragmenter;
 use crate::l4_reassembly::Reassembler;
 use crate::protocols;
@@ -80,12 +83,14 @@ fn is_local_ip(ip: &IpAddr) -> bool {
 /// Run the analysis engine. Intended to be called inside `std::thread::spawn`.
 ///
 /// # Arguments
-/// * `rx`          – Crossbeam receiver (ring buffer consumer).
-/// * `alert_tx`    – Tokio unbounded sender for emitting alerts to Stage 3.
-/// * `running`     – Shared shutdown flag.
-/// * `stats`       – Shared atomic counters.
-/// * `core_id`     – Physical core to pin to (typically 1).
-/// * `dns_tracker` – Shared passive DNS cache for IP→domain resolution.
+/// * `rx`               – Crossbeam receiver (ring buffer consumer).
+/// * `alert_tx`         – Tokio unbounded sender for emitting alerts to Stage 3.
+/// * `running`          – Shared shutdown flag.
+/// * `stats`            – Shared atomic counters.
+/// * `core_id`          – Physical core to pin to (typically 1).
+/// * `dns_tracker`      – Shared passive DNS cache for IP→domain resolution.
+/// * `flow_tracker`     – Shared flow tracker for anomaly detection.
+/// * `anomaly_detector` – Shared anomaly detector (Isolation Forest).
 pub fn run(
     rx: Receiver<RawPacket>,
     alert_tx: UnboundedSender<MitreAlert>,
@@ -93,6 +98,8 @@ pub fn run(
     stats: Arc<EngineStats>,
     core_id: usize,
     dns_tracker: Arc<DnsTracker>,
+    flow_tracker: Arc<FlowTracker>,
+    _anomaly_detector: Arc<AnomalyDetector>,
 ) {
     // ── Core pinning ──────────────────────────────────────────────────
     pin_to_core("Engine", core_id);
@@ -242,6 +249,44 @@ pub fn run(
         };
 
         if let Some((scan_src, scan_dst)) = ip_addrs {
+            // ── Flow Tracking for Anomaly Detection ─────────────────────
+            // Record every IP packet into the FlowTracker for session aggregation.
+            {
+                let (src_port, dst_port, protocol, tcp_fin, tcp_rst, payload_data) =
+                    match &headers.transport {
+                        Some(TransportHeader::Tcp(tcp)) => (
+                            tcp.source_port,
+                            tcp.destination_port,
+                            Protocol::Tcp,
+                            tcp.fin,
+                            tcp.rst,
+                            Some(headers.payload.slice()),
+                        ),
+                        Some(TransportHeader::Udp(udp)) => (
+                            udp.source_port,
+                            udp.destination_port,
+                            Protocol::Udp,
+                            false,
+                            false,
+                            Some(headers.payload.slice()),
+                        ),
+                        _ => (0, 0, Protocol::Other(0), false, false, None),
+                    };
+
+                flow_tracker.record_packet(
+                    scan_src,
+                    scan_dst,
+                    src_port,
+                    dst_port,
+                    protocol,
+                    raw.data.len() as u64,
+                    payload_data,
+                    raw.timestamp,
+                    tcp_fin,
+                    tcp_rst,
+                );
+            }
+
             // T1046 Scanning Detection
             if is_local_ip(&scan_src) {
                 match &headers.transport {

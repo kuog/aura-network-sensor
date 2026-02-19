@@ -20,6 +20,8 @@ use crate::analysis::dns_resolver::{self, DnsCache};
 use crate::analysis::dns_tracker::{self, DnsTracker};
 use crate::analysis::enrichment;
 use crate::analysis::reputation;
+use crate::anomaly::detector::AnomalyDetector;
+use crate::anomaly::types::{DetectorPhase, FlowMetrics, Protocol};
 
 use super::alert::{MitreAlert, Severity};
 
@@ -138,17 +140,19 @@ async fn send_to_cloud(_alert: &MitreAlert) {
 /// Run the async exporter task. Call this via `tokio::spawn`.
 ///
 /// # Arguments
-/// * `rx`          – Tokio unbounded receiver for incoming alerts.
-/// * `stats`       – Shared atomic counters.
-/// * `db_path`     – Path to the SQLite database file (created if absent).
-/// * `dns_tracker` – Shared passive DNS cache for reverse-DNS fallback.
-/// * `dns_cache`   – Shared active DNS resolver cache (hickory-resolver).
+/// * `rx`               – Tokio unbounded receiver for incoming alerts.
+/// * `stats`            – Shared atomic counters.
+/// * `db_path`          – Path to the SQLite database file (created if absent).
+/// * `dns_tracker`      – Shared passive DNS cache for reverse-DNS fallback.
+/// * `dns_cache`        – Shared active DNS resolver cache (hickory-resolver).
+/// * `anomaly_detector` – Shared anomaly detector for AI-based alert suppression.
 pub async fn run(
     mut rx: UnboundedReceiver<MitreAlert>,
     stats: Arc<ExporterStats>,
     db_path: Option<String>,
     dns_tracker: Arc<DnsTracker>,
     dns_cache: Arc<DnsCache>,
+    anomaly_detector: Arc<AnomalyDetector>,
 ) {
     let db_file = db_path.unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
 
@@ -161,7 +165,7 @@ pub async fn run(
         }
     };
 
-    info!("[Exporter] Async exporter task started (with DNS reverse-lookup fallback + hickory-resolver)");
+    info!("[Exporter] Async exporter task started (with DNS reverse-lookup fallback + hickory-resolver + anomaly detection)");
 
     // ── Periodic DNS cache eviction counter ────────────────────────────
     let mut alert_count: u64 = 0;
@@ -169,6 +173,9 @@ pub async fn run(
     // ── Main drain loop ───────────────────────────────────────────────
     while let Some(mut alert) = rx.recv().await {
         alert_count += 1;
+
+        // ── AI-driven Alert Suppression (Isolation Forest) ─────────────
+        apply_anomaly_suppression(&mut alert, &anomaly_detector);
 
         // ── Active DNS Resolver Enrichment (hickory-resolver) ─────────
         // Performs async reverse lookup, known-good matching, fast-flux
@@ -447,5 +454,192 @@ fn post_enrichment_adjust(alert: &mut MitreAlert) {
             format!("{} → {}", alert.severity, new_severity),
         );
         alert.severity = new_severity;
+    }
+}
+
+// ── AI-driven Anomaly Suppression ──────────────────────────────────────────
+
+/// Apply Isolation Forest-based anomaly suppression to an alert.
+///
+/// During the **Learning Phase**, alerts are tagged with `[LEARNING MODE]` metadata
+/// but not suppressed. During the **Inference Phase**, the alert's flow characteristics
+/// are scored by the Isolation Forest model:
+///
+/// - If the model classifies the flow as **Normal** (typical traffic pattern for this
+///   network), the alert severity is reduced to DEBUG/INFO and an `ai_confidence_score`
+///   metadata field is added.
+/// - If the model classifies the flow as **Anomalous**, the alert is left unchanged
+///   (or even boosted if the anomaly score is very high).
+fn apply_anomaly_suppression(alert: &mut MitreAlert, detector: &AnomalyDetector) {
+    let phase = detector.phase();
+
+    match phase {
+        DetectorPhase::Learning => {
+            // Tag alerts during learning phase
+            alert.metadata.insert(
+                "ai_phase".to_string(),
+                "LEARNING".to_string(),
+            );
+            let remaining = detector.remaining_learning_time();
+            alert.metadata.insert(
+                "ai_learning_remaining_secs".to_string(),
+                remaining.as_secs().to_string(),
+            );
+        }
+        DetectorPhase::Training => {
+            // Model is being trained — tag but don't suppress
+            alert.metadata.insert(
+                "ai_phase".to_string(),
+                "TRAINING".to_string(),
+            );
+        }
+        DetectorPhase::Inference => {
+            // Build a FlowMetrics from the alert for scoring
+            let flow = alert_to_flow_metrics(alert);
+            if let Some(result) = detector.predict(&flow) {
+                // Always add the AI confidence score to metadata
+                alert.metadata.insert(
+                    "ai_confidence_score".to_string(),
+                    format!("{:.4}", result.anomaly_score),
+                );
+                alert.metadata.insert(
+                    "ai_phase".to_string(),
+                    "INFERENCE".to_string(),
+                );
+                alert.metadata.insert(
+                    "ai_classification".to_string(),
+                    if result.is_normal {
+                        "NORMAL".to_string()
+                    } else {
+                        "ANOMALOUS".to_string()
+                    },
+                );
+
+                if result.is_normal && result.confidence > 0.3 {
+                    // Flow is classified as normal with reasonable confidence.
+                    // Suppress the alert by reducing severity and confidence.
+                    let original_severity = alert.severity;
+                    let original_confidence = alert.confidence;
+
+                    // Scale down confidence based on AI confidence
+                    // Higher AI confidence in "normal" → more suppression
+                    let suppression_factor = result.confidence.min(0.9);
+                    let new_confidence = (alert.confidence as f64 * (1.0 - suppression_factor)) as u8;
+
+                    alert.confidence = new_confidence;
+
+                    // Reduce severity based on new confidence
+                    let new_severity = if new_confidence <= 10 {
+                        Severity::Debug
+                    } else if new_confidence <= 25 {
+                        Severity::Info
+                    } else if new_confidence <= 40 {
+                        Severity::Low
+                    } else {
+                        alert.severity // Keep original if suppression wasn't strong enough
+                    };
+
+                    // Only downgrade severity, never upgrade
+                    if new_severity < alert.severity {
+                        alert.severity = new_severity;
+                    }
+
+                    alert.metadata.insert(
+                        "ai_suppression".to_string(),
+                        format!(
+                            "Normal traffic pattern (score={:.4}, confidence={:.2}). Severity: {} → {}, Confidence: {} → {}",
+                            result.anomaly_score,
+                            result.confidence,
+                            original_severity,
+                            alert.severity,
+                            original_confidence,
+                            alert.confidence,
+                        ),
+                    );
+
+                    debug!(
+                        "[Exporter] AI suppression: {} {} → {} (score={:.4}, ai_conf={:.2})",
+                        alert.technique_id,
+                        original_severity,
+                        alert.severity,
+                        result.anomaly_score,
+                        result.confidence,
+                    );
+                }
+                // If anomalous, leave the alert as-is (the signature detection is confirmed)
+            }
+        }
+    }
+}
+
+/// Convert a MitreAlert into a FlowMetrics for anomaly scoring.
+///
+/// Since the alert doesn't contain all flow-level features, we construct
+/// a best-effort FlowMetrics from the available alert metadata.
+fn alert_to_flow_metrics(alert: &MitreAlert) -> FlowMetrics {
+    let src_ip: IpAddr = alert
+        .src_ip
+        .parse()
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+    let dst_ip: IpAddr = alert
+        .dst_ip
+        .parse()
+        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+
+    let protocol = match alert.protocol.as_str() {
+        "tcp" => Protocol::Tcp,
+        "udp" => Protocol::Udp,
+        "icmp" => Protocol::Icmp,
+        _ => Protocol::Other(0),
+    };
+
+    // Extract entropy from metadata if available
+    let entropy = alert
+        .metadata
+        .get("entropy")
+        .or_else(|| alert.metadata.get("observed_entropy"))
+        .and_then(|e| e.parse::<f64>().ok())
+        .unwrap_or(4.0); // Default to mid-range entropy
+
+    // Extract duration from metadata if available
+    let duration_ms = alert
+        .metadata
+        .get("duration_ms")
+        .and_then(|d| d.parse::<u64>().ok())
+        .unwrap_or(1000); // Default 1 second
+
+    // Extract packet count from metadata if available
+    let packet_count = alert
+        .metadata
+        .get("packet_count")
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(10); // Default 10 packets
+
+    // Extract bytes count from metadata if available
+    let bytes_count = alert
+        .metadata
+        .get("bytes_count")
+        .and_then(|b| b.parse::<u64>().ok())
+        .unwrap_or(5000); // Default 5KB
+
+    // Extract IAT mean from metadata if available
+    let iat_mean = alert
+        .metadata
+        .get("iat_mean")
+        .and_then(|i| i.parse::<f64>().ok())
+        .unwrap_or(100.0); // Default 100ms
+
+    FlowMetrics {
+        timestamp: alert.timestamp.timestamp() as f64,
+        src_ip,
+        dst_ip,
+        src_port: alert.src_port,
+        dst_port: alert.dst_port,
+        protocol,
+        entropy,
+        duration_ms,
+        packet_count,
+        bytes_count,
+        iat_mean,
     }
 }

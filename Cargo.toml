@@ -47,3 +47,13 @@ colored = "3"
 
 # Accurate terminal column-width for Unicode (emoji = 2 columns, etc.)
 unicode-width = "0.2"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Random number generation (for Isolation Forest)
+rand = "0.8"
+
+# Serialization for ML model persistence
+bincode = "1"
