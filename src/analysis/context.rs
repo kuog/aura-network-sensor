@@ -81,6 +81,12 @@ static CDN_PROVIDERS: LazyLock<Vec<CdnProvider>> = LazyLock::new(|| {
                 "190.93.240.0/20",
                 "197.234.240.0/22",
                 "198.41.128.0/17",
+                // IPv6
+                "2400:cb00::/32",
+                "2606:4700::/32",
+                "2803:f800::/32",
+                "2a06:98c0::/29",
+                "2c0f:f248::/32",
             ]),
         },
         CdnProvider {
@@ -96,6 +102,9 @@ static CDN_PROVIDERS: LazyLock<Vec<CdnProvider>> = LazyLock::new(|| {
                 "184.84.0.0/14",
                 "2.16.0.0/13",
                 "95.100.0.0/15",
+                // IPv6
+                "2600:1400::/24",
+                "2600:1480::/24",
             ]),
         },
         CdnProvider {
@@ -119,6 +128,13 @@ static CDN_PROVIDERS: LazyLock<Vec<CdnProvider>> = LazyLock::new(|| {
                 "173.194.0.0/16",
                 "209.85.128.0/17",
                 "216.58.192.0/19",
+                // IPv6
+                "2001:4860::/32",
+                "2404:6800::/32",
+                "2607:f8b0::/32",
+                "2800:3f0::/32",
+                "2a00:1450::/32",
+                "2c0f:fb50::/32",
             ]),
         },
         CdnProvider {
@@ -143,6 +159,9 @@ static CDN_PROVIDERS: LazyLock<Vec<CdnProvider>> = LazyLock::new(|| {
                 "185.31.16.0/22",
                 "199.27.72.0/21",
                 "199.232.0.0/16",
+                // IPv6
+                "2a04:4e40::/32",
+                "2a04:4e42::/32",
             ]),
         },
         CdnProvider {
@@ -168,6 +187,12 @@ static CDN_PROVIDERS: LazyLock<Vec<CdnProvider>> = LazyLock::new(|| {
                 "54.224.0.0/12",
                 "99.77.128.0/18",
                 "176.32.96.0/21",
+                // IPv6
+                "2600:1f00::/24",
+                "2600:1ff0::/24",
+                "2406:da00::/24",
+                "2a05:d000::/25",
+                "2600:9000::/28",
             ]),
         },
     ]

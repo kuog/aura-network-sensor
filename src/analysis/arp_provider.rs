@@ -286,7 +286,13 @@ impl ArpGuardian {
                 // Common gateway addresses: x.x.x.1 or x.x.x.254
                 octets[3] == 1 || octets[3] == 254
             }
-            _ => false,
+            IpAddr::V6(v6) => {
+                let segs = v6.segments();
+                // fe80::1 is the most common IPv6 link-local gateway address.
+                // Also match fe80::<anything>::1 (last segment == 1).
+                let is_link_local = (segs[0] & 0xffc0) == 0xfe80;
+                is_link_local && segs[7] == 1
+            }
         }
     }
 }

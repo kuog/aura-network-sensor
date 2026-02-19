@@ -53,7 +53,10 @@ impl EngineStats {
     }
 }
 
-/// Returns `true` if the IP is in a private RFC-1918 range.
+/// Returns `true` if the IP is in a private/local range.
+///
+/// For IPv4: RFC-1918 private ranges (10/8, 172.16/12, 192.168/16).
+/// For IPv6: link-local (fe80::/10), ULA (fc00::/7), and loopback (::1).
 fn is_local_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
@@ -62,7 +65,15 @@ fn is_local_ip(ip: &IpAddr) -> bool {
                 || (o[0] == 192 && o[1] == 168)
                 || (o[0] == 172 && (16..=31).contains(&o[1]))
         }
-        _ => false,
+        IpAddr::V6(ipv6) => {
+            let seg0 = ipv6.segments()[0];
+            // fe80::/10 — link-local
+            (seg0 & 0xffc0) == 0xfe80
+            // fc00::/7 — unique local address (ULA)
+            || (seg0 & 0xfe00) == 0xfc00
+            // ::1 — loopback
+            || *ipv6 == std::net::Ipv6Addr::LOCALHOST
+        }
     }
 }
 
@@ -216,11 +227,21 @@ pub fn run(
             }
         }
 
-        // ── IPv4 processing ───────────────────────────────────────────
-        if let Some(NetHeaders::Ipv4(ip_hdr, _)) = headers.net {
-            let scan_src = IpAddr::V4(ip_hdr.source.into());
-            let scan_dst = IpAddr::V4(ip_hdr.destination.into());
+        // ── Extract IP-layer source/destination ────────────────────────
+        // Unified extraction: works for both IPv4 and IPv6 headers.
+        let ip_addrs: Option<(IpAddr, IpAddr)> = match &headers.net {
+            Some(NetHeaders::Ipv4(ip_hdr, _)) => Some((
+                IpAddr::V4(ip_hdr.source.into()),
+                IpAddr::V4(ip_hdr.destination.into()),
+            )),
+            Some(NetHeaders::Ipv6(ip_hdr, _)) => Some((
+                IpAddr::V6(ip_hdr.source.into()),
+                IpAddr::V6(ip_hdr.destination.into()),
+            )),
+            _ => None,
+        };
 
+        if let Some((scan_src, scan_dst)) = ip_addrs {
             // T1046 Scanning Detection
             if is_local_ip(&scan_src) {
                 match &headers.transport {
@@ -288,11 +309,24 @@ pub fn run(
                 }
             }
 
-            // IP defragmentation
-            let ip_payload_bytes = headers.payload.slice();
-            if let Some(full_ip_payload) = defrag.process(&ip_hdr, ip_payload_bytes) {
-                let src_ip = IpAddr::V4(ip_hdr.source.into());
-                let dst_ip = IpAddr::V4(ip_hdr.destination.into());
+            // ── IP payload extraction (IPv4 defrag / IPv6 direct) ──────
+            let full_ip_payload: Option<Vec<u8>> = match &headers.net {
+                Some(NetHeaders::Ipv4(ip_hdr, _)) => {
+                    let ip_payload_bytes = headers.payload.slice();
+                    defrag.process(ip_hdr, ip_payload_bytes)
+                }
+                Some(NetHeaders::Ipv6(_, _)) => {
+                    // IPv6 fragmentation is handled at the extension header
+                    // level; for now pass the payload through directly.
+                    // (Full IPv6 fragment reassembly is a future enhancement.)
+                    Some(headers.payload.slice().to_vec())
+                }
+                _ => None,
+            };
+
+            if let Some(full_ip_payload) = full_ip_payload {
+                let src_ip = scan_src;
+                let dst_ip = scan_dst;
 
                 match headers.transport {
                     Some(TransportHeader::Tcp(tcp)) => {

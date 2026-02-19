@@ -282,28 +282,53 @@ const MICROSOFT_IP_PREFIXES: &[([u8; 4], u8)] = &[
     ([204, 152, 18, 0], 23),
 ];
 
-/// Check whether an IPv4 address (as string) falls within a known Microsoft range.
+/// Known Microsoft / Azure IPv6 CIDR prefixes.
 ///
+/// Source: Microsoft published IP ranges for Azure and M365.
+static MICROSOFT_IPV6_PREFIXES: &[([u8; 16], u8)] = &[
+    // 2603:1000::/24 — Azure
+    ([0x26, 0x03, 0x10, 0x00, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 24),
+    // 2a01:111::/32 — Microsoft 365
+    ([0x2a, 0x01, 0x01, 0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32),
+    // 2a01:112::/32 — Microsoft 365
+    ([0x2a, 0x01, 0x01, 0x12, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 32),
+    // 2620:1ec::/40 — Microsoft
+    ([0x26, 0x20, 0x01, 0xec, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], 40),
+];
+
+/// Check whether an IP address (as string) falls within a known Microsoft range.
+///
+/// Supports both IPv4 and IPv6 addresses.
 /// Returns `true` if the IP is in a trusted Microsoft prefix.
 fn is_microsoft_ip(ip_str: &str) -> bool {
     let ip: IpAddr = match ip_str.parse() {
         Ok(ip) => ip,
         Err(_) => return false,
     };
-    let octets = match ip {
-        IpAddr::V4(v4) => v4.octets(),
-        IpAddr::V6(_) => return false, // TODO: add IPv6 Microsoft ranges
-    };
-    let ip_u32 = u32::from_be_bytes(octets);
-
-    for &(prefix, cidr) in MICROSOFT_IP_PREFIXES {
-        let prefix_u32 = u32::from_be_bytes(prefix);
-        let mask = if cidr == 0 { 0 } else { !0u32 << (32 - cidr) };
-        if (ip_u32 & mask) == (prefix_u32 & mask) {
-            return true;
+    match ip {
+        IpAddr::V4(v4) => {
+            let ip_u32 = u32::from_be_bytes(v4.octets());
+            for &(prefix, cidr) in MICROSOFT_IP_PREFIXES {
+                let prefix_u32 = u32::from_be_bytes(prefix);
+                let mask = if cidr == 0 { 0 } else { !0u32 << (32 - cidr) };
+                if (ip_u32 & mask) == (prefix_u32 & mask) {
+                    return true;
+                }
+            }
+            false
+        }
+        IpAddr::V6(v6) => {
+            let ip_u128 = u128::from_be_bytes(v6.octets());
+            for &(prefix, cidr) in MICROSOFT_IPV6_PREFIXES {
+                let prefix_u128 = u128::from_be_bytes(prefix);
+                let mask = if cidr == 0 { 0 } else { !0u128 << (128 - cidr) };
+                if (ip_u128 & mask) == (prefix_u128 & mask) {
+                    return true;
+                }
+            }
+            false
         }
     }
-    false
 }
 
 /// Compute a trust score for the connection endpoints.

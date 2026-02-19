@@ -4,18 +4,20 @@
 //! for major cloud/mail providers (Apple, Microsoft, Google, AWS, Cloudflare)
 //! and a port-aware service mapping for expected encrypted traffic.
 //!
+//! Supports both IPv4 and IPv6 address ranges.
+//!
 //! **Performance**: All lookups are O(log n) via sorted CIDR prefix matching.
 //! No external API calls are made in the fast path.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::LazyLock;
 
 // ---------------------------------------------------------------------------
 // CIDR Range Representation
 // ---------------------------------------------------------------------------
 
-/// A CIDR range stored as (network_u32, prefix_len) for fast matching.
+/// A CIDR range stored as (network_u32, prefix_len) for fast IPv4 matching.
 #[derive(Debug, Clone, Copy)]
 struct CidrEntry {
     /// Network address as a u32 (host byte order).
@@ -45,14 +47,44 @@ impl CidrEntry {
     }
 }
 
+/// An IPv6 CIDR range stored as (network_u128, prefix_len) for fast matching.
+#[derive(Debug, Clone, Copy)]
+struct Cidr6Entry {
+    /// Network address as a u128 (host byte order).
+    network: u128,
+    /// Prefix length (e.g. 48 for /48).
+    prefix_len: u8,
+}
+
+impl Cidr6Entry {
+    /// Create a new IPv6 CIDR entry from an `Ipv6Addr` and prefix length.
+    const fn new(addr: Ipv6Addr, prefix_len: u8) -> Self {
+        Self {
+            network: u128::from_be_bytes(addr.octets()),
+            prefix_len,
+        }
+    }
+
+    /// Check if an IPv6 address (as u128) falls within this CIDR range.
+    #[inline]
+    fn contains(&self, ip: u128) -> bool {
+        if self.prefix_len == 0 {
+            return true;
+        }
+        let mask = !0u128 << (128 - self.prefix_len);
+        (ip & mask) == (self.network & mask)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Provider Definition
 // ---------------------------------------------------------------------------
 
-/// Known cloud/mail provider with associated CIDR ranges.
+/// Known cloud/mail provider with associated IPv4 and IPv6 CIDR ranges.
 struct ProviderDef {
     name: &'static str,
     ranges: &'static [CidrEntry],
+    ranges_v6: &'static [Cidr6Entry],
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +93,8 @@ struct ProviderDef {
 //
 // These are representative ranges for the prototype. In production, these
 // would be updated from BGP/ASN feeds or provider-published IP lists.
+
+// ── IPv4 CIDR ranges ──────────────────────────────────────────────────────
 
 /// Apple Inc. — iCloud Mail, Push Notifications, iMessage.
 static APPLE_RANGES: &[CidrEntry] = &[
@@ -176,31 +210,87 @@ static GITHUB_RANGES: &[CidrEntry] = &[
     CidrEntry::new(20, 201, 28, 151, 32),  // 20.201.28.151/32 (GitHub Actions)
 ];
 
+// ── IPv6 CIDR ranges ──────────────────────────────────────────────────────
+// Representative IPv6 ranges from provider-published IP lists.
+
+/// Apple IPv6 ranges.
+static APPLE_RANGES_V6: &[Cidr6Entry] = &[
+    Cidr6Entry::new(Ipv6Addr::new(0x2620, 0x0149, 0, 0, 0, 0, 0, 0), 44),  // 2620:149::/44 (Apple)
+    Cidr6Entry::new(Ipv6Addr::new(0x2a01, 0xb740, 0, 0, 0, 0, 0, 0), 32),  // 2a01:b740::/32 (Apple iCloud Private Relay)
+];
+
+/// Microsoft / Azure IPv6 ranges.
+static MICROSOFT_RANGES_V6: &[Cidr6Entry] = &[
+    Cidr6Entry::new(Ipv6Addr::new(0x2603, 0x1000, 0, 0, 0, 0, 0, 0), 24),  // 2603:1000::/24 (Azure)
+    Cidr6Entry::new(Ipv6Addr::new(0x2a01, 0x0111, 0, 0, 0, 0, 0, 0), 32),  // 2a01:111::/32 (Microsoft 365)
+    Cidr6Entry::new(Ipv6Addr::new(0x2a01, 0x0112, 0, 0, 0, 0, 0, 0), 32),  // 2a01:112::/32 (Microsoft 365)
+    Cidr6Entry::new(Ipv6Addr::new(0x2620, 0x1ec, 0, 0, 0, 0, 0, 0), 40),   // 2620:1ec::/40 (Microsoft)
+];
+
+/// Google IPv6 ranges.
+static GOOGLE_RANGES_V6: &[Cidr6Entry] = &[
+    Cidr6Entry::new(Ipv6Addr::new(0x2001, 0x4860, 0, 0, 0, 0, 0, 0), 32),  // 2001:4860::/32 (Google)
+    Cidr6Entry::new(Ipv6Addr::new(0x2404, 0x6800, 0, 0, 0, 0, 0, 0), 32),  // 2404:6800::/32 (Google APAC)
+    Cidr6Entry::new(Ipv6Addr::new(0x2607, 0xf8b0, 0, 0, 0, 0, 0, 0), 32),  // 2607:f8b0::/32 (Google Americas)
+    Cidr6Entry::new(Ipv6Addr::new(0x2800, 0x3f0, 0, 0, 0, 0, 0, 0), 32),   // 2800:3f0::/32 (Google LATAM)
+    Cidr6Entry::new(Ipv6Addr::new(0x2a00, 0x1450, 0, 0, 0, 0, 0, 0), 32),  // 2a00:1450::/32 (Google EMEA)
+    Cidr6Entry::new(Ipv6Addr::new(0x2c0f, 0xfb50, 0, 0, 0, 0, 0, 0), 32),  // 2c0f:fb50::/32 (Google Africa)
+];
+
+/// AWS IPv6 ranges.
+static AWS_RANGES_V6: &[Cidr6Entry] = &[
+    Cidr6Entry::new(Ipv6Addr::new(0x2600, 0x1f00, 0, 0, 0, 0, 0, 0), 24),  // 2600:1f00::/24 (AWS us-east)
+    Cidr6Entry::new(Ipv6Addr::new(0x2600, 0x1ff0, 0, 0, 0, 0, 0, 0), 24),  // 2600:1ff0::/24 (AWS us-west)
+    Cidr6Entry::new(Ipv6Addr::new(0x2406, 0xda00, 0, 0, 0, 0, 0, 0), 24),  // 2406:da00::/24 (AWS ap-*)
+    Cidr6Entry::new(Ipv6Addr::new(0x2a05, 0xd000, 0, 0, 0, 0, 0, 0), 25),  // 2a05:d000::/25 (AWS eu-*)
+    Cidr6Entry::new(Ipv6Addr::new(0x2600, 0x9000, 0, 0, 0, 0, 0, 0), 28),  // 2600:9000::/28 (CloudFront)
+];
+
+/// Cloudflare IPv6 ranges.
+static CLOUDFLARE_RANGES_V6: &[Cidr6Entry] = &[
+    Cidr6Entry::new(Ipv6Addr::new(0x2400, 0xcb00, 0, 0, 0, 0, 0, 0), 32),  // 2400:cb00::/32
+    Cidr6Entry::new(Ipv6Addr::new(0x2606, 0x4700, 0, 0, 0, 0, 0, 0), 32),  // 2606:4700::/32
+    Cidr6Entry::new(Ipv6Addr::new(0x2803, 0xf800, 0, 0, 0, 0, 0, 0), 32),  // 2803:f800::/32
+    Cidr6Entry::new(Ipv6Addr::new(0x2a06, 0x98c0, 0, 0, 0, 0, 0, 0), 29),  // 2a06:98c0::/29
+    Cidr6Entry::new(Ipv6Addr::new(0x2c0f, 0xf248, 0, 0, 0, 0, 0, 0), 32),  // 2c0f:f248::/32
+];
+
+/// GitHub IPv6 ranges.
+static GITHUB_RANGES_V6: &[Cidr6Entry] = &[
+    Cidr6Entry::new(Ipv6Addr::new(0x2a0a, 0xe5c0, 0, 0, 0, 0, 0, 0), 29),  // 2a0a:e5c0::/29 (GitHub)
+];
+
 /// All providers in lookup order.
 static PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
         name: "Apple Inc.",
         ranges: APPLE_RANGES,
+        ranges_v6: APPLE_RANGES_V6,
     },
     ProviderDef {
         name: "Microsoft Corporation",
         ranges: MICROSOFT_RANGES,
+        ranges_v6: MICROSOFT_RANGES_V6,
     },
     ProviderDef {
         name: "Google LLC",
         ranges: GOOGLE_RANGES,
+        ranges_v6: GOOGLE_RANGES_V6,
     },
     ProviderDef {
         name: "Amazon Web Services",
         ranges: AWS_RANGES,
+        ranges_v6: AWS_RANGES_V6,
     },
     ProviderDef {
         name: "Cloudflare Inc.",
         ranges: CLOUDFLARE_RANGES,
+        ranges_v6: CLOUDFLARE_RANGES_V6,
     },
     ProviderDef {
         name: "GitHub",
         ranges: GITHUB_RANGES,
+        ranges_v6: GITHUB_RANGES_V6,
     },
 ];
 
@@ -229,15 +319,14 @@ impl IpReputation {
 
 /// Lookup the reputation of an IP address against the static CIDR database.
 ///
-/// Returns the provider name and trust status. For IPv6 addresses, returns
-/// `IpReputation::unknown()` (IPv6 CIDR matching is a future enhancement).
+/// Supports both IPv4 and IPv6 addresses.
 ///
-/// **Complexity**: O(P × R) where P = number of providers (5) and R = max
+/// **Complexity**: O(P × R) where P = number of providers (6) and R = max
 /// ranges per provider (~25). Effectively O(1) for the fixed dataset.
 pub fn lookup_ip(ip: &IpAddr) -> IpReputation {
     match ip {
         IpAddr::V4(v4) => lookup_ipv4(v4),
-        IpAddr::V6(_) => IpReputation::unknown(),
+        IpAddr::V6(v6) => lookup_ipv6(v6),
     }
 }
 
@@ -247,6 +336,22 @@ fn lookup_ipv4(ip: &Ipv4Addr) -> IpReputation {
     for provider in PROVIDERS {
         for cidr in provider.ranges {
             if cidr.contains(ip_u32) {
+                return IpReputation {
+                    provider: provider.name.to_string(),
+                    is_trusted: true,
+                };
+            }
+        }
+    }
+    IpReputation::unknown()
+}
+
+/// Lookup an IPv6 address against all provider CIDR ranges.
+fn lookup_ipv6(ip: &Ipv6Addr) -> IpReputation {
+    let ip_u128 = u128::from(*ip);
+    for provider in PROVIDERS {
+        for cidr in provider.ranges_v6 {
+            if cidr.contains(ip_u128) {
                 return IpReputation {
                     provider: provider.name.to_string(),
                     is_trusted: true,
