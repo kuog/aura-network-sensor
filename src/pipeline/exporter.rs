@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::analysis::dns_resolver::{self, DnsCache};
 use crate::analysis::dns_tracker::{self, DnsTracker};
 
 use super::alert::MitreAlert;
@@ -139,11 +140,13 @@ async fn send_to_cloud(_alert: &MitreAlert) {
 /// * `stats`       – Shared atomic counters.
 /// * `db_path`     – Path to the SQLite database file (created if absent).
 /// * `dns_tracker` – Shared passive DNS cache for reverse-DNS fallback.
+/// * `dns_cache`   – Shared active DNS resolver cache (hickory-resolver).
 pub async fn run(
     mut rx: UnboundedReceiver<MitreAlert>,
     stats: Arc<ExporterStats>,
     db_path: Option<String>,
     dns_tracker: Arc<DnsTracker>,
+    dns_cache: Arc<DnsCache>,
 ) {
     let db_file = db_path.unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
 
@@ -156,7 +159,7 @@ pub async fn run(
         }
     };
 
-    info!("[Exporter] Async exporter task started (with DNS reverse-lookup fallback)");
+    info!("[Exporter] Async exporter task started (with DNS reverse-lookup fallback + hickory-resolver)");
 
     // ── Periodic DNS cache eviction counter ────────────────────────────
     let mut alert_count: u64 = 0;
@@ -165,23 +168,30 @@ pub async fn run(
     while let Some(mut alert) = rx.recv().await {
         alert_count += 1;
 
-        // ── Reverse DNS Fallback ──────────────────────────────────────
-        // If the engine didn't resolve a DNS name for dst_ip (no passive
-        // DNS entry), perform an async reverse lookup now.
-        if !alert.metadata.contains_key("dns_dst") {
+        // ── Active DNS Resolver Enrichment (hickory-resolver) ─────────
+        // Performs async reverse lookup, known-good matching, fast-flux
+        // detection, and domain squatting analysis.
+        dns_resolver::enrich_alert(&mut alert, &dns_cache).await;
+
+        // ── Passive DNS Fallback (legacy dns_tracker) ─────────────────
+        // If the active resolver didn't resolve a DNS name for dst_ip,
+        // fall back to the passive DNS tracker + libc getnameinfo.
+        if !alert.metadata.contains_key("dns_resolver_dst")
+            && !alert.metadata.contains_key("dns_dst")
+        {
             if let Ok(dst_ip) = alert.dst_ip.parse::<IpAddr>() {
                 if !dns_tracker.has_entry(&dst_ip) {
-                    // Perform async reverse lookup
+                    // Perform async reverse lookup via libc fallback
                     let tracker = dns_tracker.clone();
                     let ip = dst_ip;
 
                     if let Some(name) = dns_tracker::reverse_lookup(ip).await {
-                        debug!("[Exporter] Reverse DNS: {} → {}", ip, name);
+                        debug!("[Exporter] Reverse DNS (libc fallback): {} → {}", ip, name);
                         tracker.set_reverse(ip, name.clone());
                         alert.metadata.insert("dns_dst".to_string(), name.clone());
                         alert.metadata.insert(
                             "dns_dst_source".to_string(),
-                            "reverse_lookup".to_string(),
+                            "reverse_lookup_libc".to_string(),
                         );
 
                         // Re-apply confidence adjustment with the newly resolved name
@@ -206,18 +216,16 @@ pub async fn run(
             }
         }
 
-        // Same for src_ip
-        if !alert.metadata.contains_key("dns_src") {
+        // Same for src_ip (libc fallback)
+        if !alert.metadata.contains_key("dns_resolver_src")
+            && !alert.metadata.contains_key("dns_src")
+        {
             if let Ok(src_ip) = alert.src_ip.parse::<IpAddr>() {
                 if !dns_tracker.has_entry(&src_ip) {
                     if let Some(name) = dns_tracker::reverse_lookup(src_ip).await {
-                        debug!("[Exporter] Reverse DNS: {} → {}", src_ip, name);
+                        debug!("[Exporter] Reverse DNS (libc fallback): {} → {}", src_ip, name);
                         dns_tracker.set_reverse(src_ip, name.clone());
                         alert.metadata.insert("dns_src".to_string(), name);
-                        alert.metadata.insert(
-                            "dns_src_source".to_string(),
-                            "reverse_lookup".to_string(),
-                        );
                     }
                 }
             }
@@ -247,16 +255,18 @@ pub async fn run(
         // 4. Periodic DNS cache maintenance (every 100 alerts)
         if alert_count % 100 == 0 {
             dns_tracker.evict_expired();
+            dns_cache.evict_expired();
         }
     }
 
     // ── Channel closed — flush remaining work ─────────────────────────
     info!(
-        "[Exporter] Channel closed. Console: {}, DB writes: {}, DB errors: {}, DNS cache size: {}",
+        "[Exporter] Channel closed. Console: {}, DB writes: {}, DB errors: {}, DNS tracker: {}, DNS resolver cache: {}",
         stats.console_writes.load(Ordering::Relaxed),
         stats.db_writes.load(Ordering::Relaxed),
         stats.db_errors.load(Ordering::Relaxed),
         dns_tracker.len(),
+        dns_cache.len(),
     );
 
     // Ensure WAL checkpoint on shutdown

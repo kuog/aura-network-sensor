@@ -24,6 +24,7 @@ use log::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use analysis::dns_resolver::DnsCache;
 use analysis::dns_tracker::DnsTracker;
 use pipeline::engine::EngineStats;
 use pipeline::exporter::ExporterStats;
@@ -179,6 +180,9 @@ fn main() {
     // ── Shared DNS tracker (passive DNS cache) ─────────────────────────
     let dns_tracker = DnsTracker::shared();
 
+    // ── Shared DNS resolver cache (active, hickory-resolver) ────────────
+    let dns_cache = DnsCache::shared();
+
     // ── Channel: Sniffer → Engine (bounded crossbeam ring buffer) ─────
     let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(RING_BUFFER_CAPACITY);
 
@@ -205,11 +209,13 @@ fn main() {
 
     // Spawn the exporter task inside the runtime
     let dns_tracker_exporter = dns_tracker.clone();
+    let dns_cache_exporter = dns_cache.clone();
     let exporter_handle = rt.spawn(pipeline::exporter::run(
         alert_rx,
         exporter_stats_clone,
         db_path,
         dns_tracker_exporter,
+        dns_cache_exporter,
     ));
 
     // ── Stage 2: MITRE Analysis Engine (Core 1) ───────────────────────

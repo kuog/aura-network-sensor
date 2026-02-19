@@ -38,3 +38,6 @@ ipnetwork = "0.20"
 
 # libc bindings for reverse DNS (getnameinfo)
 libc = "0.2"
+
+# Async DNS resolver (hickory-resolver, successor to trust-dns)
+hickory-resolver = "0.25"
