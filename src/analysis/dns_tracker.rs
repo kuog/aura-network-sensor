@@ -460,6 +460,15 @@ pub struct DnsConfidenceAdjustment {
     pub domain: Option<String>,
 }
 
+/// Service keywords in domains that strongly indicate legitimate traffic.
+/// If a resolved domain contains any of these, confidence is reduced by 90 points.
+const SERVICE_KEYWORDS: &[&str] = &[
+    "exchange",
+    "outlook",
+    "mail",
+    "imap",
+];
+
 /// Known benign domain suffixes that reduce suspicion.
 const TRUSTED_SUFFIXES: &[&str] = &[
     ".amazonaws.com",
@@ -509,6 +518,27 @@ pub fn adjust_confidence(
     match tracker.get_name(ip) {
         Some(domain) => {
             let domain_lower = domain.to_lowercase();
+
+            // ── Service Keyword Filter ──────────────────────────────
+            // If the resolved domain contains service-related keywords
+            // (exchange, outlook, mail, imap), this is almost certainly
+            // legitimate email/service traffic — reduce confidence by 90.
+            let matched_service_kw = SERVICE_KEYWORDS
+                .iter()
+                .find(|kw| domain_lower.contains(**kw));
+
+            if let Some(keyword) = matched_service_kw {
+                let reduction = 90u8;
+                let new_confidence = current_confidence.saturating_sub(reduction);
+                return DnsConfidenceAdjustment {
+                    confidence: new_confidence,
+                    reason: format!(
+                        "DNS '{}' contains service keyword '{}' (-{} confidence)",
+                        domain, keyword, reduction
+                    ),
+                    domain: Some(domain),
+                };
+            }
 
             // Check if domain matches a trusted suffix
             let is_trusted = TRUSTED_SUFFIXES
@@ -664,6 +694,51 @@ mod tests {
         assert_eq!(count, 1);
         let ip: IpAddr = "93.184.216.34".parse().unwrap();
         assert_eq!(tracker.get_name(&ip), Some("example.com".to_string()));
+    }
+
+    #[test]
+    fn test_service_keyword_reduces_confidence_by_90() {
+        let tracker = DnsTracker::new();
+
+        // "outlook" keyword
+        let ip1: IpAddr = "40.97.128.1".parse().unwrap();
+        tracker.set_passive(ip1, "outlook.office365.com".to_string(), 300);
+        let adj = adjust_confidence(&tracker, &ip1, 95, None);
+        assert_eq!(adj.confidence, 5); // 95 - 90
+        assert!(adj.reason.contains("outlook"));
+
+        // "mail" keyword
+        let ip2: IpAddr = "142.250.74.5".parse().unwrap();
+        tracker.set_passive(ip2, "mail.google.com".to_string(), 300);
+        let adj = adjust_confidence(&tracker, &ip2, 80, None);
+        assert_eq!(adj.confidence, 0); // 80 - 90, saturates to 0
+        assert!(adj.reason.contains("mail"));
+
+        // "exchange" keyword
+        let ip3: IpAddr = "10.0.0.50".parse().unwrap();
+        tracker.set_passive(ip3, "exchange.corp.example.com".to_string(), 300);
+        let adj = adjust_confidence(&tracker, &ip3, 100, None);
+        assert_eq!(adj.confidence, 10); // 100 - 90
+        assert!(adj.reason.contains("exchange"));
+
+        // "imap" keyword
+        let ip4: IpAddr = "10.0.0.51".parse().unwrap();
+        tracker.set_passive(ip4, "imap.fastmail.com".to_string(), 300);
+        let adj = adjust_confidence(&tracker, &ip4, 50, None);
+        assert_eq!(adj.confidence, 0); // 50 - 90, saturates to 0
+        assert!(adj.reason.contains("imap"));
+    }
+
+    #[test]
+    fn test_service_keyword_takes_priority_over_trusted_suffix() {
+        let tracker = DnsTracker::new();
+        // Domain matches both a service keyword ("mail") and a trusted suffix (".google.com")
+        let ip: IpAddr = "142.250.74.5".parse().unwrap();
+        tracker.set_passive(ip, "mail.google.com".to_string(), 300);
+        let adj = adjust_confidence(&tracker, &ip, 80, None);
+        // Service keyword filter should apply (-90), not trusted suffix (-20)
+        assert_eq!(adj.confidence, 0); // 80 - 90, saturates to 0
+        assert!(adj.reason.contains("service keyword"));
     }
 
     #[test]

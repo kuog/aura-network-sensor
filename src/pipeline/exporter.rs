@@ -189,10 +189,6 @@ pub async fn run(
                         debug!("[Exporter] Reverse DNS (libc fallback): {} → {}", ip, name);
                         tracker.set_reverse(ip, name.clone());
                         alert.metadata.insert("dns_dst".to_string(), name.clone());
-                        alert.metadata.insert(
-                            "dns_dst_source".to_string(),
-                            "reverse_lookup_libc".to_string(),
-                        );
 
                         // Re-apply confidence adjustment with the newly resolved name
                         let adj = dns_tracker::adjust_confidence(

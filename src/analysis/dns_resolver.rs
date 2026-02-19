@@ -680,10 +680,6 @@ pub async fn enrich_alert(alert: &mut MitreAlert, cache: &DnsCache) -> Enrichmen
     alert
         .metadata
         .insert("dns_resolver_dst".to_string(), hostname.clone());
-    alert.metadata.insert(
-        "dns_resolver_source".to_string(),
-        "hickory_reverse_lookup".to_string(),
-    );
 
     // ── Step 3: Known Good check ───────────────────────────────────────
     if is_known_good(&hostname) {
