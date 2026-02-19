@@ -4,7 +4,7 @@ pub mod telemetry;
 pub mod protocols;
 pub mod report;
 
-use pcap::Capture;
+use pcap::{Capture, Active, Offline};
 use etherparse::{PacketHeaders, NetHeaders, TransportHeader, LinkHeader, VlanHeader};
 use l3_defrag::Defragmenter;
 use l4_reassembly::Reassembler;
@@ -14,6 +14,50 @@ use crate::protocols::arp::{ArpTracker, parse_arp};
 use crate::protocols::shell;
 use std::time::Duration;
 use crate::report::{AiHint, Context, Report, Telemetry};
+
+/// Capture source: either a live interface or a pcap file.
+enum CaptureSource {
+    Live(Capture<Active>),
+    File(Capture<Offline>),
+}
+
+impl CaptureSource {
+    fn next_packet(&mut self) -> Result<pcap::Packet<'_>, pcap::Error> {
+        match self {
+            CaptureSource::Live(cap) => cap.next_packet(),
+            CaptureSource::File(cap) => cap.next_packet(),
+        }
+    }
+}
+
+fn print_usage() {
+    eprintln!("Usage:");
+    eprintln!("  Live capture (default):  mcp-network-sensor -i <interface>");
+    eprintln!("  Read pcap file:          mcp-network-sensor -f <path_to_pcap>");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -i <interface>   Capture live traffic from the specified network interface");
+    eprintln!("  -f <file>        Analyze traffic from a pcap file");
+    eprintln!("  -l               List available network interfaces");
+    eprintln!("  -h, --help       Show this help message");
+}
+
+fn list_interfaces() {
+    match pcap::Device::list() {
+        Ok(devices) => {
+            println!("Available network interfaces:");
+            for dev in &devices {
+                let desc = dev.desc.as_deref().unwrap_or("");
+                let addrs: Vec<String> = dev.addresses.iter().map(|a| format!("{}", a.addr)).collect();
+                let addr_str = if addrs.is_empty() { String::from("no addresses") } else { addrs.join(", ") };
+                println!("  {} - {} [{}]", dev.name, desc, addr_str);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error listing interfaces: {}", e);
+        }
+    }
+}
 
 fn is_local_ip(ip: &std::net::IpAddr) -> bool {
     match ip {
@@ -30,10 +74,71 @@ fn is_local_ip(ip: &std::net::IpAddr) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        println!("Usage: cargo run -- <path_to_pcap>");
-        return;
+    
+    // Parse command-line arguments
+    let mut interface: Option<String> = None;
+    let mut pcap_file: Option<String> = None;
+    let mut i = 1;
+    
+    while i < args.len() {
+        match args[i].as_str() {
+            "-i" => {
+                if i + 1 < args.len() {
+                    interface = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: -i requires an interface name");
+                    print_usage();
+                    return;
+                }
+            }
+            "-f" => {
+                if i + 1 < args.len() {
+                    pcap_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Error: -f requires a file path");
+                    print_usage();
+                    return;
+                }
+            }
+            "-l" => {
+                list_interfaces();
+                return;
+            }
+            "-h" | "--help" => {
+                print_usage();
+                return;
+            }
+            other => {
+                // Backward compatibility: treat bare argument as pcap file
+                pcap_file = Some(other.to_string());
+                i += 1;
+            }
+        }
     }
+
+    // Determine capture source
+    let mut source = if let Some(file) = pcap_file {
+        let cap = Capture::from_file(&file).expect("Failed to open PCAP file");
+        eprintln!("Reading from pcap file: {}", file);
+        CaptureSource::File(cap)
+    } else if let Some(iface) = interface {
+        let cap = Capture::from_device(iface.as_str())
+            .expect("Failed to open capture device")
+            .promisc(true)
+            .snaplen(65535)
+            .timeout(1000)
+            .open()
+            .expect("Failed to activate capture on interface");
+        eprintln!("Capturing live traffic on interface: {}", iface);
+        CaptureSource::Live(cap)
+    } else {
+        eprintln!("Error: no capture source specified. Use -i <interface> for live capture or -f <file> for pcap analysis.");
+        eprintln!();
+        print_usage();
+        return;
+    };
 
     let mut defrag = Defragmenter::new();
     // Increase capacity for real-world traffic
@@ -42,12 +147,24 @@ fn main() {
     let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
     let mut arp_tracker = ArpTracker::new();
     let mut smb_tracker = protocols::smb::SmbTracker::new();
-    
-    let mut cap = Capture::from_file(&args[1]).expect("Failed to open PCAP file");
 
-    println!("--- AI Sensor Analysis Started ---");
+    // Install Ctrl+C handler for graceful shutdown during live capture
+    let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        eprintln!("\n--- Capture interrupted, shutting down ---");
+        r.store(false, std::sync::atomic::Ordering::SeqCst);
+    }).expect("Error setting Ctrl-C handler");
 
-    while let Ok(packet) = cap.next_packet() {
+    eprintln!("--- AI Sensor Analysis Started ---");
+
+    while running.load(std::sync::atomic::Ordering::SeqCst) {
+        let packet = match source.next_packet() {
+            Ok(p) => p,
+            Err(pcap::Error::TimeoutExpired) => continue,  // live capture timeout, retry
+            Err(_) => break,  // EOF or error
+        };
+
         // Extract timestamp from pcap header
         let ts = packet.header.ts.tv_sec as f64 + (packet.header.ts.tv_usec as f64 / 1_000_000.0);
 
@@ -337,4 +454,6 @@ fn main() {
             }
         }
     }
+
+    eprintln!("--- AI Sensor Analysis Finished ---");
 }
