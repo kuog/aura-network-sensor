@@ -167,6 +167,15 @@ static CLOUDFLARE_RANGES: &[CidrEntry] = &[
     CidrEntry::new(198, 41, 128, 0, 17),   // 198.41.128.0/17
 ];
 
+/// GitHub — Git hosting, Actions, Packages.
+static GITHUB_RANGES: &[CidrEntry] = &[
+    CidrEntry::new(140, 82, 112, 0, 20),   // 140.82.112.0/20 (GitHub)
+    CidrEntry::new(143, 55, 64, 0, 20),    // 143.55.64.0/20 (GitHub)
+    CidrEntry::new(185, 199, 108, 0, 22),  // 185.199.108.0/22 (GitHub Pages)
+    CidrEntry::new(192, 30, 252, 0, 22),   // 192.30.252.0/22 (GitHub)
+    CidrEntry::new(20, 201, 28, 151, 32),  // 20.201.28.151/32 (GitHub Actions)
+];
+
 /// All providers in lookup order.
 static PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
@@ -188,6 +197,10 @@ static PROVIDERS: &[ProviderDef] = &[
     ProviderDef {
         name: "Cloudflare Inc.",
         ranges: CLOUDFLARE_RANGES,
+    },
+    ProviderDef {
+        name: "GitHub",
+        ranges: GITHUB_RANGES,
     },
 ];
 
@@ -677,6 +690,14 @@ mod tests {
         let rep = lookup_ip_str("104.16.0.1");
         assert!(rep.is_trusted);
         assert_eq!(rep.provider, "Cloudflare Inc.");
+    }
+
+    #[test]
+    fn test_github_lookup() {
+        // 140.82.121.4 — GitHub (lb-140-82-121-4-fra.github.com)
+        let rep = lookup_ip_str("140.82.121.4");
+        assert!(rep.is_trusted);
+        assert_eq!(rep.provider, "GitHub");
     }
 
     #[test]

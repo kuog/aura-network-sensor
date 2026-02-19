@@ -355,6 +355,18 @@ fn post_enrichment_adjust(alert: &mut MitreAlert) {
 
     let domain_lower = domain.to_lowercase();
 
+    // ── Check 0: Provider fallback from DNS hostname ─────────────────────
+    // If the provider metadata is still "Unknown" (CIDR lookup missed), try
+    // to identify the provider from the DNS-resolved hostname using the
+    // enrichment module's domain-keyword matching.
+    let current_provider = alert.metadata.get("provider").map(|s| s.as_str());
+    if current_provider == Some("Unknown") || current_provider.is_none() {
+        if let Some(dns_provider) = enrichment::identify_provider(&domain_lower) {
+            alert.metadata.insert("provider".to_string(), dns_provider.clone());
+            alert.metadata.insert("provider_name".to_string(), dns_provider);
+        }
+    }
+
     // ── Check 1: Service keyword match ──────────────────────────────────
     let matched_keyword = SERVICE_KEYWORDS
         .iter()

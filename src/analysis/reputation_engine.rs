@@ -251,6 +251,20 @@ static PROVIDER_REGISTRY: LazyLock<Vec<ProviderEntry>> = LazyLock::new(|| {
                 "199.232.0.0/16",
             ]),
         },
+        // ── GitHub ──────────────────────────────────────────────────────
+        ProviderEntry {
+            identity: Identity {
+                provider: "GitHub",
+                category: "Cloud",
+                trust_level: 55,
+            },
+            ranges: parse_cidrs(&[
+                "140.82.112.0/20",
+                "143.55.64.0/20",
+                "185.199.108.0/22",
+                "192.30.252.0/22",
+            ]),
+        },
     ]
 });
 
@@ -297,6 +311,7 @@ pub fn provider_display_name(provider: &str) -> &'static str {
         "Cloudflare" => "Cloudflare Inc.",
         "Akamai" => "Akamai Technologies",
         "Fastly" => "Fastly Inc.",
+        "GitHub" => "GitHub Inc.",
         _ => "Unknown",
     }
 }

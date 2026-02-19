@@ -1221,6 +1221,10 @@ fn analyze_tcp(
 /// adds `dns_src` / `dns_dst` metadata fields. Also applies confidence
 /// adjustments based on the security scoring logic in [`dns_tracker`].
 ///
+/// Additionally, if the `provider` metadata is currently "Unknown" and the
+/// DNS-resolved hostname matches a known provider (via [`enrichment::identify_provider`]),
+/// the `provider` and `provider_name` metadata fields are updated.
+///
 /// # Arguments
 /// * `tracker`  – The shared DNS tracker.
 /// * `alert`    – The alert to enrich (mutated in place).
@@ -1245,6 +1249,15 @@ fn enrich_alert_with_dns(
         let adj = dns_tracker::adjust_confidence(tracker, ip, alert.confidence, entropy);
         if let Some(ref domain) = adj.domain {
             alert.metadata.insert("dns_dst".to_string(), domain.clone());
+
+            // If provider is still "Unknown", try to identify from DNS hostname
+            let current_provider = alert.metadata.get("provider").map(|s| s.as_str());
+            if current_provider == Some("Unknown") || current_provider.is_none() {
+                if let Some(dns_provider) = enrichment::identify_provider(domain) {
+                    alert.metadata.insert("provider".to_string(), dns_provider.clone());
+                    alert.metadata.insert("provider_name".to_string(), dns_provider);
+                }
+            }
         }
         if adj.confidence != alert.confidence {
             alert
