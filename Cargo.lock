@@ -514,6 +514,7 @@ dependencies = [
  "env_logger",
  "etherparse",
  "ipnetwork",
+ "libc",
  "log",
  "lru",
  "md5",

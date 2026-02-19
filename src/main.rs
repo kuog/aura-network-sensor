@@ -24,6 +24,7 @@ use log::{error, info};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use analysis::dns_tracker::DnsTracker;
 use pipeline::engine::EngineStats;
 use pipeline::exporter::ExporterStats;
 use pipeline::sniffer::{CaptureSource, SnifferStats};
@@ -175,6 +176,9 @@ fn main() {
     let engine_stats = Arc::new(EngineStats::new());
     let exporter_stats = Arc::new(ExporterStats::new());
 
+    // ── Shared DNS tracker (passive DNS cache) ─────────────────────────
+    let dns_tracker = DnsTracker::shared();
+
     // ── Channel: Sniffer → Engine (bounded crossbeam ring buffer) ─────
     let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(RING_BUFFER_CAPACITY);
 
@@ -200,19 +204,22 @@ fn main() {
         .expect("Failed to build Tokio runtime");
 
     // Spawn the exporter task inside the runtime
+    let dns_tracker_exporter = dns_tracker.clone();
     let exporter_handle = rt.spawn(pipeline::exporter::run(
         alert_rx,
         exporter_stats_clone,
         db_path,
+        dns_tracker_exporter,
     ));
 
     // ── Stage 2: MITRE Analysis Engine (Core 1) ───────────────────────
     let engine_running = running.clone();
     let engine_stats_clone = engine_stats.clone();
+    let dns_tracker_engine = dns_tracker.clone();
     let engine_thread = std::thread::Builder::new()
         .name("engine".to_string())
         .spawn(move || {
-            pipeline::engine::run(pkt_rx, alert_tx, engine_running, engine_stats_clone, ENGINE_CORE);
+            pipeline::engine::run(pkt_rx, alert_tx, engine_running, engine_stats_clone, ENGINE_CORE, dns_tracker_engine);
         })
         .expect("Failed to spawn engine thread");
 
@@ -267,6 +274,10 @@ fn main() {
         exporter_stats.console_writes.load(Ordering::Relaxed),
         exporter_stats.db_writes.load(Ordering::Relaxed),
         exporter_stats.db_errors.load(Ordering::Relaxed),
+    );
+    info!(
+        "DNS      — Cache entries: {}",
+        dns_tracker.len(),
     );
     info!("=== MCP Network Sensor stopped ===");
 }

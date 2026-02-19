@@ -9,11 +9,14 @@
 //! The exporter drains the `tokio::sync::mpsc` channel until it is closed
 //! (graceful shutdown), ensuring all remaining alerts are flushed to the DB.
 
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use rusqlite::Connection;
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedReceiver;
+
+use crate::analysis::dns_tracker::{self, DnsTracker};
 
 use super::alert::MitreAlert;
 
@@ -132,13 +135,15 @@ async fn send_to_cloud(_alert: &MitreAlert) {
 /// Run the async exporter task. Call this via `tokio::spawn`.
 ///
 /// # Arguments
-/// * `rx`      – Tokio unbounded receiver for incoming alerts.
-/// * `stats`   – Shared atomic counters.
-/// * `db_path` – Path to the SQLite database file (created if absent).
+/// * `rx`          – Tokio unbounded receiver for incoming alerts.
+/// * `stats`       – Shared atomic counters.
+/// * `db_path`     – Path to the SQLite database file (created if absent).
+/// * `dns_tracker` – Shared passive DNS cache for reverse-DNS fallback.
 pub async fn run(
     mut rx: UnboundedReceiver<MitreAlert>,
     stats: Arc<ExporterStats>,
     db_path: Option<String>,
+    dns_tracker: Arc<DnsTracker>,
 ) {
     let db_file = db_path.unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
 
@@ -151,10 +156,73 @@ pub async fn run(
         }
     };
 
-    info!("[Exporter] Async exporter task started");
+    info!("[Exporter] Async exporter task started (with DNS reverse-lookup fallback)");
+
+    // ── Periodic DNS cache eviction counter ────────────────────────────
+    let mut alert_count: u64 = 0;
 
     // ── Main drain loop ───────────────────────────────────────────────
-    while let Some(alert) = rx.recv().await {
+    while let Some(mut alert) = rx.recv().await {
+        alert_count += 1;
+
+        // ── Reverse DNS Fallback ──────────────────────────────────────
+        // If the engine didn't resolve a DNS name for dst_ip (no passive
+        // DNS entry), perform an async reverse lookup now.
+        if !alert.metadata.contains_key("dns_dst") {
+            if let Ok(dst_ip) = alert.dst_ip.parse::<IpAddr>() {
+                if !dns_tracker.has_entry(&dst_ip) {
+                    // Perform async reverse lookup
+                    let tracker = dns_tracker.clone();
+                    let ip = dst_ip;
+
+                    if let Some(name) = dns_tracker::reverse_lookup(ip).await {
+                        debug!("[Exporter] Reverse DNS: {} → {}", ip, name);
+                        tracker.set_reverse(ip, name.clone());
+                        alert.metadata.insert("dns_dst".to_string(), name.clone());
+                        alert.metadata.insert(
+                            "dns_dst_source".to_string(),
+                            "reverse_lookup".to_string(),
+                        );
+
+                        // Re-apply confidence adjustment with the newly resolved name
+                        let adj = dns_tracker::adjust_confidence(
+                            &tracker,
+                            &ip,
+                            alert.confidence,
+                            alert
+                                .metadata
+                                .get("entropy")
+                                .and_then(|e| e.parse::<f64>().ok()),
+                        );
+                        if adj.confidence != alert.confidence {
+                            alert.metadata.insert(
+                                "dns_confidence_reason".to_string(),
+                                adj.reason,
+                            );
+                            alert.confidence = adj.confidence;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Same for src_ip
+        if !alert.metadata.contains_key("dns_src") {
+            if let Ok(src_ip) = alert.src_ip.parse::<IpAddr>() {
+                if !dns_tracker.has_entry(&src_ip) {
+                    if let Some(name) = dns_tracker::reverse_lookup(src_ip).await {
+                        debug!("[Exporter] Reverse DNS: {} → {}", src_ip, name);
+                        dns_tracker.set_reverse(src_ip, name.clone());
+                        alert.metadata.insert("dns_src".to_string(), name);
+                        alert.metadata.insert(
+                            "dns_src_source".to_string(),
+                            "reverse_lookup".to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
         // 1. Console output (pretty JSON)
         let json = alert.to_json_pretty();
         println!("{}", json);
@@ -175,14 +243,20 @@ pub async fn run(
 
         // 3. Cloud / Telegram (stub)
         send_to_cloud(&alert).await;
+
+        // 4. Periodic DNS cache maintenance (every 100 alerts)
+        if alert_count % 100 == 0 {
+            dns_tracker.evict_expired();
+        }
     }
 
     // ── Channel closed — flush remaining work ─────────────────────────
     info!(
-        "[Exporter] Channel closed. Console: {}, DB writes: {}, DB errors: {}",
+        "[Exporter] Channel closed. Console: {}, DB writes: {}, DB errors: {}, DNS cache size: {}",
         stats.console_writes.load(Ordering::Relaxed),
         stats.db_writes.load(Ordering::Relaxed),
         stats.db_errors.load(Ordering::Relaxed),
+        dns_tracker.len(),
     );
 
     // Ensure WAL checkpoint on shutdown

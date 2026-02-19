@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::analysis::arp_provider::{ArpGuardian, ArpVerdict};
+use crate::analysis::dns_tracker::{self, DnsTracker};
 use crate::analysis::enrichment::{self, ScoringInput};
 use crate::analysis::protocol_filter::{self, FilterVerdict};
 use crate::analysis::reputation::{self, ReputationVerdict};
@@ -68,17 +69,19 @@ fn is_local_ip(ip: &IpAddr) -> bool {
 /// Run the analysis engine. Intended to be called inside `std::thread::spawn`.
 ///
 /// # Arguments
-/// * `rx`        – Crossbeam receiver (ring buffer consumer).
-/// * `alert_tx`  – Tokio unbounded sender for emitting alerts to Stage 3.
-/// * `running`   – Shared shutdown flag.
-/// * `stats`     – Shared atomic counters.
-/// * `core_id`   – Physical core to pin to (typically 1).
+/// * `rx`          – Crossbeam receiver (ring buffer consumer).
+/// * `alert_tx`    – Tokio unbounded sender for emitting alerts to Stage 3.
+/// * `running`     – Shared shutdown flag.
+/// * `stats`       – Shared atomic counters.
+/// * `core_id`     – Physical core to pin to (typically 1).
+/// * `dns_tracker` – Shared passive DNS cache for IP→domain resolution.
 pub fn run(
     rx: Receiver<RawPacket>,
     alert_tx: UnboundedSender<MitreAlert>,
     running: Arc<AtomicBool>,
     stats: Arc<EngineStats>,
     core_id: usize,
+    dns_tracker: Arc<DnsTracker>,
 ) {
     // ── Core pinning ──────────────────────────────────────────────────
     pin_to_core("Engine", core_id);
@@ -224,7 +227,7 @@ pub fn run(
                     Some(TransportHeader::Tcp(tcp)) => {
                         if tcp.syn && !tcp.ack {
                             if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port) {
-                                let alert = MitreAlert::new(
+                                let mut alert = MitreAlert::new(
                                     "T1046",
                                     "Network Service Discovery",
                                     Severity::Medium,
@@ -237,13 +240,14 @@ pub fn run(
                                     "port_scan",
                                     serde_json::to_string(&scan_alert).unwrap_or_default(),
                                 );
+                                enrich_alert_with_dns(&dns_tracker, &mut alert, None);
                                 emit(alert, &stats);
                             }
                         }
                     }
                     Some(TransportHeader::Udp(udp)) => {
                         if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port) {
-                            let alert = MitreAlert::new(
+                            let mut alert = MitreAlert::new(
                                 "T1046",
                                 "Network Service Discovery",
                                 Severity::Medium,
@@ -256,6 +260,7 @@ pub fn run(
                                 "port_scan",
                                 serde_json::to_string(&scan_alert).unwrap_or_default(),
                             );
+                            enrich_alert_with_dns(&dns_tracker, &mut alert, None);
                             emit(alert, &stats);
                         }
                     }
@@ -282,16 +287,24 @@ pub fn run(
                             raw.timestamp,
                             &emit,
                             &stats,
+                            &dns_tracker,
                         );
                     }
                     Some(TransportHeader::Udp(udp)) => {
-                        // DNS analysis (T1071.004)
+                        // DNS analysis (T1071.004) + Passive DNS tracking
                         if udp.destination_port == 53 || udp.source_port == 53 {
                             let udp_data_offset = 8;
                             if full_ip_payload.len() > udp_data_offset {
                                 let dns_data = &full_ip_payload[udp_data_offset..];
+
+                                // ── Passive DNS: ingest responses into the tracker ──
+                                if udp.source_port == 53 {
+                                    dns_tracker::ingest_dns_response(dns_data, &dns_tracker);
+                                }
+
+                                // ── T1071.004: DNS tunneling / anomaly detection ────
                                 if let Some(dns_report) = dns::analyze_dns(dns_data) {
-                                    let alert = MitreAlert::new(
+                                    let mut alert = MitreAlert::new(
                                         "T1071.004",
                                         "Application Layer Protocol: DNS",
                                         Severity::High,
@@ -304,6 +317,10 @@ pub fn run(
                                         "dns_anomaly",
                                         serde_json::to_string(&dns_report).unwrap_or_default(),
                                     );
+
+                                    // Enrich with DNS names for src/dst IPs
+                                    enrich_alert_with_dns(&dns_tracker, &mut alert, None);
+
                                     emit(alert, &stats);
                                 }
                             }
@@ -336,6 +353,7 @@ fn analyze_tcp(
     _timestamp: f64,
     emit: &impl Fn(MitreAlert, &Arc<EngineStats>),
     stats: &Arc<EngineStats>,
+    dns_tracker: &DnsTracker,
 ) {
     let is_upload = is_local_ip(&src_ip);
     let packet_len = full_ip_payload.len() as u64;
@@ -349,7 +367,7 @@ fn analyze_tcp(
         packet_len,
         is_upload,
     ) {
-        let alert = MitreAlert::new(
+        let mut alert = MitreAlert::new(
             "T1041",
             "Exfiltration Over C2 Channel",
             Severity::High,
@@ -365,6 +383,7 @@ fn analyze_tcp(
         .with_meta("total_uploaded_mb", format!("{:.2}", up as f64 / 1_000_000.0))
         .with_meta("total_downloaded_mb", format!("{:.2}", down as f64 / 1_000_000.0))
         .with_meta("ratio", format!("{:.2}", ratio));
+        enrich_alert_with_dns(dns_tracker, &mut alert, None);
         emit(alert, stats);
     }
 
@@ -524,7 +543,7 @@ fn analyze_tcp(
 
     // ── T1571 Port Anomaly ────────────────────────────────────────────
     if let Some(anomaly) = matrix.check(port, entropy, &session_data) {
-        let alert = MitreAlert::new(
+        let mut alert = MitreAlert::new(
             &anomaly.technique,
             "Non-Standard Port",
             Severity::High,
@@ -539,6 +558,7 @@ fn analyze_tcp(
         )
         .with_meta("entropy", format!("{:.2}", entropy))
         .with_meta("jitter", format!("{:.2}", b_score));
+        enrich_alert_with_dns(dns_tracker, &mut alert, Some(entropy));
         emit(alert, stats);
     }
 
@@ -982,7 +1002,7 @@ fn analyze_tcp(
                         76..=89 => Severity::High,
                         _ => Severity::Critical,
                     };
-                    let alert = MitreAlert::new(
+                    let mut alert = MitreAlert::new(
                         "T1573",
                         "Encrypted Channel",
                         severity,
@@ -1007,6 +1027,7 @@ fn analyze_tcp(
                         "sni",
                         sni_ref.unwrap_or(""),
                     );
+                    enrich_alert_with_dns(dns_tracker, &mut alert, Some(entropy));
                     emit(alert, stats);
                 }
             }
@@ -1033,7 +1054,7 @@ fn analyze_tcp(
                 "Periodic communication detected".to_string()
             };
 
-            let alert = MitreAlert::new(
+            let mut alert = MitreAlert::new(
                 "T1011",
                 "Exfiltration Over Other Network Medium",
                 severity,
@@ -1050,7 +1071,50 @@ fn analyze_tcp(
             .with_meta("provider", &flow_rep.provider)
             .with_meta("port_service", &flow_rep.port_service)
             .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string());
+            enrich_alert_with_dns(dns_tracker, &mut alert, Some(entropy));
             emit(alert, stats);
+        }
+    }
+}
+
+// ── DNS Enrichment Helper ──────────────────────────────────────────────────
+
+/// Enrich a [`MitreAlert`] with DNS-resolved domain names and adjust confidence.
+///
+/// Looks up both `src_ip` and `dst_ip` in the passive DNS cache. If found,
+/// adds `dns_src` / `dns_dst` metadata fields. Also applies confidence
+/// adjustments based on the security scoring logic in [`dns_tracker`].
+///
+/// # Arguments
+/// * `tracker`  – The shared DNS tracker.
+/// * `alert`    – The alert to enrich (mutated in place).
+/// * `entropy`  – Optional Shannon entropy of the traffic for dark-traffic scoring.
+fn enrich_alert_with_dns(
+    tracker: &DnsTracker,
+    alert: &mut MitreAlert,
+    entropy: Option<f64>,
+) {
+    let src_ip: Option<IpAddr> = alert.src_ip.parse().ok();
+    let dst_ip: Option<IpAddr> = alert.dst_ip.parse().ok();
+
+    // Enrich source IP
+    if let Some(ref ip) = src_ip {
+        if let Some(name) = tracker.get_name(ip) {
+            alert.metadata.insert("dns_src".to_string(), name);
+        }
+    }
+
+    // Enrich destination IP + apply confidence adjustment
+    if let Some(ref ip) = dst_ip {
+        let adj = dns_tracker::adjust_confidence(tracker, ip, alert.confidence, entropy);
+        if let Some(ref domain) = adj.domain {
+            alert.metadata.insert("dns_dst".to_string(), domain.clone());
+        }
+        if adj.confidence != alert.confidence {
+            alert
+                .metadata
+                .insert("dns_confidence_reason".to_string(), adj.reason.clone());
+            alert.confidence = adj.confidence;
         }
     }
 }
