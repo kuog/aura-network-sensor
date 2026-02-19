@@ -3,6 +3,7 @@ pub mod l4_reassembly;
 pub mod telemetry;
 pub mod protocols;
 pub mod report;
+pub mod analysis;
 
 use pcap::{Capture, Active, Offline};
 use etherparse::{PacketHeaders, NetHeaders, TransportHeader, LinkHeader, VlanHeader};
@@ -14,6 +15,7 @@ use crate::protocols::arp::{ArpTracker, parse_arp};
 use crate::protocols::shell;
 use std::time::Duration;
 use crate::report::{AiHint, Context, Report, Telemetry};
+use crate::analysis::enrichment::{self, ScoringInput};
 
 /// Capture source: either a live interface or a pcap file.
 enum CaptureSource {
@@ -376,20 +378,21 @@ fn main() {
                                     }
 
                                     // 3. Beaconing check (Timing)
-                                    if b_score < 0.15 {
-                                        println!("BEACON DETECTED: T1011 | Score: {:.2}", b_score);
+                                    let is_beaconing = b_score < 0.15;
+                                    if is_beaconing {
+                                        eprintln!("BEACON CANDIDATE: T1011 | Score: {:.2} (enriching...)", b_score);
                                     }
                                     
                                     // Check for TLS JA3
                                     let mut ja3_hash_str = None;
                                     if let Some(ja3_hash) = protocols::tls::calculate_ja3(&session_data) {
-                                        println!("TLS FINGERPRINT (JA3): {}", ja3_hash);
+                                        eprintln!("TLS FINGERPRINT (JA3): {}", ja3_hash);
                                         
                                         // MITRE T1011 Hint:
-                                        // Many C2 agents have fixed JA3 hashes. 
+                                        // Many C2 agents have fixed JA3 hashes.
                                         // e.g., "a0e9f5d64349fb12a91c..." is a known Meterpreter hash.
                                         if ja3_hash == "a0e9f5d64349fb12a91c13d332612953" {
-                                            println!("ALERT: Known Malware JA3 detected! (T1573.002)");
+                                            eprintln!("ALERT: Known Malware JA3 detected! (T1573.002)");
                                         }
                                         ja3_hash_str = Some(ja3_hash);
                                     }
@@ -400,7 +403,16 @@ fn main() {
                                     let high_entropy_trigger = ent > 7.5 && !is_standard_tls;
 
                                     // Threshold for non-standard encrypted tunnels
-                                    if high_entropy_trigger || ja3_hash_str.is_some() || b_score < 0.15 {
+                                    if high_entropy_trigger || ja3_hash_str.is_some() || is_beaconing {
+                                        // --- Enrichment: SNI + Reputation + Confidence Scoring ---
+                                        let scoring_input = ScoringInput {
+                                            tls_payload: &session_data,
+                                            dst_port: tcp.destination_port,
+                                            is_beaconing,
+                                            session_data: &session_data,
+                                        };
+                                        let enrichment_result = enrichment::enrich(&scoring_input);
+
                                         let mut context = Context::default();
                                         context.fields.insert("src_ip".to_string(), src_ip.to_string());
                                         context.fields.insert("dst_ip".to_string(), dst_ip.to_string());
@@ -423,15 +435,32 @@ fn main() {
                                             });
                                         }
                                         
-                                        if b_score < 0.15 {
+                                        if is_beaconing {
+                                            let beacon_logic = if enrichment_result.confidence_score < 40 {
+                                                format!(
+                                                    "Periodic communication detected — likely legitimate {} traffic (confidence_score: {})",
+                                                    enrichment_result.enriched_context.provider.as_deref().unwrap_or("unknown"),
+                                                    enrichment_result.confidence_score
+                                                )
+                                            } else {
+                                                "Periodic communication detected".to_string()
+                                            };
                                             ai_hints.push(AiHint {
                                                 trigger: "beaconing".to_string(),
                                                 suspected_techniques: vec!["T1011".to_string()],
-                                                logic: "Periodic communication detected".to_string(),
+                                                logic: beacon_logic,
                                             });
                                         }
 
-                                        let report = Report::new(context, telemetry, ai_hints);
+                                        let report = Report::new_enriched(
+                                            context,
+                                            telemetry,
+                                            ai_hints,
+                                            enrichment_result.confidence_score,
+                                            enrichment_result.enriched_context,
+                                            enrichment_result.severity,
+                                            enrichment_result.scoring_notes,
+                                        );
                                         println!("{}", serde_json::to_string_pretty(&report).unwrap());
                                     }
                                 }
