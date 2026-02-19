@@ -17,13 +17,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::analysis::arp_provider::{ArpGuardian, ArpVerdict};
 use crate::analysis::enrichment::{self, ScoringInput};
 use crate::analysis::protocol_filter::{self, FilterVerdict};
 use crate::analysis::reputation::{self, ReputationVerdict};
 use crate::l3_defrag::Defragmenter;
 use crate::l4_reassembly::Reassembler;
 use crate::protocols;
-use crate::protocols::arp::{parse_arp, ArpTracker};
+use crate::protocols::arp::parse_arp;
 use crate::protocols::dns;
 use crate::protocols::scan::ScannerTracker;
 use crate::protocols::shell;
@@ -87,7 +88,7 @@ pub fn run(
     let mut tcp_reassembler = Reassembler::new(10_000);
     let matrix = protocols::port_anomaly::ExpectationMatrix::new();
     let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
-    let mut arp_tracker = ArpTracker::new();
+    let arp_guardian = ArpGuardian::new();
     let mut smb_tracker = SmbTracker::new();
 
     info!("[Engine] Analysis loop started");
@@ -158,23 +159,56 @@ pub fn run(
                 }
             };
 
-            if let Some((opcode, sender_mac, sender_ip, target_mac, target_ip)) = parse_arp(payload) {
-                if let Some(arp_alert) = arp_tracker.handle_packet(sender_mac, sender_ip, target_mac, target_ip, opcode) {
-                    // Convert the existing ARP alert to our MitreAlert format
-                    let alert = MitreAlert::new(
-                        "T1557",
-                        "Adversary-in-the-Middle: ARP Spoofing",
-                        Severity::High,
-                        85,
-                        sender_ip.to_string(),
-                        target_ip.to_string(),
-                        0u16,
-                        0u16,
-                        "arp",
-                        "arp_spoofing",
-                        serde_json::to_string(&arp_alert).unwrap_or_default(),
-                    );
-                    emit(alert, &stats);
+            if let Some((opcode, sender_mac, sender_ip, _target_mac, target_ip)) = parse_arp(payload) {
+                match arp_guardian.evaluate(sender_mac, sender_ip, opcode) {
+                    ArpVerdict::Conflict(conflict) => {
+                        // Rule 3: The Red Line — MAC conflict detected
+                        let severity = if conflict.is_gateway_attack {
+                            Severity::Critical
+                        } else {
+                            Severity::High
+                        };
+                        let confidence = if conflict.is_gateway_attack { 95 } else { 85 };
+
+                        let alert = MitreAlert::new(
+                            "T1557",
+                            "Adversary-in-the-Middle: ARP Spoofing",
+                            severity,
+                            confidence,
+                            sender_ip.to_string(),
+                            target_ip.to_string(),
+                            0u16,
+                            0u16,
+                            "arp",
+                            "arp_spoofing",
+                            serde_json::to_string(&conflict).unwrap_or_default(),
+                        )
+                        .with_meta("previous_mac", &conflict.previous_mac)
+                        .with_meta("conflicting_mac", &conflict.conflicting_mac)
+                        .with_meta("is_gateway_attack", conflict.is_gateway_attack.to_string());
+                        emit(alert, &stats);
+                    }
+                    ArpVerdict::NewDevice { ip, mac } => {
+                        // Rule 4: New device discovered — INFO event
+                        let alert = MitreAlert::new(
+                            "T1557",
+                            "ARP Discovery: New Device",
+                            Severity::Info,
+                            10,
+                            ip.to_string(),
+                            target_ip.to_string(),
+                            0u16,
+                            0u16,
+                            "arp",
+                            "new_device",
+                            format!("New device discovered: {} → {}", ip, mac),
+                        )
+                        .with_meta("discovered_mac", &mac);
+                        emit(alert, &stats);
+                    }
+                    ArpVerdict::Legitimate => {
+                        // Rule 2: Same MAC — routine heartbeat, no alert
+                    }
                 }
             }
         }

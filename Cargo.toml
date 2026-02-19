@@ -26,6 +26,9 @@ tokio = { version = "1", features = ["full"] }
 # Pipeline: SQLite persistence for alerts
 rusqlite = { version = "0.34", features = ["bundled"] }
 
+# Concurrent hash map for ARP Guardian state table
+dashmap = "6"
+
 # Logging (non-blocking)
 log = "0.4"
 env_logger = "0.11"
