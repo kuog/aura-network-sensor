@@ -30,7 +30,7 @@ use crate::l4_reassembly::Reassembler;
 use crate::protocols;
 use crate::protocols::arp::parse_arp;
 use crate::protocols::dns;
-use crate::protocols::scan::ScannerTracker;
+use crate::protocols::scan::{ConnTracker, ScannerTracker};
 use crate::protocols::shell;
 use crate::protocols::smb::SmbTracker;
 use crate::telemetry;
@@ -109,6 +109,7 @@ pub fn run(
     let mut tcp_reassembler = Reassembler::new(10_000);
     let matrix = protocols::port_anomaly::ExpectationMatrix::new();
     let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
+    let mut conn_tracker = ConnTracker::new(Duration::from_secs(120));
     let arp_guardian = ArpGuardian::new();
     let mut smb_tracker = SmbTracker::new();
 
@@ -287,12 +288,44 @@ pub fn run(
                 );
             }
 
-            // T1046 Scanning Detection
+            // ── T1046 Scanning Detection (with Connection Tracking) ────────
+            //
+            // TCP: Only pure SYN packets (connection initiators) are counted.
+            // UDP: We maintain a ConnTracker table of outbound flows.  Inbound
+            //      packets that match a known outbound flow are classified as
+            //      "return traffic" (e.g. DNS responses) and are NOT counted
+            //      towards the port-scan heuristic.  Only unsolicited inbound
+            //      UDP packets (no matching outbound flow) are treated as
+            //      potential scan probes.
+            //
+            // This eliminates false positives from DNS responses, NTP replies,
+            // DHCP answers, etc.
+
+            // ── UDP ConnTracker bookkeeping: record ALL outbound UDP ─────
+            if let Some(TransportHeader::Udp(udp)) = &headers.transport {
+                if is_local_ip(&scan_src) {
+                    // Local host sending UDP → record as outbound flow
+                    conn_tracker.record_outbound(
+                        scan_src,
+                        udp.source_port,
+                        scan_dst,
+                        udp.destination_port,
+                    );
+                }
+                if is_local_ip(&scan_dst) && !is_local_ip(&scan_src) {
+                    // Remote host sending UDP to local → also record the
+                    // local side's "outbound" if we see the local host
+                    // replying later.  (Already handled above when local
+                    // sends.)  Nothing extra needed here.
+                }
+            }
+
             if is_local_ip(&scan_src) {
                 match &headers.transport {
                     Some(TransportHeader::Tcp(tcp)) => {
+                        // TCP: only pure SYN = connection initiator
                         if tcp.syn && !tcp.ack {
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true) {
                                 // ── Importance-lowering: local-to-local scanning ────
                                 let dst_local = is_local_ip(&scan_dst);
                                 let (severity, confidence) = if dst_local {
@@ -323,7 +356,11 @@ pub fn run(
                         }
                     }
                     Some(TransportHeader::Udp(udp)) => {
-                        if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port) {
+                        // UDP: check ConnTracker — is this an unsolicited packet?
+                        // An outbound UDP from local is always an initiator
+                        // (we already recorded it in conn_tracker above).
+                        let is_initiator = true;
+                        if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, is_initiator) {
                             // ── Importance-lowering: local-to-local scanning ────
                             let dst_local = is_local_ip(&scan_dst);
                             let (severity, confidence) = if dst_local {
@@ -349,6 +386,68 @@ pub fn run(
                             enrich_alert_with_dns(&dns_tracker, &mut alert, None);
                             emit(alert, &stats);
                         }
+                    }
+                    _ => {}
+                }
+            }
+
+            // ── Inbound scan detection (remote → local, unsolicited) ────
+            // Detect external hosts scanning our local machine.
+            if !is_local_ip(&scan_src) && is_local_ip(&scan_dst) {
+                match &headers.transport {
+                    Some(TransportHeader::Tcp(tcp)) => {
+                        // Inbound TCP SYN = someone scanning us
+                        if tcp.syn && !tcp.ack {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true) {
+                                let mut alert = MitreAlert::new(
+                                    "T1046",
+                                    "Network Service Discovery",
+                                    Severity::High,
+                                    80u8,
+                                    scan_src.to_string(),
+                                    scan_dst.to_string(),
+                                    tcp.source_port,
+                                    tcp.destination_port,
+                                    "tcp",
+                                    "port_scan",
+                                    serde_json::to_string(&scan_alert).unwrap_or_default(),
+                                )
+                                .with_meta("direction", "inbound");
+                                enrich_alert_with_dns(&dns_tracker, &mut alert, None);
+                                emit(alert, &stats);
+                            }
+                        }
+                    }
+                    Some(TransportHeader::Udp(udp)) => {
+                        // Inbound UDP: only count if NOT return traffic
+                        let is_return = conn_tracker.is_return_traffic(
+                            scan_src,
+                            udp.source_port,
+                            scan_dst,
+                            udp.destination_port,
+                        );
+                        if !is_return {
+                            // Unsolicited inbound UDP — potential scan
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, true) {
+                                let mut alert = MitreAlert::new(
+                                    "T1046",
+                                    "Network Service Discovery",
+                                    Severity::High,
+                                    80u8,
+                                    scan_src.to_string(),
+                                    scan_dst.to_string(),
+                                    udp.source_port,
+                                    udp.destination_port,
+                                    "udp",
+                                    "port_scan",
+                                    serde_json::to_string(&scan_alert).unwrap_or_default(),
+                                )
+                                .with_meta("direction", "inbound");
+                                enrich_alert_with_dns(&dns_tracker, &mut alert, None);
+                                emit(alert, &stats);
+                            }
+                        }
+                        // If is_return, this is a response (e.g. DNS reply) — skip scan counting
                     }
                     _ => {}
                 }

@@ -3,6 +3,126 @@ use std::net::IpAddr;
 use std::time::{Duration, Instant};
 use serde::Serialize;
 
+// ── UDP Connection Tracker (Stateful Inspection) ────────────────────────────
+//
+// Tracks outbound UDP flows so that inbound packets can be classified as
+// "return traffic" (response to a previously seen request) vs. "unsolicited"
+// (potential scan).  A flow is identified by the 4-tuple (local_ip, local_port,
+// remote_ip, remote_port).  Entries expire after `flow_timeout`.
+
+/// 4-tuple identifying a UDP "connection" (pseudo-connection).
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+struct UdpFlowKey {
+    local_ip: IpAddr,
+    local_port: u16,
+    remote_ip: IpAddr,
+    remote_port: u16,
+}
+
+/// Lightweight UDP connection tracker.
+///
+/// Call [`ConnTracker::record_outbound`] for every outbound UDP packet from a
+/// local host.  Then call [`ConnTracker::is_return_traffic`] for inbound UDP
+/// packets — it returns `true` when the inbound packet matches a previously
+/// recorded outbound flow (i.e. it is a response, not an unsolicited probe).
+pub struct ConnTracker {
+    /// Active outbound flows: key → last-seen timestamp.
+    flows: HashMap<UdpFlowKey, Instant>,
+    /// How long a flow entry stays valid after the last outbound packet.
+    flow_timeout: Duration,
+    /// Maximum number of tracked flows (LRU eviction when exceeded).
+    capacity: usize,
+    /// Counter for periodic garbage-collection sweeps.
+    ops_since_gc: u32,
+}
+
+impl ConnTracker {
+    pub fn new(flow_timeout: Duration) -> Self {
+        Self {
+            flows: HashMap::new(),
+            flow_timeout,
+            capacity: 50_000,
+            ops_since_gc: 0,
+        }
+    }
+
+    /// Record an outbound UDP packet from a local host.
+    ///
+    /// `src_ip`/`src_port` are the local (initiator) side;
+    /// `dst_ip`/`dst_port` are the remote side.
+    pub fn record_outbound(
+        &mut self,
+        src_ip: IpAddr,
+        src_port: u16,
+        dst_ip: IpAddr,
+        dst_port: u16,
+    ) {
+        let key = UdpFlowKey {
+            local_ip: src_ip,
+            local_port: src_port,
+            remote_ip: dst_ip,
+            remote_port: dst_port,
+        };
+        let now = Instant::now();
+        self.flows.insert(key, now);
+
+        self.maybe_gc();
+    }
+
+    /// Check whether an inbound UDP packet is return traffic for a known flow.
+    ///
+    /// `src_ip`/`src_port` are the remote (responder) side;
+    /// `dst_ip`/`dst_port` are the local side.
+    ///
+    /// Returns `true` if this packet matches a previously recorded outbound
+    /// flow that has not yet expired.
+    pub fn is_return_traffic(
+        &self,
+        src_ip: IpAddr,
+        src_port: u16,
+        dst_ip: IpAddr,
+        dst_port: u16,
+    ) -> bool {
+        // The reverse of the outbound flow:
+        //   outbound was  local(dst_ip:dst_port) → remote(src_ip:src_port)
+        //   inbound is    remote(src_ip:src_port) → local(dst_ip:dst_port)
+        let key = UdpFlowKey {
+            local_ip: dst_ip,
+            local_port: dst_port,
+            remote_ip: src_ip,
+            remote_port: src_port,
+        };
+        if let Some(last_seen) = self.flows.get(&key) {
+            Instant::now().duration_since(*last_seen) <= self.flow_timeout
+        } else {
+            false
+        }
+    }
+
+    /// Periodic garbage collection — remove expired entries.
+    fn maybe_gc(&mut self) {
+        self.ops_since_gc += 1;
+        if self.ops_since_gc < 1000 {
+            return;
+        }
+        self.ops_since_gc = 0;
+
+        let now = Instant::now();
+        self.flows
+            .retain(|_, last_seen| now.duration_since(*last_seen) <= self.flow_timeout);
+
+        // If still over capacity, drop oldest entries
+        if self.flows.len() > self.capacity {
+            let mut entries: Vec<_> = self.flows.iter().map(|(k, v)| (k.clone(), *v)).collect();
+            entries.sort_by_key(|(_, ts)| *ts);
+            let to_remove = self.flows.len() - self.capacity;
+            for (key, _) in entries.into_iter().take(to_remove) {
+                self.flows.remove(&key);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct HostScanStats {
     // Map destination IP to set of ports visited on that IP
@@ -62,7 +182,7 @@ impl ScannerTracker {
         self
     }
 
-    pub fn update(&mut self, src_ip: IpAddr, dst_ip: IpAddr, dst_port: u16) -> Option<ScanAlert> {
+    pub fn update(&mut self, src_ip: IpAddr, dst_ip: IpAddr, dst_port: u16, is_initiator: bool) -> Option<ScanAlert> {
         let now = Instant::now();
         let mut is_new = false;
         let mut old_last_seen = None;
@@ -98,12 +218,14 @@ impl ScannerTracker {
         // Now update stats
         let stats = self.scanners.get_mut(&src_ip).unwrap();
         
-        let ports = stats.dst_ports_per_ip
-            .entry(dst_ip)
-            .or_insert_with(HashSet::new);
-            
-        if ports.insert(dst_port) {
-            stats.connection_attempts += 1;
+        if is_initiator {
+            let ports = stats.dst_ports_per_ip
+                .entry(dst_ip)
+                .or_insert_with(HashSet::new);
+                
+            if ports.insert(dst_port) {
+                stats.connection_attempts += 1;
+            }
         }
 
         // Check triggers

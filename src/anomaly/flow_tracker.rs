@@ -180,7 +180,7 @@ impl FlowTracker {
         timestamp: f64,
         tcp_fin: bool,
         tcp_rst: bool,
-    ) {
+    ) -> bool {
         let key = FlowKey {
             src_ip,
             dst_ip,
@@ -189,10 +189,14 @@ impl FlowTracker {
             protocol,
         };
 
+        let mut is_new_flow = false;
         let mut entry = self
             .flows
             .entry(key)
-            .or_insert_with(|| FlowState::new(timestamp));
+            .or_insert_with(|| {
+                is_new_flow = true;
+                FlowState::new(timestamp)
+            });
 
         entry.update(payload_len, payload);
 
@@ -202,6 +206,8 @@ impl FlowTracker {
         if tcp_rst {
             entry.rst_seen = true;
         }
+        
+        is_new_flow
     }
 
     /// Flush all completed flows (timed out or TCP FIN/RST).
