@@ -355,14 +355,30 @@ fn analyze_tcp(
     let port = tcp.destination_port;
 
     // ── T1059 Interactive Shell ────────────────────────────────────────
-    if let Some(_shell_alert) = shell::detect_interactive_shell(
+    if let Some(shell_result) = shell::detect_interactive_shell(
         &session_data,
         &src_ip.to_string(),
         &dst_ip.to_string(),
         tcp.source_port,
         tcp.destination_port,
     ) {
-        let alert = MitreAlert::new(
+        // Build a descriptive logic string with shell details
+        let logic = if shell_result.extracted_commands.is_empty() {
+            format!(
+                "Interactive {} session detected. Matched: [{}]",
+                shell_result.shell_type,
+                shell_result.matched_patterns.join(", "),
+            )
+        } else {
+            format!(
+                "Interactive {} session detected. Matched: [{}]. Commands: [{}]",
+                shell_result.shell_type,
+                shell_result.matched_patterns.join(", "),
+                shell_result.extracted_commands.join("; "),
+            )
+        };
+
+        let mut alert = MitreAlert::new(
             "T1059",
             "Command and Scripting Interpreter",
             Severity::Critical,
@@ -373,8 +389,26 @@ fn analyze_tcp(
             tcp.destination_port,
             "tcp",
             "interactive_shell",
-            "Interactive shell session detected",
-        );
+            &logic,
+        )
+        .with_meta("shell_type", &shell_result.shell_type)
+        .with_meta("matched_patterns", shell_result.matched_patterns.join(", "));
+
+        if !shell_result.extracted_commands.is_empty() {
+            alert = alert.with_meta(
+                "commands",
+                shell_result.extracted_commands.join(" | "),
+            );
+            alert = alert.with_meta(
+                "command_count",
+                shell_result.extracted_commands.len().to_string(),
+            );
+        }
+
+        if !shell_result.payload_snippet.is_empty() {
+            alert = alert.with_meta("payload_snippet", shell_result.payload_snippet);
+        }
+
         emit(alert, stats);
     }
 

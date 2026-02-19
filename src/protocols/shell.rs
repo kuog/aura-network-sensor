@@ -14,6 +14,182 @@ pub struct ShellDetectionResult {
     pub matched_patterns: Vec<String>,
     pub severity: String,
     pub context: ShellContext,
+    /// Actual command lines extracted from the session payload.
+    pub extracted_commands: Vec<String>,
+    /// Sanitized snippet of the payload (printable ASCII, truncated).
+    pub payload_snippet: String,
+}
+
+/// Known shell commands that indicate reconnaissance or post-exploitation.
+const RECON_COMMANDS: &[&str] = &[
+    "whoami",
+    "id",
+    "hostname",
+    "net user",
+    "net localgroup",
+    "net group",
+    "uname -a",
+    "uname",
+    "ipconfig",
+    "ifconfig",
+    "ip addr",
+    "ip a",
+    "cat /etc/passwd",
+    "cat /etc/shadow",
+    "ps aux",
+    "ps -ef",
+    "netstat",
+    "ss -tlnp",
+    "systeminfo",
+    "tasklist",
+    "dir",
+    "ls -la",
+    "ls -al",
+    "pwd",
+    "echo",
+    "wget",
+    "curl",
+    "chmod",
+    "chown",
+    "scp",
+    "ssh",
+    "nc ",
+    "ncat",
+    "python",
+    "perl",
+    "ruby",
+    "bash -i",
+    "sh -i",
+    "powershell",
+    "cmd.exe",
+    "reg query",
+    "wmic",
+    "certutil",
+    "bitsadmin",
+    "arp -a",
+    "route print",
+    "nslookup",
+    "dig ",
+    "find /",
+    "locate ",
+    "env",
+    "export",
+    "set",
+    "history",
+];
+
+/// Extract individual command lines from a shell session payload.
+///
+/// Splits on common line terminators (`\r\n`, `\n`) and filters for lines
+/// that look like typed commands (non-empty, not pure whitespace, not just
+/// a prompt character).
+fn extract_command_lines(payload_str: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+
+    for raw_line in payload_str.split('\n') {
+        let line = raw_line.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Skip lines that are purely prompt characters or very short noise
+        if line.len() < 2 {
+            continue;
+        }
+
+        // Skip lines that look like output headers / banners rather than commands
+        // (heuristic: lines starting with common output prefixes)
+        let lower = line.to_ascii_lowercase();
+
+        // Check if the line contains any known command
+        let has_known_cmd = RECON_COMMANDS.iter().any(|cmd| lower.contains(cmd));
+
+        // Also accept lines that look like they were typed at a prompt:
+        //   "root@host:~# whoami"  →  extract "whoami"
+        //   "PS C:\> Get-Process"  →  extract "Get-Process"
+        //   "$ ls -la"             →  extract "ls -la"
+        let after_prompt = strip_prompt(line);
+
+        if has_known_cmd {
+            // Use the part after the prompt if available, otherwise the whole line
+            let cmd = if !after_prompt.is_empty() {
+                after_prompt.to_string()
+            } else {
+                line.to_string()
+            };
+            if !commands.contains(&cmd) {
+                commands.push(cmd);
+            }
+        } else if !after_prompt.is_empty() && after_prompt != line {
+            // The line had a recognizable prompt prefix — treat the remainder as a command
+            let cmd = after_prompt.to_string();
+            if !commands.contains(&cmd) {
+                commands.push(cmd);
+            }
+        }
+    }
+
+    commands
+}
+
+/// Try to strip a shell prompt prefix and return the command portion.
+///
+/// Recognizes patterns like:
+///   `root@host:~# <cmd>`
+///   `user@host:~/dir$ <cmd>`
+///   `PS C:\Users\admin> <cmd>`
+///   `C:\> <cmd>`
+///   `$ <cmd>`
+///   `# <cmd>`
+///   `> <cmd>`
+fn strip_prompt(line: &str) -> &str {
+    // Pattern: "user@host:path# cmd" or "user@host:path$ cmd"
+    if let Some(pos) = line.find("# ") {
+        let candidate = &line[pos + 2..];
+        if !candidate.is_empty() {
+            return candidate.trim();
+        }
+    }
+    if let Some(pos) = line.find("$ ") {
+        let candidate = &line[pos + 2..];
+        if !candidate.is_empty() {
+            return candidate.trim();
+        }
+    }
+    // PowerShell: "PS C:\path> cmd"
+    if let Some(pos) = line.find("> ") {
+        let before = &line[..pos];
+        if before.contains("PS ") || before.contains("C:\\") || before.ends_with(']') {
+            let candidate = &line[pos + 2..];
+            if !candidate.is_empty() {
+                return candidate.trim();
+            }
+        }
+    }
+    ""
+}
+
+/// Build a sanitized, truncated snippet of the payload for display.
+///
+/// Replaces non-printable characters with '.' and caps at `max_len` bytes.
+fn sanitize_payload(payload: &[u8], max_len: usize) -> String {
+    let len = payload.len().min(max_len);
+    let mut snippet = String::with_capacity(len);
+    for &b in &payload[..len] {
+        if b.is_ascii_graphic() || b == b' ' {
+            snippet.push(b as char);
+        } else if b == b'\n' || b == b'\r' {
+            snippet.push('↵');
+        } else if b == b'\t' {
+            snippet.push('→');
+        } else {
+            snippet.push('.');
+        }
+    }
+    if payload.len() > max_len {
+        snippet.push_str("…");
+    }
+    snippet
 }
 
 pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_port: u16, dst_port: u16) -> Option<ShellDetectionResult> {
@@ -100,12 +276,20 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
         fields.insert("dst_port".to_string(), dst_port.to_string());
         fields.insert("protocol".to_string(), "tcp".to_string());
 
+        // Extract command lines from the session
+        let extracted_commands = extract_command_lines(&payload_str);
+
+        // Build a sanitized payload snippet (up to 512 bytes)
+        let payload_snippet = sanitize_payload(payload, 512);
+
         return Some(ShellDetectionResult {
             technique_id: "T1059".to_string(),
             shell_type,
             matched_patterns,
             severity: "CRITICAL".to_string(),
             context: ShellContext { fields },
+            extracted_commands,
+            payload_snippet,
         });
     }
 
