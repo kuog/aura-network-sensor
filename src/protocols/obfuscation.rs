@@ -1,4 +1,5 @@
 use crate::analysis::context;
+use crate::analysis::reputation_engine::{self, ContextualScore};
 use crate::telemetry::shannon_entropy;
 
 pub struct StegResult {
@@ -15,6 +16,8 @@ pub struct StegResult {
     pub cdn_provider: Option<String>,
     /// Suppression reason for metadata enrichment.
     pub suppression_reason: Option<String>,
+    /// Contextual score from the reputation engine (populated when available).
+    pub contextual_score: Option<ContextualScore>,
 }
 
 /// Additional context passed into the steganography analyser so it can
@@ -100,7 +103,7 @@ pub fn analyze_steganography_with_context(
 
     let entropy = shannon_entropy(payload);
 
-    // ── TLS 1.3 Awareness ──────────────────────────────────────────────
+    // ── Step 1: TLS 1.3 Protocol Validation ─────────────────────────────
     // Before triggering T1001, check if the protocol is TLS 1.3.
     // TLS 1.3 traffic on port 443 with high entropy is expected behavior.
     let is_tls_1_3 = context::looks_like_tls_1_3(payload);
@@ -126,6 +129,7 @@ pub fn analyze_steganography_with_context(
                 protocol_feature: None,
                 cdn_provider: None,
                 suppression_reason: None,
+                contextual_score: None,
             });
         }
     }
@@ -133,62 +137,174 @@ pub fn analyze_steganography_with_context(
     // Trigger 3: Null Byte Padding
     // Detect large blocks of null bytes (0x00) used as padding
     if has_null_block(payload, 32) {
-        // ── TLS Padding CDN heuristic (T1001 benign) ───────────────────
-        // If null-byte padding is detected on port 443 while communicating
-        // with a known CDN AND entropy is consistently high (> 7.9), this
-        // is legitimate TLS record padding and should be marked BENIGN.
+        // ── Step 2: Signature Filtering ─────────────────────────────────
+        // If pattern_type == "Null byte padding" AND is_tls13 == true on
+        // port 443, this is a standard TLS 1.3 protocol feature.
         //
-        // Enhanced: Now uses BOTH IP-based CDN lookup (via context module)
-        // AND SNI-based matching for double-verification.
-        if port == 443 && entropy > 7.9 {
-            if let Some(cdn_provider) = resolve_cdn_provider(ctx) {
-                let suppression_reason = if is_tls_1_3 {
+        // ── Step 3: Reputation Adjustment ───────────────────────────────
+        // Use the reputation engine to compute contextual confidence score.
+        // Cloud provider IPs get −70, safe SNI gets −20.
+        if let Some(c) = ctx {
+            let contextual = reputation_engine::compute_contextual_score(
+                100,
+                c.dst_ip,
+                port,
+                c.sni,
+                "Null byte padding",
+                is_tls_1_3,
+            );
+
+            // If the contextual score says suppress (confidence < 30 + known provider),
+            // mark as benign with full metadata.
+            if contextual.suppress || contextual.is_standard_tls_feature {
+                let cdn_provider = resolve_cdn_provider(ctx)
+                    .or_else(|| {
+                        if contextual.dst_identity.is_known_provider() {
+                            Some(contextual.dst_identity.provider.to_string())
+                        } else {
+                            None
+                        }
+                    });
+
+                let suppression_reason = if contextual.is_standard_tls_feature {
                     format!(
-                        "Known CDN behavior: TLS 1.3 padding from '{}' on port 443 (entropy={:.2})",
-                        cdn_provider, entropy,
+                        "Standard TLS 1.3 feature: null-byte padding on port {} to {} (confidence={}, entropy={:.2})",
+                        port,
+                        contextual.provider_name,
+                        contextual.confidence,
+                        entropy,
                     )
                 } else {
                     format!(
-                        "Known CDN behavior: TLS padding from '{}' on port 443 (entropy={:.2})",
-                        cdn_provider, entropy,
+                        "Known cloud provider: {} on port {} (confidence={}, entropy={:.2})",
+                        contextual.provider_name,
+                        port,
+                        contextual.confidence,
+                        entropy,
                     )
                 };
 
                 return Some(StegResult {
                     technique_id: "T1001".to_string(),
                     reason: format!(
-                        "TLS null-byte padding on port 443 to known CDN '{}' with high entropy ({:.2}) — benign",
-                        cdn_provider, entropy,
+                        "TLS null-byte padding on port {} to '{}' (entropy={:.2}) — contextual score: {}",
+                        port,
+                        contextual.provider_name,
+                        entropy,
+                        contextual.confidence,
                     ),
                     observed_entropy: entropy,
                     pattern_type: "Null byte padding".to_string(),
                     is_benign: true,
                     protocol_feature: protocol_feature_tag.clone().or(Some("TLS Padding detected".to_string())),
-                    cdn_provider: Some(cdn_provider),
+                    cdn_provider,
                     suppression_reason: Some(suppression_reason),
+                    contextual_score: Some(contextual),
                 });
             }
 
-            // Even without CDN match, if TLS 1.3 is detected on port 443,
-            // cross-reference with the context module's flow classification
-            if is_tls_1_3 {
-                if let Some(c) = ctx {
-                    let (flow_trust, cdn_result) = context::classify_flow(c.dst_ip, port);
-                    if flow_trust == context::FlowTrust::TrustedInfrastructure {
-                        let provider = cdn_result.provider.unwrap_or_else(|| "Unknown CDN".to_string());
+            // Even if not suppressed, if confidence is reduced, still attach
+            // the contextual score for downstream processing.
+            if contextual.confidence < 100 {
+                // Check legacy CDN heuristic as well
+                if port == 443 && entropy > 7.9 {
+                    if let Some(cdn_provider) = resolve_cdn_provider(ctx) {
+                        let suppression_reason = if is_tls_1_3 {
+                            format!(
+                                "Known CDN behavior: TLS 1.3 padding from '{}' on port 443 (entropy={:.2})",
+                                cdn_provider, entropy,
+                            )
+                        } else {
+                            format!(
+                                "Known CDN behavior: TLS padding from '{}' on port 443 (entropy={:.2})",
+                                cdn_provider, entropy,
+                            )
+                        };
+
                         return Some(StegResult {
                             technique_id: "T1001".to_string(),
                             reason: format!(
-                                "TLS 1.3 null-byte padding on port 443 to trusted infrastructure '{}' (entropy={:.2}) — benign",
-                                provider, entropy,
+                                "TLS null-byte padding on port 443 to known CDN '{}' with high entropy ({:.2}) — benign",
+                                cdn_provider, entropy,
                             ),
                             observed_entropy: entropy,
                             pattern_type: "Null byte padding".to_string(),
                             is_benign: true,
-                            protocol_feature: Some("TLS_1.3_Padding".to_string()),
-                            cdn_provider: Some(provider),
-                            suppression_reason: Some("Known CDN behavior".to_string()),
+                            protocol_feature: protocol_feature_tag.clone().or(Some("TLS Padding detected".to_string())),
+                            cdn_provider: Some(cdn_provider),
+                            suppression_reason: Some(suppression_reason),
+                            contextual_score: Some(contextual),
                         });
+                    }
+                }
+
+                // Non-benign but with reduced confidence — attach score
+                return Some(StegResult {
+                    technique_id: "T1001".to_string(),
+                    reason: "Entropy dilution detected".to_string(),
+                    observed_entropy: entropy,
+                    pattern_type: "Null byte padding".to_string(),
+                    is_benign: false,
+                    protocol_feature: protocol_feature_tag,
+                    cdn_provider: None,
+                    suppression_reason: None,
+                    contextual_score: Some(contextual),
+                });
+            }
+        } else {
+            // No context available — fall back to legacy CDN heuristic
+            if port == 443 && entropy > 7.9 {
+                if let Some(cdn_provider) = resolve_cdn_provider(ctx) {
+                    let suppression_reason = if is_tls_1_3 {
+                        format!(
+                            "Known CDN behavior: TLS 1.3 padding from '{}' on port 443 (entropy={:.2})",
+                            cdn_provider, entropy,
+                        )
+                    } else {
+                        format!(
+                            "Known CDN behavior: TLS padding from '{}' on port 443 (entropy={:.2})",
+                            cdn_provider, entropy,
+                        )
+                    };
+
+                    return Some(StegResult {
+                        technique_id: "T1001".to_string(),
+                        reason: format!(
+                            "TLS null-byte padding on port 443 to known CDN '{}' with high entropy ({:.2}) — benign",
+                            cdn_provider, entropy,
+                        ),
+                        observed_entropy: entropy,
+                        pattern_type: "Null byte padding".to_string(),
+                        is_benign: true,
+                        protocol_feature: protocol_feature_tag.clone().or(Some("TLS Padding detected".to_string())),
+                        cdn_provider: Some(cdn_provider),
+                        suppression_reason: Some(suppression_reason),
+                        contextual_score: None,
+                    });
+                }
+
+                // Even without CDN match, if TLS 1.3 is detected on port 443,
+                // cross-reference with the context module's flow classification
+                if is_tls_1_3 {
+                    if let Some(c) = ctx {
+                        let (flow_trust, cdn_result) = context::classify_flow(c.dst_ip, port);
+                        if flow_trust == context::FlowTrust::TrustedInfrastructure {
+                            let provider = cdn_result.provider.unwrap_or_else(|| "Unknown CDN".to_string());
+                            return Some(StegResult {
+                                technique_id: "T1001".to_string(),
+                                reason: format!(
+                                    "TLS 1.3 null-byte padding on port 443 to trusted infrastructure '{}' (entropy={:.2}) — benign",
+                                    provider, entropy,
+                                ),
+                                observed_entropy: entropy,
+                                pattern_type: "Null byte padding".to_string(),
+                                is_benign: true,
+                                protocol_feature: Some("TLS_1.3_Padding".to_string()),
+                                cdn_provider: Some(provider),
+                                suppression_reason: Some("Known CDN behavior".to_string()),
+                                contextual_score: None,
+                            });
+                        }
                     }
                 }
             }
@@ -203,6 +319,7 @@ pub fn analyze_steganography_with_context(
             protocol_feature: protocol_feature_tag,
             cdn_provider: None,
             suppression_reason: None,
+            contextual_score: None,
         });
     }
 
@@ -222,6 +339,7 @@ pub fn analyze_steganography_with_context(
                 protocol_feature: None,
                 cdn_provider: None,
                 suppression_reason: None,
+                contextual_score: None,
             });
         }
     }

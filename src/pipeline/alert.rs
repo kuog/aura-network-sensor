@@ -57,6 +57,9 @@ pub struct MitreAlert {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum Severity {
+    /// Debug-level: suppressed or near-zero confidence detections.
+    /// Used when reputation/protocol checks reduce confidence below 30.
+    Debug,
     Info,
     Low,
     Medium,
@@ -67,6 +70,7 @@ pub enum Severity {
 impl std::fmt::Display for Severity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Severity::Debug => write!(f, "DEBUG"),
             Severity::Info => write!(f, "INFO"),
             Severity::Low => write!(f, "LOW"),
             Severity::Medium => write!(f, "MEDIUM"),

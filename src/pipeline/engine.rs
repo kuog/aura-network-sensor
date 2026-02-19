@@ -557,10 +557,23 @@ fn analyze_tcp(
         port,
         Some(&steg_ctx),
     ) {
+        // ── Reputation Engine: Contextual Scoring ──────────────────────
+        // Use the new reputation_engine to compute contextual confidence
+        // with cloud provider CIDR matching, TLS 1.3 awareness, and SNI trust.
+        let is_tls13 = crate::analysis::context::looks_like_tls_1_3(&session_data);
+        let rep_score = crate::analysis::reputation_engine::compute_contextual_score(
+            100,
+            &dst_ip_str,
+            port,
+            sni_for_steg.as_deref(),
+            &steg.pattern_type,
+            is_tls13,
+        );
+
         if steg.is_benign {
             // ── Context-aware confidence scoring ───────────────────────
-            // Use the new context module to compute relief-factor-adjusted
-            // confidence and determine whether to suppress or downgrade.
+            // Use the context module for legacy flow classification, plus
+            // the new reputation engine for contextual scoring.
             let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
                 &session_data,
                 &dst_ip_str,
@@ -569,7 +582,10 @@ fn analyze_tcp(
                 steg.observed_entropy,
             );
 
-            if ctx_verdict.suppress {
+            // Determine suppression: use reputation engine OR context verdict
+            let should_suppress = rep_score.suppress || ctx_verdict.suppress;
+
+            if should_suppress {
                 // Fully suppress — log to suppressed.log for audit
                 crate::analysis::context::log_suppressed(
                     &steg.technique_id,
@@ -581,16 +597,20 @@ fn analyze_tcp(
                     sni_for_steg.as_deref(),
                 );
                 debug!(
-                    "[Engine] T1001 suppressed: {} ({}:{} → {}:{})",
+                    "[Engine] T1001 suppressed: {} ({}:{} → {}:{}) [rep_confidence={}, is_standard_tls={}]",
                     ctx_verdict.suppression_reason.as_deref().unwrap_or("CDN"),
                     src_ip, tcp.source_port,
                     dst_ip, tcp.destination_port,
+                    rep_score.confidence,
+                    rep_score.is_standard_tls_feature,
                 );
             } else {
-                // Downgraded to INFO with enriched metadata
-                let severity = match ctx_verdict.severity {
+                // Downgraded with enriched metadata
+                let severity = match rep_score.severity {
+                    "DEBUG" => Severity::Debug,
                     "INFO" => Severity::Info,
                     "LOW" => Severity::Low,
+                    "MEDIUM" => Severity::Medium,
                     _ => Severity::Info,
                 };
 
@@ -598,7 +618,7 @@ fn analyze_tcp(
                     &steg.technique_id,
                     "Data Obfuscation",
                     severity,
-                    ctx_verdict.confidence,
+                    rep_score.confidence,
                     src_ip.to_string(),
                     dst_ip.to_string(),
                     tcp.source_port,
@@ -610,7 +630,10 @@ fn analyze_tcp(
                 .with_meta("pattern_type", &steg.pattern_type)
                 .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy))
                 .with_meta("verdict", "BENIGN")
-                .with_meta("flow_trust", ctx_verdict.flow_trust.to_string());
+                // New metadata fields from reputation engine
+                .with_meta("provider_name", rep_score.provider_name)
+                .with_meta("is_standard_tls_feature", rep_score.is_standard_tls_feature.to_string())
+                .with_meta("flow_trust", rep_score.flow_trust);
 
                 // Data Enrichment: cdn_provider, protocol_feature, suppression_reason
                 if let Some(ref cdn) = steg.cdn_provider {
@@ -635,7 +658,7 @@ fn analyze_tcp(
                 emit(alert, stats);
             }
         } else {
-            // ── Non-benign detection: apply context scoring anyway ─────
+            // ── Non-benign detection: apply contextual scoring ─────────
             // Even for non-benign detections, run the confidence scoring
             // to see if relief factors should reduce severity.
             let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
@@ -646,44 +669,74 @@ fn analyze_tcp(
                 steg.observed_entropy,
             );
 
-            let (severity, confidence) = if ctx_verdict.confidence < 30 {
-                (Severity::Info, ctx_verdict.confidence)
-            } else if ctx_verdict.confidence < 50 {
-                (Severity::Low, ctx_verdict.confidence)
-            } else if ctx_verdict.confidence < 70 {
-                (Severity::Medium, ctx_verdict.confidence)
+            // Use the reputation engine score as primary, with context as fallback
+            let effective_confidence = rep_score.confidence.min(ctx_verdict.confidence);
+
+            // Updated severity thresholds:
+            // - confidence < 30 → DEBUG (suppress if reputation/protocol checks caused it)
+            // - confidence > 75 → HIGH
+            let (severity, confidence) = if effective_confidence < 30 {
+                (Severity::Debug, effective_confidence)
+            } else if effective_confidence < 50 {
+                (Severity::Low, effective_confidence)
+            } else if effective_confidence <= 75 {
+                (Severity::Medium, effective_confidence)
             } else {
-                (Severity::High, 80u8)
+                (Severity::High, effective_confidence)
             };
 
-            let mut alert = MitreAlert::new(
-                &steg.technique_id,
-                "Data Obfuscation",
-                severity,
-                confidence,
-                src_ip.to_string(),
-                dst_ip.to_string(),
-                tcp.source_port,
-                tcp.destination_port,
-                "tcp",
-                "obfuscation_detected",
-                &steg.reason,
-            )
-            .with_meta("pattern_type", &steg.pattern_type)
-            .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy))
-            .with_meta("flow_trust", ctx_verdict.flow_trust.to_string());
+            // If confidence fell below 30 due to reputation/protocol checks, suppress
+            if effective_confidence < 30 && rep_score.dst_identity.is_known_provider() {
+                crate::analysis::context::log_suppressed(
+                    &steg.technique_id,
+                    &src_ip.to_string(),
+                    &dst_ip_str,
+                    port,
+                    &format!("Reputation-adjusted confidence {} < 30 for {}", effective_confidence, rep_score.provider_name),
+                    Some(rep_score.dst_identity.provider),
+                    sni_for_steg.as_deref(),
+                );
+                debug!(
+                    "[Engine] T1001 suppressed (reputation): confidence={} provider={} ({}:{} → {}:{})",
+                    effective_confidence,
+                    rep_score.provider_name,
+                    src_ip, tcp.source_port,
+                    dst_ip, tcp.destination_port,
+                );
+                // Don't emit — suppressed entirely
+            } else {
+                let mut alert = MitreAlert::new(
+                    &steg.technique_id,
+                    "Data Obfuscation",
+                    severity,
+                    confidence,
+                    src_ip.to_string(),
+                    dst_ip.to_string(),
+                    tcp.source_port,
+                    tcp.destination_port,
+                    "tcp",
+                    "obfuscation_detected",
+                    &steg.reason,
+                )
+                .with_meta("pattern_type", &steg.pattern_type)
+                .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy))
+                // New metadata fields from reputation engine
+                .with_meta("provider_name", rep_score.provider_name)
+                .with_meta("is_standard_tls_feature", rep_score.is_standard_tls_feature.to_string())
+                .with_meta("flow_trust", rep_score.flow_trust);
 
-            if let Some(ref cdn) = ctx_verdict.cdn_provider {
-                alert = alert.with_meta("cdn_provider", cdn);
-            }
-            if let Some(ref feature) = ctx_verdict.protocol_feature {
-                alert = alert.with_meta("protocol_feature", feature);
-            }
-            if let Some(ref reason) = ctx_verdict.suppression_reason {
-                alert = alert.with_meta("suppression_reason", reason);
-            }
+                if let Some(ref cdn) = ctx_verdict.cdn_provider {
+                    alert = alert.with_meta("cdn_provider", cdn);
+                }
+                if let Some(ref feature) = ctx_verdict.protocol_feature {
+                    alert = alert.with_meta("protocol_feature", feature);
+                }
+                if let Some(ref reason) = ctx_verdict.suppression_reason {
+                    alert = alert.with_meta("suppression_reason", reason);
+                }
 
-            emit(alert, stats);
+                emit(alert, stats);
+            }
         }
     }
 
@@ -814,6 +867,16 @@ fn analyze_tcp(
         );
 
         // ── Step 2: Heuristic Adjustment for T1573 ───────────────────
+        // Also compute reputation engine score for enriched metadata
+        let t1573_rep_score = crate::analysis::reputation_engine::compute_contextual_score(
+            100,
+            &dst_ip.to_string(),
+            tcp.destination_port,
+            sni_ref,
+            "encrypted_channel",
+            crate::analysis::context::looks_like_tls_1_3(&session_data),
+        );
+
         if high_entropy_trigger || (entropy > 7.5 && is_standard_encrypted) {
             let verdict = reputation::adjust_t1573(
                 &flow_rep,
@@ -833,11 +896,16 @@ fn analyze_tcp(
                     );
                 }
                 ReputationVerdict::Downgrade { reason } => {
-                    // Emit as INFO with confidence 0
+                    // If confidence < 30 due to reputation, use DEBUG severity
+                    let severity = if t1573_rep_score.confidence < 30 {
+                        Severity::Debug
+                    } else {
+                        Severity::Info
+                    };
                     let alert = MitreAlert::new(
                         "T1573",
                         "Encrypted Channel",
-                        Severity::Info,
+                        severity,
                         0,
                         src_ip.to_string(),
                         dst_ip.to_string(),
@@ -852,6 +920,9 @@ fn analyze_tcp(
                     .with_meta("provider", &flow_rep.provider)
                     .with_meta("port_service", &flow_rep.port_service)
                     .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string())
+                    .with_meta("provider_name", t1573_rep_score.provider_name)
+                    .with_meta("is_standard_tls_feature", t1573_rep_score.is_standard_tls_feature.to_string())
+                    .with_meta("flow_trust", t1573_rep_score.flow_trust)
                     .with_meta(
                         "sni",
                         sni_ref.unwrap_or(""),
@@ -863,11 +934,14 @@ fn analyze_tcp(
                     confidence,
                     reason,
                 } => {
+                    // Updated severity mapping: HIGH only if confidence > 75
                     let severity = match severity_hint {
+                        "DEBUG" => Severity::Debug,
                         "INFO" => Severity::Info,
                         "LOW" => Severity::Low,
                         "MEDIUM" => Severity::Medium,
-                        "HIGH" => Severity::High,
+                        "HIGH" if confidence > 75 => Severity::High,
+                        "HIGH" => Severity::Medium, // Downgrade if confidence <= 75
                         "CRITICAL" => Severity::Critical,
                         _ => Severity::Medium,
                     };
@@ -889,6 +963,9 @@ fn analyze_tcp(
                     .with_meta("provider", &flow_rep.provider)
                     .with_meta("port_service", &flow_rep.port_service)
                     .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string())
+                    .with_meta("provider_name", t1573_rep_score.provider_name)
+                    .with_meta("is_standard_tls_feature", t1573_rep_score.is_standard_tls_feature.to_string())
+                    .with_meta("flow_trust", t1573_rep_score.flow_trust)
                     .with_meta(
                         "sni",
                         sni_ref.unwrap_or(""),
@@ -896,11 +973,13 @@ fn analyze_tcp(
                     emit(alert, stats);
                 }
                 ReputationVerdict::NoChange => {
-                    // Use original enrichment-based severity
+                    // Use original enrichment-based severity with updated thresholds:
+                    // HIGH only if confidence > 75 (was >= 70)
                     let severity = match enrichment_result.confidence_score {
-                        0..=39 => Severity::Low,
-                        40..=69 => Severity::Medium,
-                        70..=89 => Severity::High,
+                        0..=29 => Severity::Debug,
+                        30..=49 => Severity::Low,
+                        50..=75 => Severity::Medium,
+                        76..=89 => Severity::High,
                         _ => Severity::Critical,
                     };
                     let alert = MitreAlert::new(
@@ -921,6 +1000,9 @@ fn analyze_tcp(
                     .with_meta("provider", &flow_rep.provider)
                     .with_meta("port_service", &flow_rep.port_service)
                     .with_meta("is_whitelisted", flow_rep.is_whitelisted.to_string())
+                    .with_meta("provider_name", t1573_rep_score.provider_name)
+                    .with_meta("is_standard_tls_feature", t1573_rep_score.is_standard_tls_feature.to_string())
+                    .with_meta("flow_trust", t1573_rep_score.flow_trust)
                     .with_meta(
                         "sni",
                         sni_ref.unwrap_or(""),
@@ -932,10 +1014,12 @@ fn analyze_tcp(
 
         // ── Beaconing detection (T1011) — also enriched with reputation ─
         if is_beaconing {
+            // Updated severity thresholds: HIGH only if confidence > 75
             let severity = match enrichment_result.confidence_score {
-                0..=39 => Severity::Low,
-                40..=69 => Severity::Medium,
-                70..=89 => Severity::High,
+                0..=29 => Severity::Debug,
+                30..=49 => Severity::Low,
+                50..=75 => Severity::Medium,
+                76..=89 => Severity::High,
                 _ => Severity::Critical,
             };
 

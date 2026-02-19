@@ -258,11 +258,11 @@ pub fn classify_flow(dst_ip: &str, dst_port: u16) -> (FlowTrust, CdnLookupResult
 /// Relief factors applied to the base confidence score.
 #[derive(Debug, Clone, Default)]
 pub struct ReliefFactors {
-    /// Matched a trusted CDN/Cloud ASN: −80 points.
+    /// Matched a trusted CDN/Cloud ASN: −70 points (was −80).
     pub trusted_asn: bool,
-    /// Traffic on a standard encrypted port (443/993/…): −20 points.
+    /// Traffic on a standard encrypted port (443/993/…): −10 points.
     pub standard_port: bool,
-    /// Valid SNI (Server Name Indication) present: −10 points.
+    /// Valid SNI (Server Name Indication) matching a safe domain: −20 points (was −10).
     pub valid_sni: bool,
 }
 
@@ -282,13 +282,17 @@ pub struct ConfidenceResult {
 /// Compute the final confidence score starting from `base_confidence = 100`
 /// and subtracting relief factors.
 ///
-/// | Factor              | Points |
-/// |---------------------|--------|
-/// | Trusted CDN/ASN     | −80    |
-/// | Standard port       | −20    |
-/// | Valid SNI present   | −10    |
+/// | Factor                          | Points |
+/// |---------------------------------|--------|
+/// | Trusted CDN/Cloud ASN (AWS/GCP) | −70    |
+/// | Standard encrypted port         | −10    |
+/// | Safe SNI domain present         | −20    |
 ///
-/// If the final score drops below 30, severity is forced to `"INFO"`.
+/// Severity thresholds:
+/// - confidence > 75 → HIGH
+/// - confidence < 30 → DEBUG (suppress)
+/// - confidence < 50 → LOW
+/// - confidence < 75 → MEDIUM
 pub fn compute_confidence(
     dst_ip: &str,
     dst_port: u16,
@@ -298,40 +302,52 @@ pub fn compute_confidence(
     let mut notes = Vec::new();
     let mut factors = ReliefFactors::default();
 
-    // Factor 1: Trusted CDN/ASN
+    // Factor 1: Trusted CDN/Cloud ASN — reduced from −80 to −70
+    // Aligns with reputation_engine's contextual scoring
     let cdn = lookup_cdn_str(dst_ip);
     if cdn.is_cdn {
-        score -= 80;
+        score -= 70;
         factors.trusted_asn = true;
         notes.push(format!(
-            "Matched Trusted ASN '{}' (-80)",
+            "Matched Trusted ASN '{}' (-70)",
             cdn.provider.as_deref().unwrap_or("Unknown CDN")
         ));
     }
 
-    // Factor 2: Standard encrypted port
+    // Factor 2: Standard encrypted port — reduced from −20 to −10
     if STANDARD_ENCRYPTED_PORTS.contains(&dst_port) {
-        score -= 20;
+        score -= 10;
         factors.standard_port = true;
-        notes.push(format!("Standard encrypted port {} (-20)", dst_port));
+        notes.push(format!("Standard encrypted port {} (-10)", dst_port));
     }
 
-    // Factor 3: Valid SNI present
+    // Factor 3: Safe SNI domain — increased from −10 to −20
+    // Now checks against known safe domain suffixes for stronger reduction
     if let Some(sni_val) = sni {
         if !sni_val.is_empty() {
-            score -= 10;
-            factors.valid_sni = true;
-            notes.push(format!("Valid SNI '{}' present (-10)", sni_val));
+            if crate::analysis::reputation_engine::is_safe_sni(sni_val) {
+                score -= 20;
+                factors.valid_sni = true;
+                notes.push(format!("Safe SNI '{}' matched known domain (-20)", sni_val));
+            } else {
+                // SNI present but not a known safe domain — smaller reduction
+                score -= 5;
+                factors.valid_sni = true;
+                notes.push(format!("Valid SNI '{}' present (-5)", sni_val));
+            }
         }
     }
 
     let confidence = score.clamp(0, 100) as u8;
 
+    // Updated severity thresholds:
+    // - HIGH only if confidence > 75 (was >= 70)
+    // - DEBUG if confidence < 30 (new tier)
     let severity = if confidence < 30 {
-        "INFO"
+        "DEBUG"
     } else if confidence < 50 {
         "LOW"
-    } else if confidence < 70 {
+    } else if confidence <= 75 {
         "MEDIUM"
     } else {
         "HIGH"
@@ -570,7 +586,9 @@ pub fn evaluate_t1001_context(
             (false, false, None)
         };
 
-    let severity = if suppress || downgrade_to_info {
+    let severity = if suppress {
+        "DEBUG"
+    } else if downgrade_to_info {
         "INFO"
     } else {
         conf.severity
@@ -670,14 +688,14 @@ mod tests {
 
     #[test]
     fn test_confidence_full_relief() {
-        // Cloudflare IP + port 443 + valid SNI → should be < 30
+        // Cloudflare IP + port 443 + safe SNI → 100 - 70 - 10 - 20 = 0 → DEBUG
         let result = compute_confidence("104.16.0.1", 443, Some("cdn.cloudflare.com"));
         assert!(
             result.confidence < 30,
             "Expected confidence < 30, got {}",
             result.confidence
         );
-        assert_eq!(result.severity, "INFO");
+        assert_eq!(result.severity, "DEBUG");
         assert!(result.factors.trusted_asn);
         assert!(result.factors.standard_port);
         assert!(result.factors.valid_sni);
@@ -692,9 +710,17 @@ mod tests {
 
     #[test]
     fn test_confidence_partial_relief() {
-        // Standard port only → 100 - 20 = 80
+        // Standard port only → 100 - 10 = 90
         let result = compute_confidence("192.168.1.1", 443, None);
-        assert_eq!(result.confidence, 80);
+        assert_eq!(result.confidence, 90);
+    }
+
+    #[test]
+    fn test_confidence_cdn_port_only() {
+        // CDN IP + standard port → 100 - 70 - 10 = 20 → DEBUG
+        let result = compute_confidence("104.16.0.1", 443, None);
+        assert_eq!(result.confidence, 20);
+        assert_eq!(result.severity, "DEBUG");
     }
 
     #[test]
@@ -708,7 +734,8 @@ mod tests {
             7.95,
         );
         assert!(verdict.suppress || verdict.downgrade_to_info);
-        assert_eq!(verdict.severity, "INFO");
+        // Suppressed alerts now get "DEBUG" severity
+        assert!(verdict.severity == "DEBUG" || verdict.severity == "INFO");
         assert!(verdict.cdn_provider.is_some());
     }
 
