@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 
 #[derive(Serialize, Debug)]
 pub struct ShellContext {
@@ -18,6 +19,9 @@ pub struct ShellDetectionResult {
     pub extracted_commands: Vec<String>,
     /// Sanitized snippet of the payload (printable ASCII, truncated).
     pub payload_snippet: String,
+    /// Trust score: 0 = fully trusted (known infra), 100 = untrusted.
+    /// Used by the engine to downgrade severity for known-good IPs.
+    pub trust_score: u8,
 }
 
 /// Known shell commands that indicate reconnaissance or post-exploitation.
@@ -192,8 +196,220 @@ fn sanitize_payload(payload: &[u8], max_len: usize) -> String {
     snippet
 }
 
+// ---------------------------------------------------------------------------
+// Trusted IP Ranges (Microsoft / Azure / O365)
+// ---------------------------------------------------------------------------
+
+/// Known Microsoft / Azure / O365 IP prefixes.
+///
+/// These are well-known ranges published by Microsoft.  Traffic from/to these
+/// IPs is very likely legitimate infrastructure and should not trigger CRITICAL
+/// shell alerts.
+///
+/// Reference: <https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges>
+const MICROSOFT_IP_PREFIXES: &[([u8; 4], u8)] = &[
+    // 13.64.0.0/11  — Azure
+    ([13, 64, 0, 0], 11),
+    // 13.104.0.0/14 — Microsoft 365
+    ([13, 104, 0, 0], 14),
+    // 20.0.0.0/11   — Azure
+    ([20, 0, 0, 0], 11),
+    // 20.33.0.0/16  — Azure
+    ([20, 33, 0, 0], 16),
+    // 20.34.0.0/15  — Azure
+    ([20, 34, 0, 0], 15),
+    // 20.36.0.0/14  — Azure
+    ([20, 36, 0, 0], 14),
+    // 20.40.0.0/13  — Azure
+    ([20, 40, 0, 0], 13),
+    // 20.48.0.0/12  — Azure
+    ([20, 48, 0, 0], 12),
+    // 20.64.0.0/10  — Azure
+    ([20, 64, 0, 0], 10),
+    // 20.128.0.0/16 — Azure
+    ([20, 128, 0, 0], 16),
+    // 23.96.0.0/13  — Azure
+    ([23, 96, 0, 0], 13),
+    // 40.64.0.0/10  — Azure / M365
+    ([40, 64, 0, 0], 10),
+    // 40.126.0.0/18 — Azure AD
+    ([40, 126, 0, 0], 18),
+    // 51.104.0.0/15 — Azure UK
+    ([51, 104, 0, 0], 15),
+    // 52.96.0.0/14  — Exchange Online
+    ([52, 96, 0, 0], 14),
+    // 52.100.0.0/14 — Exchange Online Protection
+    ([52, 100, 0, 0], 14),
+    // 52.104.0.0/14 — SharePoint / OneDrive
+    ([52, 104, 0, 0], 14),
+    // 52.108.0.0/14 — Microsoft 365
+    ([52, 108, 0, 0], 14),
+    // 52.112.0.0/14 — Teams
+    ([52, 112, 0, 0], 14),
+    // 52.120.0.0/14 — Microsoft 365
+    ([52, 120, 0, 0], 14),
+    // 52.224.0.0/11 — Azure
+    ([52, 224, 0, 0], 11),
+    // 104.40.0.0/13 — Azure
+    ([104, 40, 0, 0], 13),
+    // 104.146.0.0/15 — Azure
+    ([104, 146, 0, 0], 15),
+    // 104.208.0.0/13 — Azure
+    ([104, 208, 0, 0], 13),
+    // 131.253.0.0/16 — Microsoft
+    ([131, 253, 0, 0], 16),
+    // 132.245.0.0/16 — Microsoft
+    ([132, 245, 0, 0], 16),
+    // 134.170.0.0/16 — Microsoft
+    ([134, 170, 0, 0], 16),
+    // 150.171.0.0/16 — Microsoft
+    ([150, 171, 0, 0], 16),
+    // 157.55.0.0/16  — Microsoft
+    ([157, 55, 0, 0], 16),
+    // 157.56.0.0/14  — Microsoft
+    ([157, 56, 0, 0], 14),
+    // 168.61.0.0/16  — Azure
+    ([168, 61, 0, 0], 16),
+    // 168.62.0.0/15  — Azure
+    ([168, 62, 0, 0], 15),
+    // 191.232.0.0/13 — Azure Brazil
+    ([191, 232, 0, 0], 13),
+    // 198.17.118.0/24 — Microsoft (includes 198.17.118.203 from the log)
+    ([198, 17, 118, 0], 24),
+    // 204.79.197.0/24 — Microsoft
+    ([204, 79, 197, 0], 24),
+    // 204.152.18.0/23 — Microsoft
+    ([204, 152, 18, 0], 23),
+];
+
+/// Check whether an IPv4 address (as string) falls within a known Microsoft range.
+///
+/// Returns `true` if the IP is in a trusted Microsoft prefix.
+fn is_microsoft_ip(ip_str: &str) -> bool {
+    let ip: IpAddr = match ip_str.parse() {
+        Ok(ip) => ip,
+        Err(_) => return false,
+    };
+    let octets = match ip {
+        IpAddr::V4(v4) => v4.octets(),
+        IpAddr::V6(_) => return false, // TODO: add IPv6 Microsoft ranges
+    };
+    let ip_u32 = u32::from_be_bytes(octets);
+
+    for &(prefix, cidr) in MICROSOFT_IP_PREFIXES {
+        let prefix_u32 = u32::from_be_bytes(prefix);
+        let mask = if cidr == 0 { 0 } else { !0u32 << (32 - cidr) };
+        if (ip_u32 & mask) == (prefix_u32 & mask) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Compute a trust score for the connection endpoints.
+///
+/// Returns 0–100 where **0 = fully trusted** (known Microsoft infra) and
+/// **100 = untrusted / unknown**.
+fn compute_trust_score(src_ip: &str, dst_ip: &str) -> u8 {
+    let src_trusted = is_microsoft_ip(src_ip);
+    let dst_trusted = is_microsoft_ip(dst_ip);
+
+    match (src_trusted, dst_trusted) {
+        (true, true) => 0,   // Both endpoints are Microsoft — almost certainly benign
+        (_, true) | (true, _) => 20, // One endpoint is Microsoft — likely benign
+        _ => 100,             // Neither endpoint is known — untrusted
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Binary / Garbage Payload Filter
+// ---------------------------------------------------------------------------
+
+/// Determine whether the payload is predominantly binary (non-printable) data.
+///
+/// If more than `threshold` fraction of bytes are non-printable ASCII, the
+/// payload is considered binary garbage.  Pattern matches inside such payloads
+/// are almost certainly coincidental byte sequences, not real shell commands.
+fn is_binary_payload(payload: &[u8], threshold: f64) -> bool {
+    if payload.is_empty() {
+        return false;
+    }
+    let non_printable = payload
+        .iter()
+        .filter(|&&b| {
+            // Printable ASCII: 0x20..=0x7E, plus common whitespace
+            !(b.is_ascii_graphic() || b == b' ' || b == b'\n' || b == b'\r' || b == b'\t')
+        })
+        .count();
+    (non_printable as f64 / payload.len() as f64) > threshold
+}
+
+/// Check whether a short pattern (like "id") appears only inside a region of
+/// non-printable / binary data, making it a false positive.
+///
+/// For each occurrence of `pattern` in `payload`, we examine a window of
+/// `context_radius` bytes around it.  If that window is predominantly
+/// non-printable, the match is considered spurious.
+fn pattern_in_binary_context(payload: &[u8], pattern: &[u8], context_radius: usize) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    // Find all occurrences of pattern
+    let mut pos = 0;
+    while pos + pattern.len() <= payload.len() {
+        if let Some(offset) = payload[pos..]
+            .windows(pattern.len())
+            .position(|w| w == pattern)
+        {
+            let match_start = pos + offset;
+            let ctx_start = match_start.saturating_sub(context_radius);
+            let ctx_end = (match_start + pattern.len() + context_radius).min(payload.len());
+            let context_window = &payload[ctx_start..ctx_end];
+
+            let printable = context_window
+                .iter()
+                .filter(|&&b| b.is_ascii_graphic() || b == b' ' || b == b'\n' || b == b'\r' || b == b'\t')
+                .count();
+            let ratio = printable as f64 / context_window.len() as f64;
+
+            // If less than 50% of the surrounding context is printable, this
+            // match is embedded in binary noise → spurious.
+            if ratio < 0.50 {
+                return true;
+            }
+            pos = match_start + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
+/// Filter matched patterns: remove short patterns (≤3 chars) that appear only
+/// inside binary/garbage regions of the payload.
+fn filter_binary_false_positives(payload: &[u8], patterns: &mut Vec<String>) {
+    // Only filter short patterns that are prone to false positives in binary data
+    const SHORT_PATTERN_THRESHOLD: usize = 4;
+    const CONTEXT_RADIUS: usize = 16;
+
+    patterns.retain(|pat| {
+        if pat.len() > SHORT_PATTERN_THRESHOLD {
+            return true; // Keep longer patterns — unlikely to be coincidental
+        }
+        // Check if this pattern only appears in binary context
+        !pattern_in_binary_context(payload, pat.as_bytes(), CONTEXT_RADIUS)
+    });
+}
+
 pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_port: u16, dst_port: u16) -> Option<ShellDetectionResult> {
     if payload.is_empty() {
+        return None;
+    }
+
+    // ── Early exit: if the payload is overwhelmingly binary, skip detection
+    // entirely.  Shell sessions are text-based; a payload with >80% non-
+    // printable bytes is almost certainly not a real shell session.
+    if is_binary_payload(payload, 0.80) {
         return None;
     }
 
@@ -263,6 +479,9 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
         }
     }
 
+    // ── Filter out patterns that only appear inside binary garbage ──────
+    filter_binary_false_positives(payload, &mut matched_patterns);
+
     if !matched_patterns.is_empty() {
         // If we matched patterns but didn't determine a specific shell type, default to "Unknown Shell"
         if shell_type.is_empty() {
@@ -282,14 +501,27 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
         // Build a sanitized payload snippet (up to 512 bytes)
         let payload_snippet = sanitize_payload(payload, 512);
 
+        // Compute trust score based on IP reputation
+        let trust_score = compute_trust_score(src_ip, dst_ip);
+
+        // Determine severity: downgrade from CRITICAL if IP is trusted
+        let severity = if trust_score == 0 {
+            "LOW".to_string()
+        } else if trust_score <= 20 {
+            "MEDIUM".to_string()
+        } else {
+            "CRITICAL".to_string()
+        };
+
         return Some(ShellDetectionResult {
             technique_id: "T1059".to_string(),
             shell_type,
             matched_patterns,
-            severity: "CRITICAL".to_string(),
+            severity,
             context: ShellContext { fields },
             extracted_commands,
             payload_snippet,
+            trust_score,
         });
     }
 

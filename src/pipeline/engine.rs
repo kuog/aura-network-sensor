@@ -362,6 +362,17 @@ fn analyze_tcp(
         tcp.source_port,
         tcp.destination_port,
     ) {
+        // Determine severity and confidence based on trust_score.
+        // trust_score 0   = fully trusted (both IPs Microsoft) → LOW / 20
+        // trust_score ≤20 = one IP is Microsoft                → MEDIUM / 40
+        // trust_score 100 = untrusted                          → CRITICAL / 90
+        let (severity, confidence) = match shell_result.trust_score {
+            0 => (Severity::Low, 20u8),
+            1..=20 => (Severity::Medium, 40u8),
+            21..=50 => (Severity::High, 70u8),
+            _ => (Severity::Critical, 90u8),
+        };
+
         // Build a descriptive logic string with shell details
         let logic = if shell_result.extracted_commands.is_empty() {
             format!(
@@ -381,8 +392,8 @@ fn analyze_tcp(
         let mut alert = MitreAlert::new(
             "T1059",
             "Command and Scripting Interpreter",
-            Severity::Critical,
-            90,
+            severity,
+            confidence,
             src_ip.to_string(),
             dst_ip.to_string(),
             tcp.source_port,
@@ -392,7 +403,8 @@ fn analyze_tcp(
             &logic,
         )
         .with_meta("shell_type", &shell_result.shell_type)
-        .with_meta("matched_patterns", shell_result.matched_patterns.join(", "));
+        .with_meta("matched_patterns", shell_result.matched_patterns.join(", "))
+        .with_meta("trust_score", shell_result.trust_score.to_string());
 
         if !shell_result.extracted_commands.is_empty() {
             alert = alert.with_meta(
