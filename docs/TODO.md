@@ -30,150 +30,178 @@
 | 1 | T1595.001 | Active Scanning: Scanning IP Blocks |
 | 2 | T1595.002 | Active Scanning: Vulnerability Scanning |
 | 3 | T1595.003 | Active Scanning: Wordlist Scanning |
+| 4 | T1590 | Gather Victim Network Information (DNS zone transfer AXFR) |
+| 5 | T1590.001 | Gather Victim Network Information: Domain Properties |
+| 6 | T1590.004 | Gather Victim Network Information: Network Topology (traceroute/ICMP TTL) |
+| 7 | T1590.005 | Gather Victim Network Information: IP Addresses (mass DNS resolution) |
+| 8 | T1592.004 | Gather Victim Host Information: Client Configurations (HTTP/TLS fingerprinting) |
 
 ### Initial Access
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 4 | T1133 | External Remote Services (VPN/RDP/SSH from external IPs) |
-| 5 | T1190 | Exploit Public-Facing Application (exploit payload signatures in HTTP) |
-| 6 | T1659 | Content Injection (HTTP response injection / iframe inject) |
+| 9 | T1133 | External Remote Services (VPN/RDP/SSH from external IPs) |
+| 10 | T1190 | Exploit Public-Facing Application (exploit payload signatures in HTTP) |
+| 11 | T1659 | Content Injection (HTTP response injection / iframe inject) |
+| 12 | T1566.002 | Phishing: Spearphishing Link (malicious URL patterns in HTTP/SMTP) |
 
 ### Execution
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 7 | T1059.001 | Command and Scripting Interpreter: PowerShell (network payload) |
-| 8 | T1047 | Windows Management Instrumentation (WMI over DCOM/135) |
+| 13 | T1059.001 | Command and Scripting Interpreter: PowerShell (network payload detection) |
+| 14 | T1047 | Windows Management Instrumentation (WMI over DCOM port 135) |
+
+### Persistence
+
+| № | Код MITRE | Название техники |
+| --- | --- | --- |
+| 15 | T1197 | BITS Jobs (HTTP range request patterns for stealthy downloads) |
 
 ### Discovery
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 9 | T1016 | System Network Configuration Discovery (DHCP/DNS recon queries) |
-| 10 | T1018 | Remote System Discovery (NetBIOS/LLMNR/mDNS enumeration) |
-| 11 | T1049 | System Network Connections Discovery (SMB session enum) |
-| 12 | T1135 | Network Share Discovery (SMB share enumeration) |
-| 13 | T1040 | Network Sniffing (promiscuous mode detection via ARP anomalies) |
+| 16 | T1016 | System Network Configuration Discovery (DHCP/DNS recon queries) |
+| 17 | T1018 | Remote System Discovery (NetBIOS/LLMNR/mDNS enumeration) |
+| 18 | T1049 | System Network Connections Discovery (SMB session enum) |
+| 19 | T1135 | Network Share Discovery (SMB share enumeration) |
+| 20 | T1040 | Network Sniffing (promiscuous mode detection via ARP anomalies) |
+| 21 | T1580 | Cloud Infrastructure Discovery (cloud metadata API calls in HTTP) |
 
 ### Lateral Movement
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 14 | T1021.001 | Remote Services: Remote Desktop Protocol (RDP on 3389) |
-| 15 | T1021.002 | Remote Services: SMB/Windows Admin Shares (PsExec lateral) |
-| 16 | T1021.004 | Remote Services: SSH |
-| 17 | T1021.005 | Remote Services: VNC |
-| 18 | T1021.006 | Remote Services: Windows Remote Management (WinRM on 5985/5986) |
-| 19 | T1210 | Exploitation of Remote Services (exploit payload signatures) |
-| 20 | T1570 | Lateral Tool Transfer (internal file copy via SMB/WinRM) |
-| 21 | T1563 | Remote Service Session Hijacking |
-| 22 | T1563.001 | Remote Service Session Hijacking: SSH Hijacking |
-| 23 | T1563.002 | Remote Service Session Hijacking: RDP Hijacking |
+| 22 | T1021.001 | Remote Services: Remote Desktop Protocol (RDP on 3389) |
+| 23 | T1021.002 | Remote Services: SMB/Windows Admin Shares (PsExec lateral) |
+| 24 | T1021.003 | Remote Services: Distributed Component Object Model (DCOM on 135) |
+| 25 | T1021.004 | Remote Services: SSH |
+| 26 | T1021.005 | Remote Services: VNC |
+| 27 | T1021.006 | Remote Services: Windows Remote Management (WinRM on 5985/5986) |
+| 28 | T1210 | Exploitation of Remote Services (exploit payload signatures) |
+| 29 | T1570 | Lateral Tool Transfer (internal file copy via SMB/WinRM) |
+| 30 | T1563 | Remote Service Session Hijacking |
+| 31 | T1563.001 | Remote Service Session Hijacking: SSH Hijacking |
+| 32 | T1563.002 | Remote Service Session Hijacking: RDP Hijacking |
 
 ### Credential Access
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 24 | T1110 | Brute Force (repeated failed auth attempts) |
-| 25 | T1110.001 | Brute Force: Password Guessing |
-| 26 | T1110.002 | Brute Force: Password Cracking (Kerberos AS-REP roasting traffic) |
-| 27 | T1110.003 | Brute Force: Password Spraying |
-| 28 | T1110.004 | Brute Force: Credential Stuffing |
-| 29 | T1187 | Forced Authentication (SMB relay / NTLM capture) |
-| 30 | T1557.001 | Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning |
-| 31 | T1557.002 | Adversary-in-the-Middle: ARP Cache Poisoning (rate-based detection) |
-| 32 | T1557.003 | Adversary-in-the-Middle: DHCP Spoofing |
-| 33 | T1558.003 | Steal or Forge Kerberos Tickets: Kerberoasting (TGS-REQ anomalies) |
-| 34 | T1040 | Network Sniffing (credential capture detection) |
+| 33 | T1110 | Brute Force (repeated failed auth attempts) |
+| 34 | T1110.001 | Brute Force: Password Guessing |
+| 35 | T1110.002 | Brute Force: Password Cracking (Kerberos AS-REP roasting traffic) |
+| 36 | T1110.003 | Brute Force: Password Spraying |
+| 37 | T1110.004 | Brute Force: Credential Stuffing |
+| 38 | T1187 | Forced Authentication (SMB relay / NTLM capture) |
+| 39 | T1557.001 | Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning |
+| 40 | T1557.002 | Adversary-in-the-Middle: ARP Cache Poisoning (rate-based detection) |
+| 41 | T1557.003 | Adversary-in-the-Middle: DHCP Spoofing |
+| 42 | T1558.003 | Steal or Forge Kerberos Tickets: Kerberoasting (TGS-REQ anomalies) |
+| 43 | T1552.004 | Unsecured Credentials: Private Keys (cleartext key material in traffic) |
+| 44 | T1556.005 | Modify Authentication Process: Reversible Encryption (Kerberos downgrade) |
+| 45 | T1212 | Exploitation for Credential Access (exploit payloads targeting auth services) |
 
 ### Collection
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 35 | T1114.002 | Email Collection: Remote Email Collection (IMAP/POP3 bulk download) |
-| 36 | T1560 | Archive Collected Data (compressed stream detection) |
+| 46 | T1114.002 | Email Collection: Remote Email Collection (IMAP/POP3 bulk download) |
+| 47 | T1119 | Automated Collection (bulk SMB/FTP access patterns) |
+| 48 | T1560 | Archive Collected Data (compressed stream detection in transfers) |
 
 ### Command and Control
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 37 | T1071.002 | Application Layer Protocol: File Transfer Protocols (FTP/FTPS) |
-| 38 | T1071.003 | Application Layer Protocol: Mail Protocols (SMTP/IMAP/POP3) |
-| 39 | T1090 | Proxy (SOCKS/HTTP CONNECT proxy detection) |
-| 40 | T1090.001 | Proxy: Internal Proxy |
-| 41 | T1090.002 | Proxy: External Proxy |
-| 42 | T1090.003 | Proxy: Multi-hop Proxy |
-| 43 | T1095 | Non-Application Layer Protocol (raw TCP/UDP/ICMP C2) |
-| 44 | T1102 | Web Service (C2 via known cloud/web services) |
-| 45 | T1102.001 | Web Service: Dead Drop Resolver |
-| 46 | T1102.002 | Web Service: Bidirectional Communication |
-| 47 | T1104 | Multi-Stage Channels |
-| 48 | T1132 | Data Encoding (Base64/custom encoding in payloads) |
-| 49 | T1132.001 | Data Encoding: Standard Encoding |
-| 50 | T1132.002 | Data Encoding: Non-Standard Encoding |
-| 51 | T1001.001 | Data Obfuscation: Junk Data |
-| 52 | T1001.002 | Data Obfuscation: Steganography (deep image analysis) |
-| 53 | T1001.003 | Data Obfuscation: Protocol Impersonation |
-| 54 | T1008 | Fallback Channels (multiple C2 endpoints per session) |
-| 55 | T1568 | Dynamic Resolution |
-| 56 | T1568.001 | Dynamic Resolution: Fast Flux DNS |
-| 57 | T1568.002 | Dynamic Resolution: Domain Generation Algorithms (DGA) |
-| 58 | T1568.003 | Dynamic Resolution: DNS Calculation |
-| 59 | T1572 | Protocol Tunneling (SSH tunnels, DNS-over-HTTPS, ICMP tunnels) |
-| 60 | T1573.001 | Encrypted Channel: Symmetric Cryptography |
-| 61 | T1573.002 | Encrypted Channel: Asymmetric Cryptography (JA3S, cert anomalies) |
-| 62 | T1205 | Traffic Signaling (port knocking sequences) |
-| 63 | T1205.001 | Traffic Signaling: Port Knocking |
-| 64 | T1219 | Remote Access Software (TeamViewer, AnyDesk, ngrok, etc.) |
-| 65 | T1104 | Multi-Stage Channels (staged payload download detection) |
+| 49 | T1071.002 | Application Layer Protocol: File Transfer Protocols (FTP/FTPS) |
+| 50 | T1071.003 | Application Layer Protocol: Mail Protocols (SMTP/IMAP/POP3) |
+| 51 | T1090 | Proxy (SOCKS/HTTP CONNECT proxy detection) |
+| 52 | T1090.001 | Proxy: Internal Proxy |
+| 53 | T1090.002 | Proxy: External Proxy |
+| 54 | T1090.003 | Proxy: Multi-hop Proxy |
+| 55 | T1095 | Non-Application Layer Protocol (raw TCP/UDP/ICMP C2) |
+| 56 | T1102 | Web Service (C2 via known cloud/web services) |
+| 57 | T1102.001 | Web Service: Dead Drop Resolver |
+| 58 | T1102.002 | Web Service: Bidirectional Communication |
+| 59 | T1104 | Multi-Stage Channels (staged payload download detection) |
+| 60 | T1132 | Data Encoding (Base64/custom encoding in payloads) |
+| 61 | T1132.001 | Data Encoding: Standard Encoding |
+| 62 | T1132.002 | Data Encoding: Non-Standard Encoding |
+| 63 | T1001.001 | Data Obfuscation: Junk Data |
+| 64 | T1001.002 | Data Obfuscation: Steganography (deep image analysis) |
+| 65 | T1001.003 | Data Obfuscation: Protocol Impersonation |
+| 66 | T1008 | Fallback Channels (multiple C2 endpoints per session) |
+| 67 | T1568 | Dynamic Resolution |
+| 68 | T1568.001 | Dynamic Resolution: Fast Flux DNS |
+| 69 | T1568.002 | Dynamic Resolution: Domain Generation Algorithms (DGA) |
+| 70 | T1568.003 | Dynamic Resolution: DNS Calculation |
+| 71 | T1572 | Protocol Tunneling (SSH tunnels, DNS-over-HTTPS, ICMP tunnels) |
+| 72 | T1573.001 | Encrypted Channel: Symmetric Cryptography |
+| 73 | T1573.002 | Encrypted Channel: Asymmetric Cryptography (JA3S, cert anomalies) |
+| 74 | T1205 | Traffic Signaling (port knocking sequences) |
+| 75 | T1205.001 | Traffic Signaling: Port Knocking |
+| 76 | T1205.002 | Traffic Signaling: Socket Filters |
+| 77 | T1219 | Remote Access Software (TeamViewer, AnyDesk, ngrok, etc.) |
 
 ### Exfiltration
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 66 | T1048 | Exfiltration Over Alternative Protocol |
-| 67 | T1048.001 | Exfiltration Over Symmetric Encrypted Non-C2 Protocol |
-| 68 | T1048.002 | Exfiltration Over Asymmetric Encrypted Non-C2 Protocol |
-| 69 | T1048.003 | Exfiltration Over Unencrypted Non-C2 Protocol |
-| 70 | T1567 | Exfiltration Over Web Service |
-| 71 | T1567.001 | Exfiltration Over Web Service: Exfiltration to Code Repository |
-| 72 | T1567.002 | Exfiltration Over Web Service: Exfiltration to Cloud Storage |
-| 73 | T1567.004 | Exfiltration Over Web Service: Exfiltration Over Webhook |
-| 74 | T1020 | Automated Exfiltration (periodic large transfers) |
-| 75 | T1030 | Data Transfer Size Limits (chunked exfil detection) |
-| 76 | T1537 | Transfer Data to Cloud Account |
-| 77 | T1029 | Scheduled Transfer (time-based exfil patterns) |
+| 78 | T1048 | Exfiltration Over Alternative Protocol |
+| 79 | T1048.001 | Exfiltration Over Symmetric Encrypted Non-C2 Protocol |
+| 80 | T1048.002 | Exfiltration Over Asymmetric Encrypted Non-C2 Protocol |
+| 81 | T1048.003 | Exfiltration Over Unencrypted Non-C2 Protocol |
+| 82 | T1567 | Exfiltration Over Web Service |
+| 83 | T1567.001 | Exfiltration Over Web Service: Exfiltration to Code Repository |
+| 84 | T1567.002 | Exfiltration Over Web Service: Exfiltration to Cloud Storage |
+| 85 | T1567.004 | Exfiltration Over Web Service: Exfiltration Over Webhook |
+| 86 | T1020 | Automated Exfiltration (periodic large transfers) |
+| 87 | T1029 | Scheduled Transfer (time-based exfil patterns) |
+| 88 | T1030 | Data Transfer Size Limits (chunked exfil detection) |
+| 89 | T1537 | Transfer Data to Cloud Account |
 
 ### Impact
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 78 | T1498 | Network Denial of Service (volumetric flood detection) |
-| 79 | T1498.001 | Network Denial of Service: Direct Network Flood |
-| 80 | T1498.002 | Network Denial of Service: Reflection Amplification |
-| 81 | T1499 | Endpoint Denial of Service |
-| 82 | T1499.001 | Endpoint Denial of Service: OS Exhaustion Flood (SYN flood) |
-| 83 | T1499.002 | Endpoint Denial of Service: Service Exhaustion Flood |
+| 90 | T1498 | Network Denial of Service (volumetric flood detection) |
+| 91 | T1498.001 | Network Denial of Service: Direct Network Flood |
+| 92 | T1498.002 | Network Denial of Service: Reflection Amplification |
+| 93 | T1499 | Endpoint Denial of Service |
+| 94 | T1499.001 | Endpoint Denial of Service: OS Exhaustion Flood (SYN flood) |
+| 95 | T1499.002 | Endpoint Denial of Service: Service Exhaustion Flood |
+| 96 | T1499.003 | Endpoint Denial of Service: Application Exhaustion Flood |
+| 97 | T1499.004 | Endpoint Denial of Service: Application or System Exploitation |
+| 98 | T1565.002 | Data Manipulation: Transmitted Data Manipulation (MITM payload modification) |
 
-### Defense Evasion / Network-level
+### Defense Evasion (network-level)
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 84 | T1599 | Network Boundary Bridging |
-| 85 | T1599.001 | Network Boundary Bridging: Network Address Translation Traversal |
-| 86 | T1205.002 | Traffic Signaling: Socket Filters |
+| 99 | T1599 | Network Boundary Bridging |
+| 100 | T1599.001 | Network Boundary Bridging: Network Address Translation Traversal |
+| 101 | T1600 | Weaken Encryption (TLS downgrade attacks, weak cipher negotiation) |
+| 102 | T1600.001 | Weaken Encryption: Reduce Key Space |
+| 103 | T1600.002 | Weaken Encryption: Disable Crypto Hardware |
+| 104 | T1553.004 | Subvert Trust Controls: Install Root Certificate (unknown CA in TLS handshake) |
+| 105 | T1036.005 | Masquerading: Match Legitimate Name or Location (HTTP Host header spoofing) |
+| 106 | T1027.009 | Obfuscated Files or Information: Embedded Payloads (in HTTP downloads) |
 
 ### Resource Development (network-observable)
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 87 | T1583.006 | Acquire Infrastructure: Web Services (known C2 infra IPs/domains) |
-| 88 | T1584.004 | Compromise Infrastructure: Server (known compromised IP feeds) |
+| 107 | T1583.006 | Acquire Infrastructure: Web Services (known C2 infra IPs/domains) |
+| 108 | T1584.004 | Compromise Infrastructure: Server (known compromised IP feeds) |
+| 109 | T1588.004 | Obtain Capabilities: Digital Certificates (self-signed/anomalous certs in TLS) |
 
 ### Other network-observable
 
 | № | Код MITRE | Название техники |
 | --- | --- | --- |
-| 89 | T1542.003 | Pre-OS Boot: Bootkit (TFTP/PXE boot anomalies) |
-| 90 | T1021.003 | Remote Services: Distributed Component Object Model (DCOM on 135) |
+| 110 | T1542.003 | Pre-OS Boot: Bootkit (TFTP/PXE boot anomalies) |
+| 111 | T1602 | Data from Configuration Repository (SNMP community string brute force) |
+| 112 | T1602.001 | Data from Configuration Repository: SNMP (MIB Dump) |
+| 113 | T1602.002 | Data from Configuration Repository: Network Device CLI (Telnet/SSH) |
