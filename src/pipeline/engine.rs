@@ -547,9 +547,10 @@ fn analyze_tcp(
     // in the enrichment path would be ideal, but we extract it here too
     // to keep the obfuscation module self-contained for the fast path).
     let sni_for_steg = crate::analysis::enrichment::extract_sni(&session_data);
+    let dst_ip_str = dst_ip.to_string();
     let steg_ctx = protocols::obfuscation::StegContext {
         sni: sni_for_steg.as_deref(),
-        dst_ip: &dst_ip.to_string(),
+        dst_ip: &dst_ip_str,
     };
     if let Some(steg) = protocols::obfuscation::analyze_steganography_with_context(
         &session_data,
@@ -557,42 +558,109 @@ fn analyze_tcp(
         Some(&steg_ctx),
     ) {
         if steg.is_benign {
-            // TLS padding from a known CDN — emit as INFO / BENIGN
+            // ── Context-aware confidence scoring ───────────────────────
+            // Use the new context module to compute relief-factor-adjusted
+            // confidence and determine whether to suppress or downgrade.
+            let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
+                &session_data,
+                &dst_ip_str,
+                port,
+                sni_for_steg.as_deref(),
+                steg.observed_entropy,
+            );
+
+            if ctx_verdict.suppress {
+                // Fully suppress — log to suppressed.log for audit
+                crate::analysis::context::log_suppressed(
+                    &steg.technique_id,
+                    &src_ip.to_string(),
+                    &dst_ip_str,
+                    port,
+                    ctx_verdict.suppression_reason.as_deref().unwrap_or("Known CDN behavior"),
+                    steg.cdn_provider.as_deref(),
+                    sni_for_steg.as_deref(),
+                );
+                debug!(
+                    "[Engine] T1001 suppressed: {} ({}:{} → {}:{})",
+                    ctx_verdict.suppression_reason.as_deref().unwrap_or("CDN"),
+                    src_ip, tcp.source_port,
+                    dst_ip, tcp.destination_port,
+                );
+            } else {
+                // Downgraded to INFO with enriched metadata
+                let severity = match ctx_verdict.severity {
+                    "INFO" => Severity::Info,
+                    "LOW" => Severity::Low,
+                    _ => Severity::Info,
+                };
+
+                let mut alert = MitreAlert::new(
+                    &steg.technique_id,
+                    "Data Obfuscation",
+                    severity,
+                    ctx_verdict.confidence,
+                    src_ip.to_string(),
+                    dst_ip.to_string(),
+                    tcp.source_port,
+                    tcp.destination_port,
+                    "tcp",
+                    "obfuscation_benign",
+                    &steg.reason,
+                )
+                .with_meta("pattern_type", &steg.pattern_type)
+                .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy))
+                .with_meta("verdict", "BENIGN")
+                .with_meta("flow_trust", ctx_verdict.flow_trust.to_string());
+
+                // Data Enrichment: cdn_provider, protocol_feature, suppression_reason
+                if let Some(ref cdn) = steg.cdn_provider {
+                    alert = alert.with_meta("cdn_provider", cdn);
+                } else if let Some(ref cdn) = ctx_verdict.cdn_provider {
+                    alert = alert.with_meta("cdn_provider", cdn);
+                }
+                if let Some(ref feature) = steg.protocol_feature {
+                    alert = alert.with_meta("protocol_feature", feature);
+                } else if let Some(ref feature) = ctx_verdict.protocol_feature {
+                    alert = alert.with_meta("protocol_feature", feature);
+                }
+                if let Some(ref reason) = steg.suppression_reason {
+                    alert = alert.with_meta("suppression_reason", reason);
+                } else if let Some(ref reason) = ctx_verdict.suppression_reason {
+                    alert = alert.with_meta("suppression_reason", reason);
+                }
+                if let Some(ref sni) = sni_for_steg {
+                    alert = alert.with_meta("sni", sni);
+                }
+
+                emit(alert, stats);
+            }
+        } else {
+            // ── Non-benign detection: apply context scoring anyway ─────
+            // Even for non-benign detections, run the confidence scoring
+            // to see if relief factors should reduce severity.
+            let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
+                &session_data,
+                &dst_ip_str,
+                port,
+                sni_for_steg.as_deref(),
+                steg.observed_entropy,
+            );
+
+            let (severity, confidence) = if ctx_verdict.confidence < 30 {
+                (Severity::Info, ctx_verdict.confidence)
+            } else if ctx_verdict.confidence < 50 {
+                (Severity::Low, ctx_verdict.confidence)
+            } else if ctx_verdict.confidence < 70 {
+                (Severity::Medium, ctx_verdict.confidence)
+            } else {
+                (Severity::High, 80u8)
+            };
+
             let mut alert = MitreAlert::new(
                 &steg.technique_id,
                 "Data Obfuscation",
-                Severity::Info,
-                5, // very low confidence — essentially benign
-                src_ip.to_string(),
-                dst_ip.to_string(),
-                tcp.source_port,
-                tcp.destination_port,
-                "tcp",
-                "obfuscation_benign",
-                &steg.reason,
-            )
-            .with_meta("pattern_type", &steg.pattern_type)
-            .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy))
-            .with_meta("verdict", "BENIGN");
-
-            if let Some(ref feature) = steg.protocol_feature {
-                alert = alert.with_meta("protocol_feature", feature);
-            }
-            if let Some(ref cdn) = steg.cdn_provider {
-                alert = alert.with_meta("cdn_provider", cdn);
-            }
-            if let Some(ref sni) = sni_for_steg {
-                alert = alert.with_meta("sni", sni);
-            }
-
-            emit(alert, stats);
-        } else {
-            // Genuine obfuscation / steganography — emit at full severity
-            let alert = MitreAlert::new(
-                &steg.technique_id,
-                "Data Obfuscation",
-                Severity::High,
-                80,
+                severity,
+                confidence,
                 src_ip.to_string(),
                 dst_ip.to_string(),
                 tcp.source_port,
@@ -601,8 +669,20 @@ fn analyze_tcp(
                 "obfuscation_detected",
                 &steg.reason,
             )
-            .with_meta("pattern_type", steg.pattern_type)
-            .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy));
+            .with_meta("pattern_type", &steg.pattern_type)
+            .with_meta("observed_entropy", format!("{:.2}", steg.observed_entropy))
+            .with_meta("flow_trust", ctx_verdict.flow_trust.to_string());
+
+            if let Some(ref cdn) = ctx_verdict.cdn_provider {
+                alert = alert.with_meta("cdn_provider", cdn);
+            }
+            if let Some(ref feature) = ctx_verdict.protocol_feature {
+                alert = alert.with_meta("protocol_feature", feature);
+            }
+            if let Some(ref reason) = ctx_verdict.suppression_reason {
+                alert = alert.with_meta("suppression_reason", reason);
+            }
+
             emit(alert, stats);
         }
     }

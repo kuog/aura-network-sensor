@@ -1,2 +1,3 @@
 target/
 alerts.db
+suppressed.log

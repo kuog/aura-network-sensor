@@ -32,3 +32,6 @@ dashmap = "6"
 # Logging (non-blocking)
 log = "0.4"
 env_logger = "0.11"
+
+# Fast CIDR / IP-range matching for CDN context layer
+ipnetwork = "0.20"

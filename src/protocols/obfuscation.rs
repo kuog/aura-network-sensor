@@ -1,3 +1,4 @@
+use crate::analysis::context;
 use crate::telemetry::shannon_entropy;
 
 pub struct StegResult {
@@ -12,6 +13,8 @@ pub struct StegResult {
     pub protocol_feature: Option<String>,
     /// CDN provider name when the benign heuristic matched.
     pub cdn_provider: Option<String>,
+    /// Suppression reason for metadata enrichment.
+    pub suppression_reason: Option<String>,
 }
 
 /// Additional context passed into the steganography analyser so it can
@@ -41,15 +44,42 @@ const CDN_SNI_SUFFIXES: &[(&str, &str)] = &[
     (".fastly.net", "Fastly"),
     (".fastlylb.net", "Fastly"),
     (".fastly.com", "Fastly"),
+    // Google
+    (".google.com", "Google"),
+    (".googleapis.com", "Google"),
+    (".gstatic.com", "Google"),
+    (".googlevideo.com", "Google"),
+    // AWS / CloudFront
+    (".cloudfront.net", "AWS"),
+    (".amazonaws.com", "AWS"),
 ];
 
-/// Check if the SNI belongs to a known CDN (Cloudflare, Akamai, Fastly).
+/// Check if the SNI belongs to a known CDN (Cloudflare, Akamai, Fastly, etc.).
 /// Returns the provider name on match.
 fn match_cdn_sni(sni: &str) -> Option<&'static str> {
     let lower = sni.to_lowercase();
     for &(suffix, provider) in CDN_SNI_SUFFIXES {
         if lower.ends_with(suffix) || lower == suffix.trim_start_matches('.') {
             return Some(provider);
+        }
+    }
+    None
+}
+
+/// Try to identify CDN provider via IP-based lookup (using the context module).
+/// Falls back to SNI-based matching if IP lookup fails.
+fn resolve_cdn_provider(ctx: Option<&StegContext>) -> Option<String> {
+    if let Some(c) = ctx {
+        // First: try IP-based CDN lookup (O(1) via ipnetwork)
+        let cdn_lookup = context::lookup_cdn_str(c.dst_ip);
+        if cdn_lookup.is_cdn {
+            return cdn_lookup.provider;
+        }
+        // Fallback: SNI-based CDN matching
+        if let Some(sni) = c.sni {
+            if let Some(provider) = match_cdn_sni(sni) {
+                return Some(provider.to_string());
+            }
         }
     }
     None
@@ -70,6 +100,18 @@ pub fn analyze_steganography_with_context(
 
     let entropy = shannon_entropy(payload);
 
+    // ── TLS 1.3 Awareness ──────────────────────────────────────────────
+    // Before triggering T1001, check if the protocol is TLS 1.3.
+    // TLS 1.3 traffic on port 443 with high entropy is expected behavior.
+    let is_tls_1_3 = context::looks_like_tls_1_3(payload);
+    let protocol_feature_tag = if is_tls_1_3 && port == 443 {
+        Some("TLS_1.3_Padding".to_string())
+    } else if port == 443 {
+        Some("TLS_Padding".to_string())
+    } else {
+        None
+    };
+
     // Trigger 1: Magic Byte Mismatch
     if let Some(format) = check_magic_bytes(payload) {
         // Expected entropy for compressed images is usually high (> 7.0)
@@ -83,6 +125,7 @@ pub fn analyze_steganography_with_context(
                 is_benign: false,
                 protocol_feature: None,
                 cdn_provider: None,
+                suppression_reason: None,
             });
         }
     }
@@ -92,11 +135,25 @@ pub fn analyze_steganography_with_context(
     if has_null_block(payload, 32) {
         // ── TLS Padding CDN heuristic (T1001 benign) ───────────────────
         // If null-byte padding is detected on port 443 while communicating
-        // with a known CDN (Cloudflare, Akamai, Fastly) AND entropy is
-        // consistently high (> 7.9), this is legitimate TLS record padding
-        // and should be marked BENIGN.
+        // with a known CDN AND entropy is consistently high (> 7.9), this
+        // is legitimate TLS record padding and should be marked BENIGN.
+        //
+        // Enhanced: Now uses BOTH IP-based CDN lookup (via context module)
+        // AND SNI-based matching for double-verification.
         if port == 443 && entropy > 7.9 {
-            if let Some(cdn_provider) = ctx.and_then(|c| c.sni).and_then(match_cdn_sni) {
+            if let Some(cdn_provider) = resolve_cdn_provider(ctx) {
+                let suppression_reason = if is_tls_1_3 {
+                    format!(
+                        "Known CDN behavior: TLS 1.3 padding from '{}' on port 443 (entropy={:.2})",
+                        cdn_provider, entropy,
+                    )
+                } else {
+                    format!(
+                        "Known CDN behavior: TLS padding from '{}' on port 443 (entropy={:.2})",
+                        cdn_provider, entropy,
+                    )
+                };
+
                 return Some(StegResult {
                     technique_id: "T1001".to_string(),
                     reason: format!(
@@ -106,9 +163,34 @@ pub fn analyze_steganography_with_context(
                     observed_entropy: entropy,
                     pattern_type: "Null byte padding".to_string(),
                     is_benign: true,
-                    protocol_feature: Some("TLS Padding detected".to_string()),
-                    cdn_provider: Some(cdn_provider.to_string()),
+                    protocol_feature: protocol_feature_tag.clone().or(Some("TLS Padding detected".to_string())),
+                    cdn_provider: Some(cdn_provider),
+                    suppression_reason: Some(suppression_reason),
                 });
+            }
+
+            // Even without CDN match, if TLS 1.3 is detected on port 443,
+            // cross-reference with the context module's flow classification
+            if is_tls_1_3 {
+                if let Some(c) = ctx {
+                    let (flow_trust, cdn_result) = context::classify_flow(c.dst_ip, port);
+                    if flow_trust == context::FlowTrust::TrustedInfrastructure {
+                        let provider = cdn_result.provider.unwrap_or_else(|| "Unknown CDN".to_string());
+                        return Some(StegResult {
+                            technique_id: "T1001".to_string(),
+                            reason: format!(
+                                "TLS 1.3 null-byte padding on port 443 to trusted infrastructure '{}' (entropy={:.2}) — benign",
+                                provider, entropy,
+                            ),
+                            observed_entropy: entropy,
+                            pattern_type: "Null byte padding".to_string(),
+                            is_benign: true,
+                            protocol_feature: Some("TLS_1.3_Padding".to_string()),
+                            cdn_provider: Some(provider),
+                            suppression_reason: Some("Known CDN behavior".to_string()),
+                        });
+                    }
+                }
             }
         }
 
@@ -118,8 +200,9 @@ pub fn analyze_steganography_with_context(
             observed_entropy: entropy,
             pattern_type: "Null byte padding".to_string(),
             is_benign: false,
-            protocol_feature: None,
+            protocol_feature: protocol_feature_tag,
             cdn_provider: None,
+            suppression_reason: None,
         });
     }
 
@@ -138,6 +221,7 @@ pub fn analyze_steganography_with_context(
                 is_benign: false,
                 protocol_feature: None,
                 cdn_provider: None,
+                suppression_reason: None,
             });
         }
     }
