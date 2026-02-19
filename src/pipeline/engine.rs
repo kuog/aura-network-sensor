@@ -18,6 +18,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::analysis::enrichment::{self, ScoringInput};
+use crate::analysis::protocol_filter::{self, FilterVerdict};
 use crate::l3_defrag::Defragmenter;
 use crate::l4_reassembly::Reassembler;
 use crate::protocols;
@@ -362,66 +363,128 @@ fn analyze_tcp(
         tcp.source_port,
         tcp.destination_port,
     ) {
-        // Determine severity and confidence based on trust_score.
-        // trust_score 0   = fully trusted (both IPs Microsoft) → LOW / 20
-        // trust_score ≤20 = one IP is Microsoft                → MEDIUM / 40
-        // trust_score 100 = untrusted                          → CRITICAL / 90
-        let (severity, confidence) = match shell_result.trust_score {
-            0 => (Severity::Low, 20u8),
-            1..=20 => (Severity::Medium, 40u8),
-            21..=50 => (Severity::High, 70u8),
-            _ => (Severity::Critical, 90u8),
-        };
-
-        // Build a descriptive logic string with shell details
-        let logic = if shell_result.extracted_commands.is_empty() {
-            format!(
-                "Interactive {} session detected. Matched: [{}]",
-                shell_result.shell_type,
-                shell_result.matched_patterns.join(", "),
-            )
-        } else {
-            format!(
-                "Interactive {} session detected. Matched: [{}]. Commands: [{}]",
-                shell_result.shell_type,
-                shell_result.matched_patterns.join(", "),
-                shell_result.extracted_commands.join("; "),
-            )
-        };
-
-        let mut alert = MitreAlert::new(
-            "T1059",
-            "Command and Scripting Interpreter",
-            severity,
-            confidence,
-            src_ip.to_string(),
-            dst_ip.to_string(),
+        // ── Protocol-aware false-positive filter ───────────────────────
+        // Inspect the reassembled payload for legitimate multimedia /
+        // streaming protocol signatures before emitting a T1059 alert.
+        let filter_verdict = protocol_filter::check_payload(
+            &session_data,
             tcp.source_port,
             tcp.destination_port,
-            "tcp",
-            "interactive_shell",
-            &logic,
-        )
-        .with_meta("shell_type", &shell_result.shell_type)
-        .with_meta("matched_patterns", shell_result.matched_patterns.join(", "))
-        .with_meta("trust_score", shell_result.trust_score.to_string());
+        );
 
-        if !shell_result.extracted_commands.is_empty() {
-            alert = alert.with_meta(
-                "commands",
-                shell_result.extracted_commands.join(" | "),
-            );
-            alert = alert.with_meta(
-                "command_count",
-                shell_result.extracted_commands.len().to_string(),
-            );
+        match filter_verdict {
+            FilterVerdict::Suppress { ref reason } => {
+                // Completely suppress the alert — this is legitimate traffic.
+                // Optionally: log at TRACE level for debugging.
+                debug!(
+                    "[Engine] T1059 suppressed: {} ({}:{} → {}:{})",
+                    reason,
+                    src_ip, tcp.source_port,
+                    dst_ip, tcp.destination_port,
+                );
+            }
+            FilterVerdict::Downgrade {
+                ref reason,
+                suggested_confidence,
+            } => {
+                // Emit a downgraded alert (INFO severity, low confidence)
+                // so the operator can still see it in logs if needed.
+                let logic = format!(
+                    "Interactive {} session detected (DOWNGRADED). Matched: [{}]. Filter: {}",
+                    shell_result.shell_type,
+                    shell_result.matched_patterns.join(", "),
+                    reason,
+                );
+
+                let mut alert = MitreAlert::new(
+                    "T1059",
+                    "Command and Scripting Interpreter",
+                    Severity::Low, // Downgraded to lowest severity
+                    suggested_confidence,
+                    src_ip.to_string(),
+                    dst_ip.to_string(),
+                    tcp.source_port,
+                    tcp.destination_port,
+                    "tcp",
+                    "interactive_shell",
+                    &logic,
+                )
+                .with_meta("shell_type", &shell_result.shell_type)
+                .with_meta("matched_patterns", shell_result.matched_patterns.join(", "))
+                .with_meta("trust_score", shell_result.trust_score.to_string())
+                .with_meta("suppression_reason", reason);
+
+                if let Some(meta) = protocol_filter::suppression_metadata(&filter_verdict) {
+                    for (k, v) in meta {
+                        alert = alert.with_meta(k, v);
+                    }
+                }
+
+                if !shell_result.payload_snippet.is_empty() {
+                    alert = alert.with_meta("payload_snippet", shell_result.payload_snippet);
+                }
+
+                emit(alert, stats);
+            }
+            FilterVerdict::Pass => {
+                // No filter matched — emit the alert at full severity.
+                let (severity, confidence) = match shell_result.trust_score {
+                    0 => (Severity::Low, 20u8),
+                    1..=20 => (Severity::Medium, 40u8),
+                    21..=50 => (Severity::High, 70u8),
+                    _ => (Severity::Critical, 90u8),
+                };
+
+                let logic = if shell_result.extracted_commands.is_empty() {
+                    format!(
+                        "Interactive {} session detected. Matched: [{}]",
+                        shell_result.shell_type,
+                        shell_result.matched_patterns.join(", "),
+                    )
+                } else {
+                    format!(
+                        "Interactive {} session detected. Matched: [{}]. Commands: [{}]",
+                        shell_result.shell_type,
+                        shell_result.matched_patterns.join(", "),
+                        shell_result.extracted_commands.join("; "),
+                    )
+                };
+
+                let mut alert = MitreAlert::new(
+                    "T1059",
+                    "Command and Scripting Interpreter",
+                    severity,
+                    confidence,
+                    src_ip.to_string(),
+                    dst_ip.to_string(),
+                    tcp.source_port,
+                    tcp.destination_port,
+                    "tcp",
+                    "interactive_shell",
+                    &logic,
+                )
+                .with_meta("shell_type", &shell_result.shell_type)
+                .with_meta("matched_patterns", shell_result.matched_patterns.join(", "))
+                .with_meta("trust_score", shell_result.trust_score.to_string());
+
+                if !shell_result.extracted_commands.is_empty() {
+                    alert = alert.with_meta(
+                        "commands",
+                        shell_result.extracted_commands.join(" | "),
+                    );
+                    alert = alert.with_meta(
+                        "command_count",
+                        shell_result.extracted_commands.len().to_string(),
+                    );
+                }
+
+                if !shell_result.payload_snippet.is_empty() {
+                    alert = alert.with_meta("payload_snippet", shell_result.payload_snippet);
+                }
+
+                emit(alert, stats);
+            }
         }
-
-        if !shell_result.payload_snippet.is_empty() {
-            alert = alert.with_meta("payload_snippet", shell_result.payload_snippet);
-        }
-
-        emit(alert, stats);
     }
 
     // ── T1571 Port Anomaly ────────────────────────────────────────────
