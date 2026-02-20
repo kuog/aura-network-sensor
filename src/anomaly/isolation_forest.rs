@@ -43,10 +43,10 @@ pub struct IsolationForestConfig {
 impl Default for IsolationForestConfig {
     fn default() -> Self {
         Self {
-            n_trees: 100,
+            n_trees: 200,
             subsample_size: 256,
             max_depth: None,
-            threshold: 0.55,
+            threshold: 0.50,
             seed: None,
         }
     }

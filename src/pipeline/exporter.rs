@@ -495,7 +495,21 @@ fn apply_anomaly_suppression(alert: &mut MitreAlert, detector: &AnomalyDetector)
         }
         DetectorPhase::Inference => {
             // Build a FlowMetrics from the alert for scoring
-            let flow = alert_to_flow_metrics(alert);
+            let flow = match alert_to_flow_metrics(alert) {
+                Some(f) => f,
+                None => {
+                    // Insufficient data to score — tag and skip
+                    alert.metadata.insert(
+                        "ai_phase".to_string(),
+                        "INFERENCE".to_string(),
+                    );
+                    alert.metadata.insert(
+                        "ai_classification".to_string(),
+                        "NO_FLOW_DATA".to_string(),
+                    );
+                    return;
+                }
+            };
             if let Some(result) = detector.predict(&flow) {
                 // Always add the AI confidence score to metadata
                 alert.metadata.insert(
@@ -515,7 +529,7 @@ fn apply_anomaly_suppression(alert: &mut MitreAlert, detector: &AnomalyDetector)
                     },
                 );
 
-                if result.is_normal && result.confidence > 0.3 {
+                if result.is_normal && result.confidence > 0.15 {
                     // Flow is classified as normal with reasonable confidence.
                     // Suppress the alert by reducing severity and confidence.
                     let original_severity = alert.severity;
@@ -574,72 +588,119 @@ fn apply_anomaly_suppression(alert: &mut MitreAlert, detector: &AnomalyDetector)
 
 /// Convert a MitreAlert into a FlowMetrics for anomaly scoring.
 ///
-/// Since the alert doesn't contain all flow-level features, we construct
-/// a best-effort FlowMetrics from the available alert metadata.
-fn alert_to_flow_metrics(alert: &MitreAlert) -> FlowMetrics {
-    let src_ip: IpAddr = alert
-        .src_ip
-        .parse()
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
-    let dst_ip: IpAddr = alert
-        .dst_ip
-        .parse()
-        .unwrap_or(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
+/// Prefers real flow data from `flow_*` metadata keys (injected by the engine
+/// via `enrich_alert_with_flow_metrics`). Falls back to legacy metadata keys
+/// (`entropy`, `observed_entropy`, etc.) if flow data is not available.
+///
+/// Returns `None` if insufficient real data is available — this prevents
+/// scoring with fake defaults that would make all alerts look similar.
+fn alert_to_flow_metrics(alert: &MitreAlert) -> Option<FlowMetrics> {
+    let src_ip: IpAddr = alert.src_ip.parse().ok()?;
+    let dst_ip: IpAddr = alert.dst_ip.parse().ok()?;
 
     let protocol = match alert.protocol.as_str() {
         "tcp" => Protocol::Tcp,
         "udp" => Protocol::Udp,
         "icmp" => Protocol::Icmp,
-        _ => Protocol::Other(0),
+        _ => return None,
     };
 
-    // Extract entropy from metadata if available
-    let entropy = alert
-        .metadata
-        .get("entropy")
-        .or_else(|| alert.metadata.get("observed_entropy"))
-        .and_then(|e| e.parse::<f64>().ok())
-        .unwrap_or(4.0); // Default to mid-range entropy
+    // Check if we have real flow data from the engine (flow_* keys)
+    let has_flow_data = alert.metadata.contains_key("flow_entropy");
 
-    // Extract duration from metadata if available
-    let duration_ms = alert
-        .metadata
-        .get("duration_ms")
-        .and_then(|d| d.parse::<u64>().ok())
-        .unwrap_or(1000); // Default 1 second
+    if has_flow_data {
+        // Use real flow metrics from the FlowTracker
+        let entropy = alert.metadata.get("flow_entropy")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let duration_ms = alert.metadata.get("flow_duration_ms")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let packet_count = alert.metadata.get("flow_packet_count")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1);
+        let bytes_count = alert.metadata.get("flow_bytes_count")
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        let iat_mean = alert.metadata.get("flow_iat_mean")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let bytes_per_packet = alert.metadata.get("flow_bytes_per_packet")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let pkt_size_variance = alert.metadata.get("flow_pkt_size_variance")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let iat_std = alert.metadata.get("flow_iat_std")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let payload_ratio = alert.metadata.get("flow_payload_ratio")
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0);
 
-    // Extract packet count from metadata if available
-    let packet_count = alert
-        .metadata
-        .get("packet_count")
-        .and_then(|p| p.parse::<u32>().ok())
-        .unwrap_or(10); // Default 10 packets
+        Some(FlowMetrics {
+            timestamp: alert.timestamp.timestamp() as f64,
+            src_ip,
+            dst_ip,
+            src_port: alert.src_port,
+            dst_port: alert.dst_port,
+            protocol,
+            entropy,
+            duration_ms,
+            packet_count,
+            bytes_count,
+            iat_mean,
+            bytes_per_packet,
+            pkt_size_variance,
+            iat_std,
+            payload_ratio,
+        })
+    } else {
+        // Fallback: try legacy metadata keys (entropy, observed_entropy)
+        // Only score if we have at least entropy data
+        let entropy = alert.metadata.get("entropy")
+            .or_else(|| alert.metadata.get("observed_entropy"))
+            .and_then(|e| e.parse::<f64>().ok());
 
-    // Extract bytes count from metadata if available
-    let bytes_count = alert
-        .metadata
-        .get("bytes_count")
-        .and_then(|b| b.parse::<u64>().ok())
-        .unwrap_or(5000); // Default 5KB
+        // Without any real data, skip scoring entirely
+        let entropy = entropy?;
 
-    // Extract IAT mean from metadata if available
-    let iat_mean = alert
-        .metadata
-        .get("iat_mean")
-        .and_then(|i| i.parse::<f64>().ok())
-        .unwrap_or(100.0); // Default 100ms
+        let duration_ms = alert.metadata.get("duration_ms")
+            .and_then(|d| d.parse::<u64>().ok())
+            .unwrap_or(1000);
+        let packet_count = alert.metadata.get("packet_count")
+            .and_then(|p| p.parse::<u32>().ok())
+            .unwrap_or(10);
+        let bytes_count = alert.metadata.get("bytes_count")
+            .and_then(|b| b.parse::<u64>().ok())
+            .unwrap_or(5000);
+        let iat_mean = alert.metadata.get("iat_mean")
+            .and_then(|i| i.parse::<f64>().ok())
+            .unwrap_or(100.0);
 
-    FlowMetrics {
-        timestamp: alert.timestamp.timestamp() as f64,
-        src_ip,
-        dst_ip,
-        src_port: alert.src_port,
-        dst_port: alert.dst_port,
-        protocol,
-        entropy,
-        duration_ms,
-        packet_count,
-        bytes_count,
-        iat_mean,
+        // Compute derived features from available data
+        let bytes_per_packet = if packet_count > 0 {
+            bytes_count as f64 / packet_count as f64
+        } else {
+            0.0
+        };
+
+        Some(FlowMetrics {
+            timestamp: alert.timestamp.timestamp() as f64,
+            src_ip,
+            dst_ip,
+            src_port: alert.src_port,
+            dst_port: alert.dst_port,
+            protocol,
+            entropy,
+            duration_ms,
+            packet_count,
+            bytes_count,
+            iat_mean,
+            bytes_per_packet,
+            pkt_size_variance: 0.0,  // Unknown without real packet data
+            iat_std: 0.0,            // Unknown without real IAT data
+            payload_ratio: 0.5,      // Assume mid-range
+        })
     }
 }

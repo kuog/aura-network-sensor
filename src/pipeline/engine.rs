@@ -115,8 +115,9 @@ pub fn run(
 
     info!("[Engine] Analysis loop started");
 
-    // Helper closure: emit an alert without blocking
-    let emit = |alert: MitreAlert, stats: &Arc<EngineStats>| {
+    // Helper closure: enrich alert with flow metrics and emit without blocking
+    let emit = |mut alert: MitreAlert, stats: &Arc<EngineStats>| {
+        enrich_alert_with_flow_metrics(&flow_tracker, &mut alert);
         stats.alerts.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = alert_tx.send(alert) {
             debug!("[Engine] Alert channel closed: {}", e);
@@ -1402,6 +1403,45 @@ fn analyze_tcp(
 /// Additionally, if the `provider` metadata is currently "Unknown" and the
 /// DNS-resolved hostname matches a known provider (via [`enrichment::identify_provider`]),
 /// the `provider` and `provider_name` metadata fields are updated.
+///
+/// # Arguments
+/// Enrich an alert with real flow metrics from the FlowTracker.
+///
+/// Looks up the active flow by 5-tuple and attaches real metrics as metadata
+/// keys prefixed with `flow_`. These are used by the anomaly detector in the
+/// exporter to score the alert with real data instead of hardcoded defaults.
+fn enrich_alert_with_flow_metrics(
+    flow_tracker: &FlowTracker,
+    alert: &mut MitreAlert,
+) {
+    let src_ip: Option<IpAddr> = alert.src_ip.parse().ok();
+    let dst_ip: Option<IpAddr> = alert.dst_ip.parse().ok();
+
+    if let (Some(src), Some(dst)) = (src_ip, dst_ip) {
+        let protocol = match alert.protocol.as_str() {
+            "tcp" => Protocol::Tcp,
+            "udp" => Protocol::Udp,
+            "icmp" => Protocol::Icmp,
+            _ => return,
+        };
+
+        if let Some(metrics) = flow_tracker.peek_metrics(
+            src, dst, alert.src_port, alert.dst_port, protocol,
+        ) {
+            alert.metadata.insert("flow_entropy".to_string(), format!("{:.4}", metrics.entropy));
+            alert.metadata.insert("flow_duration_ms".to_string(), metrics.duration_ms.to_string());
+            alert.metadata.insert("flow_packet_count".to_string(), metrics.packet_count.to_string());
+            alert.metadata.insert("flow_bytes_count".to_string(), metrics.bytes_count.to_string());
+            alert.metadata.insert("flow_iat_mean".to_string(), format!("{:.4}", metrics.iat_mean));
+            alert.metadata.insert("flow_bytes_per_packet".to_string(), format!("{:.4}", metrics.bytes_per_packet));
+            alert.metadata.insert("flow_pkt_size_variance".to_string(), format!("{:.4}", metrics.pkt_size_variance));
+            alert.metadata.insert("flow_iat_std".to_string(), format!("{:.4}", metrics.iat_std));
+            alert.metadata.insert("flow_payload_ratio".to_string(), format!("{:.4}", metrics.payload_ratio));
+        }
+    }
+}
+
+/// Enrich an alert with DNS information from the passive DNS tracker.
 ///
 /// # Arguments
 /// * `tracker`  – The shared DNS tracker.

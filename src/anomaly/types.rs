@@ -82,19 +82,38 @@ pub struct FlowMetrics {
     pub bytes_count: u64,
     /// Mean inter-arrival time between packets (milliseconds).
     pub iat_mean: f64,
+    // ── Extended features for improved anomaly detection ──────────────
+    /// Average bytes per packet (`bytes_count / packet_count`).
+    /// Distinguishes bulk transfers from scanning/probing.
+    pub bytes_per_packet: f64,
+    /// Variance of individual packet sizes (bytes²).
+    /// Uniform sizes suggest scanning/beaconing; high variance = normal browsing.
+    pub pkt_size_variance: f64,
+    /// Standard deviation of inter-arrival times (milliseconds).
+    /// Low std = beaconing; high std = normal interactive traffic.
+    pub iat_std: f64,
+    /// Ratio of payload bytes to total bytes (0.0–1.0).
+    /// Empty SYN scans have ratio ~0; data flows have ratio ~0.9+.
+    pub payload_ratio: f64,
 }
 
 impl FlowMetrics {
     /// Convert to a feature vector for the Isolation Forest.
     ///
-    /// Features (6-dimensional):
-    /// 0. entropy
-    /// 1. log2(duration_ms + 1)
-    /// 2. log2(packet_count)
-    /// 3. log2(bytes_count + 1)
-    /// 4. log2(iat_mean + 1)
-    /// 5. dst_port (normalized: port / 65535)
-    pub fn to_feature_vector(&self) -> [f64; 6] {
+    /// Features (12-dimensional):
+    ///  0. entropy                          — payload randomness (0–8)
+    ///  1. log2(duration_ms + 1)            — flow duration
+    ///  2. log2(packet_count)               — packet volume
+    ///  3. log2(bytes_count + 1)            — byte volume
+    ///  4. log2(iat_mean + 1)               — mean inter-arrival time
+    ///  5. dst_port / 65535                  — destination port (normalized)
+    ///  6. log2(bytes_per_packet + 1)        — avg packet size
+    ///  7. log2(pkt_size_variance + 1)       — packet size uniformity
+    ///  8. log2(iat_std + 1)                 — IAT regularity
+    ///  9. src_port / 65535                  — source port (normalized)
+    /// 10. is_well_known_dst_port            — 1.0 if dst_port < 1024
+    /// 11. payload_ratio                     — payload vs total bytes
+    pub fn to_feature_vector(&self) -> [f64; Self::FEATURE_COUNT] {
         [
             self.entropy,
             (self.duration_ms as f64 + 1.0).log2(),
@@ -102,11 +121,18 @@ impl FlowMetrics {
             (self.bytes_count as f64 + 1.0).log2(),
             (self.iat_mean + 1.0).log2(),
             self.dst_port as f64 / 65535.0,
+            // ── Extended features ──
+            (self.bytes_per_packet + 1.0).log2(),
+            (self.pkt_size_variance + 1.0).log2(),
+            (self.iat_std + 1.0).log2(),
+            self.src_port as f64 / 65535.0,
+            if self.dst_port < 1024 { 1.0 } else { 0.0 },
+            self.payload_ratio,
         ]
     }
 
     /// Number of features in the feature vector.
-    pub const FEATURE_COUNT: usize = 6;
+    pub const FEATURE_COUNT: usize = 12;
 }
 
 /// Result of anomaly detection for a single flow.

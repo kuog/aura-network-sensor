@@ -29,10 +29,14 @@ struct FlowState {
     first_timestamp: f64,
     /// Total number of packets.
     packet_count: u32,
-    /// Total bytes transferred.
+    /// Total bytes transferred (including headers).
     bytes_count: u64,
+    /// Total payload bytes transferred (excluding headers).
+    payload_bytes: u64,
     /// Concatenated payload bytes (capped for entropy calculation).
     payload_sample: Vec<u8>,
+    /// Individual packet sizes for variance calculation (capped).
+    packet_sizes: Vec<u64>,
     /// Inter-arrival times between consecutive packets (milliseconds).
     inter_arrival_times: Vec<f64>,
     /// Whether a TCP FIN was observed.
@@ -44,6 +48,9 @@ struct FlowState {
 /// Maximum payload sample size for entropy calculation (64 KB).
 const MAX_PAYLOAD_SAMPLE: usize = 65_536;
 
+/// Maximum number of individual packet sizes to track for variance calculation.
+const MAX_PACKET_SIZES_TRACKED: usize = 1024;
+
 impl FlowState {
     fn new(timestamp: f64) -> Self {
         let now = Instant::now();
@@ -53,7 +60,9 @@ impl FlowState {
             first_timestamp: timestamp,
             packet_count: 0,
             bytes_count: 0,
+            payload_bytes: 0,
             payload_sample: Vec::with_capacity(4096),
+            packet_sizes: Vec::with_capacity(64),
             inter_arrival_times: Vec::with_capacity(64),
             fin_seen: false,
             rst_seen: false,
@@ -74,8 +83,14 @@ impl FlowState {
         self.packet_count += 1;
         self.bytes_count += payload_len;
 
+        // Track individual packet sizes for variance calculation
+        if self.packet_sizes.len() < MAX_PACKET_SIZES_TRACKED {
+            self.packet_sizes.push(payload_len);
+        }
+
         // Collect payload sample for entropy calculation
         if let Some(data) = payload {
+            self.payload_bytes += data.len() as u64;
             let remaining = MAX_PAYLOAD_SAMPLE.saturating_sub(self.payload_sample.len());
             if remaining > 0 {
                 let take = data.len().min(remaining);
@@ -100,6 +115,52 @@ impl FlowState {
         sum / self.inter_arrival_times.len() as f64
     }
 
+    /// Calculate the standard deviation of inter-arrival times (milliseconds).
+    fn iat_std(&self) -> f64 {
+        if self.inter_arrival_times.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.iat_mean();
+        let variance: f64 = self
+            .inter_arrival_times
+            .iter()
+            .map(|&t| (t - mean).powi(2))
+            .sum::<f64>()
+            / (self.inter_arrival_times.len() as f64 - 1.0);
+        variance.sqrt()
+    }
+
+    /// Calculate the variance of packet sizes (bytes²).
+    fn pkt_size_variance(&self) -> f64 {
+        if self.packet_sizes.len() < 2 {
+            return 0.0;
+        }
+        let mean = self.packet_sizes.iter().sum::<u64>() as f64 / self.packet_sizes.len() as f64;
+        let variance: f64 = self
+            .packet_sizes
+            .iter()
+            .map(|&s| (s as f64 - mean).powi(2))
+            .sum::<f64>()
+            / (self.packet_sizes.len() as f64 - 1.0);
+        variance
+    }
+
+    /// Calculate average bytes per packet.
+    fn bytes_per_packet(&self) -> f64 {
+        if self.packet_count == 0 {
+            return 0.0;
+        }
+        self.bytes_count as f64 / self.packet_count as f64
+    }
+
+    /// Calculate payload-to-total-bytes ratio (0.0–1.0).
+    fn payload_ratio(&self) -> f64 {
+        if self.bytes_count == 0 {
+            return 0.0;
+        }
+        (self.payload_bytes as f64 / self.bytes_count as f64).min(1.0)
+    }
+
     /// Convert to FlowMetrics for persistence and ML inference.
     fn to_metrics(&self, key: &FlowKey) -> FlowMetrics {
         let entropy = telemetry::shannon_entropy(&self.payload_sample);
@@ -116,6 +177,10 @@ impl FlowState {
             packet_count: self.packet_count,
             bytes_count: self.bytes_count,
             iat_mean: self.iat_mean(),
+            bytes_per_packet: self.bytes_per_packet(),
+            pkt_size_variance: self.pkt_size_variance(),
+            iat_std: self.iat_std(),
+            payload_ratio: self.payload_ratio(),
         }
     }
 }
@@ -272,6 +337,28 @@ impl FlowTracker {
         }
 
         all
+    }
+
+    /// Peek at the current metrics for an active flow without removing it.
+    ///
+    /// Returns `Some(FlowMetrics)` if the flow exists, `None` otherwise.
+    /// This is used by the engine to attach real flow data to alerts.
+    pub fn peek_metrics(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: Protocol,
+    ) -> Option<FlowMetrics> {
+        let key = FlowKey {
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            protocol,
+        };
+        self.flows.get(&key).map(|entry| entry.to_metrics(&key))
     }
 
     /// Number of currently active flows.

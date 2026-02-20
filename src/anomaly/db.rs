@@ -54,6 +54,28 @@ pub fn init_anomaly_db(path: &str) -> Result<Connection, DbError> {
         CREATE INDEX IF NOT EXISTS idx_nf_protocol  ON network_features(protocol);",
     )?;
 
+    // ── Schema migration: add extended features (v2) ──────────────────
+    // ALTER TABLE ... ADD COLUMN is safe: it's a no-op if the column already exists
+    // in SQLite (we catch the "duplicate column" error and ignore it).
+    let new_columns = [
+        "ALTER TABLE network_features ADD COLUMN bytes_per_packet REAL DEFAULT 0;",
+        "ALTER TABLE network_features ADD COLUMN pkt_size_variance REAL DEFAULT 0;",
+        "ALTER TABLE network_features ADD COLUMN iat_std REAL DEFAULT 0;",
+        "ALTER TABLE network_features ADD COLUMN payload_ratio REAL DEFAULT 0;",
+    ];
+    for ddl in &new_columns {
+        match conn.execute_batch(ddl) {
+            Ok(_) => {}
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("duplicate column") {
+                    return Err(DbError::Sqlite(e));
+                }
+                // Column already exists — safe to ignore
+            }
+        }
+    }
+
     info!(
         "[AnomalyDB] Database initialized at '{}'",
         path
@@ -66,8 +88,9 @@ pub fn insert_flow(conn: &Connection, flow: &FlowMetrics) -> Result<(), DbError>
     conn.execute(
         "INSERT INTO network_features (
             timestamp, src_ip, dst_ip, src_port, dst_port, protocol,
-            entropy, duration_ms, packet_count, bytes_count, iat_mean
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            entropy, duration_ms, packet_count, bytes_count, iat_mean,
+            bytes_per_packet, pkt_size_variance, iat_std, payload_ratio
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         params![
             flow.timestamp,
             flow.src_ip.to_string(),
@@ -80,6 +103,10 @@ pub fn insert_flow(conn: &Connection, flow: &FlowMetrics) -> Result<(), DbError>
             flow.packet_count,
             flow.bytes_count,
             flow.iat_mean,
+            flow.bytes_per_packet,
+            flow.pkt_size_variance,
+            flow.iat_std,
+            flow.payload_ratio,
         ],
     )?;
     Ok(())
@@ -98,8 +125,9 @@ pub fn insert_flows_batch(conn: &Connection, flows: &[FlowMetrics]) -> Result<us
         let mut stmt = tx.prepare_cached(
             "INSERT INTO network_features (
                 timestamp, src_ip, dst_ip, src_port, dst_port, protocol,
-                entropy, duration_ms, packet_count, bytes_count, iat_mean
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                entropy, duration_ms, packet_count, bytes_count, iat_mean,
+                bytes_per_packet, pkt_size_variance, iat_std, payload_ratio
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )?;
 
         for flow in flows {
@@ -115,6 +143,10 @@ pub fn insert_flows_batch(conn: &Connection, flows: &[FlowMetrics]) -> Result<us
                 flow.packet_count,
                 flow.bytes_count,
                 flow.iat_mean,
+                flow.bytes_per_packet,
+                flow.pkt_size_variance,
+                flow.iat_std,
+                flow.payload_ratio,
             ])?;
             count += 1;
         }
@@ -134,7 +166,11 @@ pub fn load_recent_features(
 ) -> Result<Vec<FlowMetrics>, DbError> {
     let mut stmt = conn.prepare(
         "SELECT timestamp, src_ip, dst_ip, src_port, dst_port, protocol,
-                entropy, duration_ms, packet_count, bytes_count, iat_mean
+                entropy, duration_ms, packet_count, bytes_count, iat_mean,
+                COALESCE(bytes_per_packet, 0.0),
+                COALESCE(pkt_size_variance, 0.0),
+                COALESCE(iat_std, 0.0),
+                COALESCE(payload_ratio, 0.0)
          FROM network_features
          ORDER BY id DESC
          LIMIT ?1",
@@ -146,23 +182,29 @@ pub fn load_recent_features(
         let protocol_str: String = row.get(5)?;
 
         Ok((
-            row.get::<_, f64>(0)?,
+            row.get::<_, f64>(0)?,       // timestamp
             src_ip_str,
             dst_ip_str,
-            row.get::<_, u16>(3)?,
-            row.get::<_, u16>(4)?,
+            row.get::<_, u16>(3)?,       // src_port
+            row.get::<_, u16>(4)?,       // dst_port
             protocol_str,
-            row.get::<_, f64>(6)?,
-            row.get::<_, u64>(7)?,
-            row.get::<_, u32>(8)?,
-            row.get::<_, u64>(9)?,
-            row.get::<_, f64>(10)?,
+            row.get::<_, f64>(6)?,       // entropy
+            row.get::<_, u64>(7)?,       // duration_ms
+            row.get::<_, u32>(8)?,       // packet_count
+            row.get::<_, u64>(9)?,       // bytes_count
+            row.get::<_, f64>(10)?,      // iat_mean
+            row.get::<_, f64>(11)?,      // bytes_per_packet
+            row.get::<_, f64>(12)?,      // pkt_size_variance
+            row.get::<_, f64>(13)?,      // iat_std
+            row.get::<_, f64>(14)?,      // payload_ratio
         ))
     })?;
 
     let mut features = Vec::new();
     for row in rows {
-        let (timestamp, src_ip_str, dst_ip_str, src_port, dst_port, protocol_str, entropy, duration_ms, packet_count, bytes_count, iat_mean) = row?;
+        let (timestamp, src_ip_str, dst_ip_str, src_port, dst_port, protocol_str,
+             entropy, duration_ms, packet_count, bytes_count, iat_mean,
+             bytes_per_packet, pkt_size_variance, iat_std, payload_ratio) = row?;
 
         let src_ip: IpAddr = match src_ip_str.parse() {
             Ok(ip) => ip,
@@ -198,6 +240,10 @@ pub fn load_recent_features(
             packet_count,
             bytes_count,
             iat_mean,
+            bytes_per_packet,
+            pkt_size_variance,
+            iat_std,
+            payload_ratio,
         });
     }
 

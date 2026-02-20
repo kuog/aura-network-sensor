@@ -78,6 +78,10 @@ impl AnomalyDetector {
     ///
     /// If successful, transitions directly to Inference phase.
     /// Returns `true` if a model was loaded.
+    ///
+    /// If the loaded model has a different number of features than expected
+    /// (e.g., after a feature expansion upgrade), the model is discarded and
+    /// the old file is removed so a fresh model will be trained.
     pub fn try_load_model(&self) -> bool {
         if !Path::new(&self.model_path).exists() {
             return false;
@@ -85,6 +89,22 @@ impl AnomalyDetector {
 
         match IsolationForest::load_from_file(&self.model_path) {
             Ok(forest) => {
+                // Validate feature count matches current FlowMetrics
+                if forest.n_features() != FlowMetrics::FEATURE_COUNT {
+                    warn!(
+                        "[AnomalyDetector] Model from '{}' has {} features, but current FlowMetrics has {}. \
+                         Discarding incompatible model — will retrain.",
+                        self.model_path,
+                        forest.n_features(),
+                        FlowMetrics::FEATURE_COUNT
+                    );
+                    // Remove the incompatible model file
+                    if let Err(e) = std::fs::remove_file(&self.model_path) {
+                        warn!("[AnomalyDetector] Failed to remove old model file: {}", e);
+                    }
+                    return false;
+                }
+
                 info!(
                     "[AnomalyDetector] Loaded pre-trained model from '{}' ({} trees, {} features)",
                     self.model_path,
@@ -210,10 +230,12 @@ impl AnomalyDetector {
         let score = model.score(&features);
         let is_normal = score <= model.threshold();
 
-        // Confidence: how far the score is from the threshold
-        // Higher distance = higher confidence in the classification
+        // Confidence: how far the score is from the threshold.
+        // Amplified by 5× (was 2×) for better separation with 12-feature model.
+        // A distance of 0.10 from threshold → confidence 0.50
+        // A distance of 0.20 from threshold → confidence 1.00
         let distance = (score - model.threshold()).abs();
-        let confidence = (distance * 2.0).min(1.0); // Normalize to [0, 1]
+        let confidence = (distance * 5.0).min(1.0);
 
         Some(AnomalyResult {
             anomaly_score: score,
