@@ -1303,6 +1303,18 @@ fn analyze_tcp(
                         76..=89 => Severity::High,
                         _ => Severity::Critical,
                     };
+                    let is_standard = reputation::is_expected_encrypted_port(tcp.destination_port);
+                    let logic_desc = if is_standard {
+                        format!(
+                            "High-entropy encrypted payload to unknown provider on port {} ({})",
+                            tcp.destination_port, flow_rep.port_service,
+                        )
+                    } else {
+                        format!(
+                            "Encrypted payload on non-standard port {}",
+                            tcp.destination_port,
+                        )
+                    };
                     let mut alert = MitreAlert::new(
                         "T1573",
                         "Encrypted Channel",
@@ -1314,7 +1326,7 @@ fn analyze_tcp(
                         tcp.destination_port,
                         "tcp",
                         "high_entropy",
-                        "Encrypted payload on non-standard port",
+                        &logic_desc,
                     )
                     .with_meta("entropy", format!("{:.2}", entropy))
                     .with_meta("jitter", format!("{:.2}", b_score))
