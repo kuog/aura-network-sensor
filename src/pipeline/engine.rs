@@ -100,6 +100,7 @@ pub fn run(
     dns_tracker: Arc<DnsTracker>,
     flow_tracker: Arc<FlowTracker>,
     _anomaly_detector: Arc<AnomalyDetector>,
+    arp_guardian: Arc<ArpGuardian>,
 ) {
     // ── Core pinning ──────────────────────────────────────────────────
     pin_to_core("Engine", core_id);
@@ -110,7 +111,6 @@ pub fn run(
     let matrix = protocols::port_anomaly::ExpectationMatrix::new();
     let mut scanner_tracker = ScannerTracker::new(Duration::from_secs(60));
     let mut conn_tracker = ConnTracker::new(Duration::from_secs(120));
-    let arp_guardian = ArpGuardian::new();
     let mut smb_tracker = SmbTracker::new();
 
     info!("[Engine] Analysis loop started");

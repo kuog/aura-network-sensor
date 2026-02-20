@@ -13,13 +13,19 @@
 //! | **Red Line** | `new_mac != existing_mac` | CRITICAL alert |
 //! | **New Device** | IP not in table | Add (TOFU) + INFO event |
 //!
+//! ## Persistence
+//!
+//! The ARP binding table is persisted to SQLite on shutdown and restored on
+//! startup, so known devices survive restarts without triggering "New Device"
+//! alerts again.
+//!
 //! ## Performance
 //!
 //! - O(1) lookups via [`DashMap`] (lock-free concurrent hash map).
 //! - No mutex contention on the analysis thread.
 
-use std::cell::Cell;
 use std::net::IpAddr;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use dashmap::DashMap;
@@ -85,15 +91,16 @@ struct MacBinding {
 /// Thread-safe ARP state machine with stickiness-based spoofing detection.
 ///
 /// Uses [`DashMap`] for O(1) concurrent lookups without locking the entire
-/// analysis thread during table updates. Gateway fields use [`Cell`] for
-/// interior mutability (safe because the engine thread is single-threaded).
+/// analysis thread during table updates. Gateway fields use [`Mutex`] for
+/// interior mutability, allowing the guardian to be shared across threads
+/// (e.g., for persistence on shutdown).
 pub struct ArpGuardian {
     /// IP → MAC binding table (TOFU state).
     state: DashMap<IpAddr, MacBinding>,
     /// The default gateway IP, if discovered.
-    gateway_ip: Cell<Option<IpAddr>>,
+    gateway_ip: Mutex<Option<IpAddr>>,
     /// The default gateway MAC, if discovered.
-    gateway_mac: Cell<Option<[u8; 6]>>,
+    gateway_mac: Mutex<Option<[u8; 6]>>,
 }
 
 impl ArpGuardian {
@@ -105,8 +112,8 @@ impl ArpGuardian {
         info!("[ArpGuardian] Initialized (TOFU mode, no pre-configured gateway)");
         Self {
             state: DashMap::with_capacity(256),
-            gateway_ip: Cell::new(None),
-            gateway_mac: Cell::new(None),
+            gateway_ip: Mutex::new(None),
+            gateway_mac: Mutex::new(None),
         }
     }
 
@@ -120,8 +127,8 @@ impl ArpGuardian {
         );
         Self {
             state: DashMap::with_capacity(256),
-            gateway_ip: Cell::new(Some(gateway_ip)),
-            gateway_mac: Cell::new(None),
+            gateway_ip: Mutex::new(Some(gateway_ip)),
+            gateway_mac: Mutex::new(None),
         }
     }
 
@@ -221,7 +228,7 @@ impl ArpGuardian {
 
     /// Returns `true` if the given IP is the default gateway.
     pub fn is_gateway(&self, ip: &IpAddr) -> bool {
-        self.gateway_ip.get().as_ref() == Some(ip)
+        self.gateway_ip.lock().unwrap().as_ref() == Some(ip)
     }
 
     /// Returns the current number of tracked IP→MAC bindings.
@@ -242,6 +249,200 @@ impl ArpGuardian {
             .collect()
     }
 
+    // ── Persistence ───────────────────────────────────────────────────
+
+    /// Save the current ARP binding table to a SQLite database.
+    ///
+    /// Creates the `arp_bindings` table if it doesn't exist, then replaces
+    /// all rows with the current in-memory state. This is designed to be
+    /// called once at shutdown.
+    pub fn save_to_db(&self, conn: &rusqlite::Connection) -> Result<usize, String> {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS arp_bindings (
+                ip          TEXT    PRIMARY KEY,
+                mac         TEXT    NOT NULL,
+                hit_count   INTEGER NOT NULL DEFAULT 1,
+                updated_at  TEXT    DEFAULT (datetime('now'))
+            );",
+        )
+        .map_err(|e| format!("Failed to create arp_bindings table: {}", e))?;
+
+        // Clear old data and insert current state in a transaction
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin transaction: {}", e))?;
+
+        tx.execute("DELETE FROM arp_bindings", [])
+            .map_err(|e| format!("Failed to clear arp_bindings: {}", e))?;
+
+        let mut count = 0;
+        {
+            let mut stmt = tx
+                .prepare_cached(
+                    "INSERT INTO arp_bindings (ip, mac, hit_count) VALUES (?1, ?2, ?3)",
+                )
+                .map_err(|e| format!("Failed to prepare insert: {}", e))?;
+
+            for entry in self.state.iter() {
+                let ip_str = entry.key().to_string();
+                let mac_str = mac_to_string(entry.value().mac);
+                let hits = entry.value().hit_count as i64;
+                stmt.execute(rusqlite::params![ip_str, mac_str, hits])
+                    .map_err(|e| format!("Failed to insert binding: {}", e))?;
+                count += 1;
+            }
+        }
+
+        // Also save gateway info
+        let gw_ip_opt = *self.gateway_ip.lock().unwrap();
+        let gw_mac_opt = *self.gateway_mac.lock().unwrap();
+        if let Some(gw_ip) = gw_ip_opt {
+            if let Some(gw_mac) = gw_mac_opt {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS arp_gateway (
+                        id      INTEGER PRIMARY KEY CHECK (id = 1),
+                        ip      TEXT    NOT NULL,
+                        mac     TEXT    NOT NULL
+                    );",
+                )
+                .map_err(|e| format!("Failed to create arp_gateway table: {}", e))?;
+
+                tx.execute("DELETE FROM arp_gateway", [])
+                    .map_err(|e| format!("Failed to clear arp_gateway: {}", e))?;
+                tx.execute(
+                    "INSERT INTO arp_gateway (id, ip, mac) VALUES (1, ?1, ?2)",
+                    rusqlite::params![gw_ip.to_string(), mac_to_string(gw_mac)],
+                )
+                .map_err(|e| format!("Failed to insert gateway: {}", e))?;
+            }
+        }
+
+        tx.commit()
+            .map_err(|e| format!("Failed to commit transaction: {}", e))?;
+
+        info!(
+            "[ArpGuardian] Saved {} ARP bindings to database",
+            count
+        );
+        Ok(count)
+    }
+
+    /// Load ARP bindings from a SQLite database, restoring the state table.
+    ///
+    /// This should be called once at startup, before the engine thread begins
+    /// processing packets. Bindings loaded from the DB are treated as trusted
+    /// (TOFU — they were learned in a previous session).
+    pub fn load_from_db(&self, conn: &rusqlite::Connection) -> Result<usize, String> {
+        // Check if the table exists
+        let table_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='arp_bindings'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if !table_exists {
+            info!("[ArpGuardian] No saved ARP bindings found (first run)");
+            return Ok(0);
+        }
+
+        // Load bindings
+        let mut stmt = conn
+            .prepare("SELECT ip, mac, hit_count FROM arp_bindings")
+            .map_err(|e| format!("Failed to prepare select: {}", e))?;
+
+        let now = Instant::now();
+        let mut count = 0;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let ip_str: String = row.get(0)?;
+                let mac_str: String = row.get(1)?;
+                let hit_count: i64 = row.get(2)?;
+                Ok((ip_str, mac_str, hit_count))
+            })
+            .map_err(|e| format!("Failed to query arp_bindings: {}", e))?;
+
+        for row in rows {
+            let (ip_str, mac_str, hit_count) =
+                row.map_err(|e| format!("Failed to read row: {}", e))?;
+
+            let ip: IpAddr = match ip_str.parse() {
+                Ok(ip) => ip,
+                Err(e) => {
+                    warn!(
+                        "[ArpGuardian] Skipping invalid IP '{}': {}",
+                        ip_str, e
+                    );
+                    continue;
+                }
+            };
+
+            let mac = match parse_mac_string(&mac_str) {
+                Some(m) => m,
+                None => {
+                    warn!(
+                        "[ArpGuardian] Skipping invalid MAC '{}' for IP {}",
+                        mac_str, ip_str
+                    );
+                    continue;
+                }
+            };
+
+            self.state.insert(
+                ip,
+                MacBinding {
+                    mac,
+                    first_seen: now,
+                    last_seen: now,
+                    hit_count: hit_count as u64,
+                },
+            );
+            count += 1;
+        }
+
+        // Load gateway info
+        let gw_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='arp_gateway'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|c| c > 0)
+            .unwrap_or(false);
+
+        if gw_exists {
+            if let Ok(row) = conn.query_row(
+                "SELECT ip, mac FROM arp_gateway WHERE id = 1",
+                [],
+                |row| {
+                    let ip_str: String = row.get(0)?;
+                    let mac_str: String = row.get(1)?;
+                    Ok((ip_str, mac_str))
+                },
+            ) {
+                if let Ok(gw_ip) = row.0.parse::<IpAddr>() {
+                    if let Some(gw_mac) = parse_mac_string(&row.1) {
+                        *self.gateway_ip.lock().unwrap() = Some(gw_ip);
+                        *self.gateway_mac.lock().unwrap() = Some(gw_mac);
+                        info!(
+                            "[ArpGuardian] Restored gateway: {} → {}",
+                            gw_ip, row.1
+                        );
+                    }
+                }
+            }
+        }
+
+        info!(
+            "[ArpGuardian] Restored {} ARP bindings from database",
+            count
+        );
+        Ok(count)
+    }
+
     // ── Private helpers ───────────────────────────────────────────────
 
     /// Attempt to auto-discover the default gateway from ARP traffic.
@@ -252,11 +453,11 @@ impl ArpGuardian {
     fn try_discover_gateway(&self, ip: IpAddr, mac: [u8; 6]) {
         // Already have a gateway MAC? Nothing to do.
         // Note: we use gateway_mac as the "fully discovered" flag.
-        if self.gateway_mac.get().is_some() {
+        if self.gateway_mac.lock().unwrap().is_some() {
             return;
         }
 
-        let should_adopt = match self.gateway_ip.get() {
+        let should_adopt = match *self.gateway_ip.lock().unwrap() {
             Some(gw_ip) => {
                 // Gateway IP is pre-configured; learn its MAC.
                 ip == gw_ip
@@ -268,8 +469,8 @@ impl ArpGuardian {
         };
 
         if should_adopt {
-            self.gateway_ip.set(Some(ip));
-            self.gateway_mac.set(Some(mac));
+            *self.gateway_ip.lock().unwrap() = Some(ip);
+            *self.gateway_mac.lock().unwrap() = Some(mac);
             info!(
                 "[ArpGuardian] Gateway discovered: {} → {}",
                 ip,
@@ -295,6 +496,21 @@ impl ArpGuardian {
             }
         }
     }
+}
+
+/// Parse a MAC address string (e.g. "aa:bb:cc:dd:ee:ff") into a 6-byte array.
+///
+/// Returns `None` if the string is not a valid MAC address.
+fn parse_mac_string(s: &str) -> Option<[u8; 6]> {
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() != 6 {
+        return None;
+    }
+    let mut mac = [0u8; 6];
+    for (i, part) in parts.iter().enumerate() {
+        mac[i] = u8::from_str_radix(part, 16).ok()?;
+    }
+    Some(mac)
 }
 
 #[cfg(test)]

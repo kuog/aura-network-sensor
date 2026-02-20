@@ -27,10 +27,11 @@ pub mod analysis;
 pub mod anomaly;
 pub mod pipeline;
 
-use log::{error, info};
+use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use analysis::arp_provider::ArpGuardian;
 use analysis::dns_resolver::DnsCache;
 use analysis::dns_tracker::DnsTracker;
 use anomaly::detector::AnomalyDetector;
@@ -231,6 +232,29 @@ fn main() {
         );
     }
 
+    // ── Shared ARP Guardian (persisted across restarts) ─────────────────
+    let arp_guardian = Arc::new(ArpGuardian::new());
+
+    // ── Restore persisted state from database ───────────────────────────
+    {
+        let state_db_path = db_path.as_deref().unwrap_or("alerts.db");
+        match rusqlite::Connection::open(state_db_path) {
+            Ok(conn) => {
+                // Restore ARP bindings (known devices)
+                match arp_guardian.load_from_db(&conn) {
+                    Ok(count) if count > 0 => {
+                        info!("Restored {} known devices from previous session", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!("Failed to restore ARP bindings: {}", e),
+                }
+            }
+            Err(e) => {
+                warn!("Failed to open state database for restore: {}", e);
+            }
+        }
+    }
+
     // ── Channel: Sniffer → Engine (bounded crossbeam ring buffer) ─────
     let (pkt_tx, pkt_rx) = crossbeam_channel::bounded(RING_BUFFER_CAPACITY);
 
@@ -287,6 +311,7 @@ fn main() {
     let dns_tracker_engine = dns_tracker.clone();
     let flow_tracker_engine = flow_tracker.clone();
     let anomaly_detector_engine = anomaly_detector.clone();
+    let arp_guardian_engine = arp_guardian.clone();
     let engine_thread = std::thread::Builder::new()
         .name("engine".to_string())
         .spawn(move || {
@@ -299,6 +324,7 @@ fn main() {
                 dns_tracker_engine,
                 flow_tracker_engine,
                 anomaly_detector_engine,
+                arp_guardian_engine,
             );
         })
         .expect("Failed to spawn engine thread");
@@ -355,6 +381,24 @@ fn main() {
         }
     });
     pipeline::console_fmt::print_stage_done("Exporter task");
+
+    // ── Persist state to database for next startup ──────────────────────
+    {
+        let state_db_path = db_path.as_deref().unwrap_or("alerts.db");
+        match rusqlite::Connection::open(state_db_path) {
+            Ok(conn) => {
+                match arp_guardian.save_to_db(&conn) {
+                    Ok(count) => {
+                        info!("Saved {} ARP bindings for next session", count);
+                    }
+                    Err(e) => warn!("Failed to save ARP bindings: {}", e),
+                }
+            }
+            Err(e) => {
+                warn!("Failed to open state database for save: {}", e);
+            }
+        }
+    }
 
     // ── Final summary ─────────────────────────────────────────────────
     pipeline::console_fmt::print_shutdown_summary(
