@@ -302,23 +302,22 @@ pub fn run(
             // This eliminates false positives from DNS responses, NTP replies,
             // DHCP answers, etc.
 
-            // ── UDP ConnTracker bookkeeping: record ALL outbound UDP ─────
+            // ── UDP ConnTracker bookkeeping: record ALL UDP flows ────────
+            let mut is_udp_return = false;
             if let Some(TransportHeader::Udp(udp)) = &headers.transport {
-                if is_local_ip(&scan_src) {
-                    // Local host sending UDP → record as outbound flow
-                    conn_tracker.record_outbound(
-                        scan_src,
-                        udp.source_port,
-                        scan_dst,
-                        udp.destination_port,
-                    );
-                }
-                if is_local_ip(&scan_dst) && !is_local_ip(&scan_src) {
-                    // Remote host sending UDP to local → also record the
-                    // local side's "outbound" if we see the local host
-                    // replying later.  (Already handled above when local
-                    // sends.)  Nothing extra needed here.
-                }
+                is_udp_return = conn_tracker.is_return_traffic(
+                    scan_src,
+                    udp.source_port,
+                    scan_dst,
+                    udp.destination_port,
+                );
+                // Always record the flow so the reverse direction is seen as return traffic
+                conn_tracker.record_flow(
+                    scan_src,
+                    udp.source_port,
+                    scan_dst,
+                    udp.destination_port,
+                );
             }
 
             if is_local_ip(&scan_src) {
@@ -358,34 +357,34 @@ pub fn run(
                     }
                     Some(TransportHeader::Udp(udp)) => {
                         // UDP: check ConnTracker — is this an unsolicited packet?
-                        // An outbound UDP from local is always an initiator
-                        // (we already recorded it in conn_tracker above).
-                        let is_initiator = true;
-                        if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, is_initiator) {
-                            // ── Importance-lowering: local-to-local scanning ────
-                            let dst_local = is_local_ip(&scan_dst);
-                            let (severity, confidence) = if dst_local {
-                                (Severity::Low, 30u8)
-                            } else {
-                                (Severity::Medium, 70u8)
-                            };
+                        if !is_udp_return {
+                            let is_initiator = true;
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, is_initiator) {
+                                // ── Importance-lowering: local-to-local scanning ────
+                                let dst_local = is_local_ip(&scan_dst);
+                                let (severity, confidence) = if dst_local {
+                                    (Severity::Low, 30u8)
+                                } else {
+                                    (Severity::Medium, 70u8)
+                                };
 
-                            let mut alert = MitreAlert::new(
-                                "T1046",
-                                "Network Service Discovery",
-                                severity,
-                                confidence,
-                                scan_src.to_string(),
-                                scan_dst.to_string(),
-                                udp.source_port,
-                                udp.destination_port,
-                                "udp",
-                                "port_scan",
-                                serde_json::to_string(&scan_alert).unwrap_or_default(),
-                            )
-                            .with_meta("dst_is_local", dst_local.to_string());
-                            enrich_alert_with_dns(&dns_tracker, &mut alert, None);
-                            emit(alert, &stats);
+                                let mut alert = MitreAlert::new(
+                                    "T1046",
+                                    "Network Service Discovery",
+                                    severity,
+                                    confidence,
+                                    scan_src.to_string(),
+                                    scan_dst.to_string(),
+                                    udp.source_port,
+                                    udp.destination_port,
+                                    "udp",
+                                    "port_scan",
+                                    serde_json::to_string(&scan_alert).unwrap_or_default(),
+                                )
+                                .with_meta("dst_is_local", dst_local.to_string());
+                                enrich_alert_with_dns(&dns_tracker, &mut alert, None);
+                                emit(alert, &stats);
+                            }
                         }
                     }
                     _ => {}
@@ -421,13 +420,7 @@ pub fn run(
                     }
                     Some(TransportHeader::Udp(udp)) => {
                         // Inbound UDP: only count if NOT return traffic
-                        let is_return = conn_tracker.is_return_traffic(
-                            scan_src,
-                            udp.source_port,
-                            scan_dst,
-                            udp.destination_port,
-                        );
-                        if !is_return {
+                        if !is_udp_return {
                             // Unsolicited inbound UDP — potential scan
                             if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, true) {
                                 let mut alert = MitreAlert::new(

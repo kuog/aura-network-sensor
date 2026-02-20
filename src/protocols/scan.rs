@@ -13,22 +13,21 @@ use serde::Serialize;
 /// 4-tuple identifying a UDP "connection" (pseudo-connection).
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 struct UdpFlowKey {
-    local_ip: IpAddr,
-    local_port: u16,
-    remote_ip: IpAddr,
-    remote_port: u16,
+    src_ip: IpAddr,
+    src_port: u16,
+    dst_ip: IpAddr,
+    dst_port: u16,
 }
 
 /// Lightweight UDP connection tracker.
 ///
-/// Call [`ConnTracker::record_outbound`] for every outbound UDP packet from a
-/// local host.  Then call [`ConnTracker::is_return_traffic`] for inbound UDP
-/// packets — it returns `true` when the inbound packet matches a previously
-/// recorded outbound flow (i.e. it is a response, not an unsolicited probe).
+/// Call [`ConnTracker::record_flow`] for every UDP packet.
+/// Then call [`ConnTracker::is_return_traffic`] to check if a packet
+/// is a response to a previously seen packet in the opposite direction.
 pub struct ConnTracker {
-    /// Active outbound flows: key → last-seen timestamp.
+    /// Active flows: key → last-seen timestamp.
     flows: HashMap<UdpFlowKey, Instant>,
-    /// How long a flow entry stays valid after the last outbound packet.
+    /// How long a flow entry stays valid after the last packet.
     flow_timeout: Duration,
     /// Maximum number of tracked flows (LRU eviction when exceeded).
     capacity: usize,
@@ -46,11 +45,8 @@ impl ConnTracker {
         }
     }
 
-    /// Record an outbound UDP packet from a local host.
-    ///
-    /// `src_ip`/`src_port` are the local (initiator) side;
-    /// `dst_ip`/`dst_port` are the remote side.
-    pub fn record_outbound(
+    /// Record a UDP packet.
+    pub fn record_flow(
         &mut self,
         src_ip: IpAddr,
         src_port: u16,
@@ -58,10 +54,10 @@ impl ConnTracker {
         dst_port: u16,
     ) {
         let key = UdpFlowKey {
-            local_ip: src_ip,
-            local_port: src_port,
-            remote_ip: dst_ip,
-            remote_port: dst_port,
+            src_ip,
+            src_port,
+            dst_ip,
+            dst_port,
         };
         let now = Instant::now();
         self.flows.insert(key, now);
@@ -69,13 +65,9 @@ impl ConnTracker {
         self.maybe_gc();
     }
 
-    /// Check whether an inbound UDP packet is return traffic for a known flow.
+    /// Check whether a UDP packet is return traffic for a known flow.
     ///
-    /// `src_ip`/`src_port` are the remote (responder) side;
-    /// `dst_ip`/`dst_port` are the local side.
-    ///
-    /// Returns `true` if this packet matches a previously recorded outbound
-    /// flow that has not yet expired.
+    /// Returns `true` if we have recently seen a packet in the opposite direction.
     pub fn is_return_traffic(
         &self,
         src_ip: IpAddr,
@@ -83,14 +75,12 @@ impl ConnTracker {
         dst_ip: IpAddr,
         dst_port: u16,
     ) -> bool {
-        // The reverse of the outbound flow:
-        //   outbound was  local(dst_ip:dst_port) → remote(src_ip:src_port)
-        //   inbound is    remote(src_ip:src_port) → local(dst_ip:dst_port)
+        // The reverse of the flow:
         let key = UdpFlowKey {
-            local_ip: dst_ip,
-            local_port: dst_port,
-            remote_ip: src_ip,
-            remote_port: src_port,
+            src_ip: dst_ip,
+            src_port: dst_port,
+            dst_ip: src_ip,
+            dst_port: src_port,
         };
         if let Some(last_seen) = self.flows.get(&key) {
             Instant::now().duration_since(*last_seen) <= self.flow_timeout
