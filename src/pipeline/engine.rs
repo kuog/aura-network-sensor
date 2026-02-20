@@ -447,8 +447,11 @@ pub fn run(
                 }
             }
 
-            // ── IP payload extraction (IPv4 defrag / IPv6 direct) ──────
-            let full_ip_payload: Option<Vec<u8>> = match &headers.net {
+            // ── Application payload extraction (IPv4 defrag / IPv6 direct) ─
+            // etherparse's `headers.payload` is the data AFTER all parsed
+            // headers (link + network + transport), i.e. the application-layer
+            // payload.  For IPv4 we run it through the defragmenter first.
+            let app_payload: Option<Vec<u8>> = match &headers.net {
                 Some(NetHeaders::Ipv4(ip_hdr, _)) => {
                     let ip_payload_bytes = headers.payload.slice();
                     defrag.process(ip_hdr, ip_payload_bytes)
@@ -462,7 +465,7 @@ pub fn run(
                 _ => None,
             };
 
-            if let Some(full_ip_payload) = full_ip_payload {
+            if let Some(app_payload) = app_payload {
                 let src_ip = scan_src;
                 let dst_ip = scan_dst;
 
@@ -472,7 +475,7 @@ pub fn run(
                             &mut tcp_reassembler,
                             &matrix,
                             &mut smb_tracker,
-                            &full_ip_payload,
+                            &app_payload,
                             src_ip,
                             dst_ip,
                             &tcp,
@@ -485,9 +488,8 @@ pub fn run(
                     Some(TransportHeader::Udp(udp)) => {
                         // DNS analysis (T1071.004) + Passive DNS tracking
                         if udp.destination_port == 53 || udp.source_port == 53 {
-                            let udp_data_offset = 8;
-                            if full_ip_payload.len() > udp_data_offset {
-                                let dns_data = &full_ip_payload[udp_data_offset..];
+                            let dns_data = &app_payload;
+                            if !dns_data.is_empty() {
 
                                 // ── Passive DNS: ingest responses into the tracker ──
                                 if udp.source_port == 53 {
@@ -556,7 +558,7 @@ fn analyze_tcp(
     tcp_reassembler: &mut Reassembler,
     matrix: &protocols::port_anomaly::ExpectationMatrix,
     smb_tracker: &mut SmbTracker,
-    full_ip_payload: &[u8],
+    app_payload: &[u8],
     src_ip: IpAddr,
     dst_ip: IpAddr,
     tcp: &etherparse::TcpHeader,
@@ -566,7 +568,7 @@ fn analyze_tcp(
     dns_tracker: &DnsTracker,
 ) {
     let is_upload = is_local_ip(&src_ip);
-    let packet_len = full_ip_payload.len() as u64;
+    let packet_len = app_payload.len() as u64;
 
     // ── Exfiltration detection (T1041) ────────────────────────────────
     if let Some((up, down, ratio)) = tcp_reassembler.update_stats(
@@ -617,11 +619,13 @@ fn analyze_tcp(
     }
 
     // ── TCP reassembly + deep inspection ──────────────────────────────
-    let tcp_data_offset = tcp.header_len() as usize;
-    if full_ip_payload.len() <= tcp_data_offset {
+    // NOTE: `full_ip_payload` is already the application-layer data
+    // (etherparse's `headers.payload` excludes link/net/transport headers),
+    // so we must NOT skip tcp.header_len() again.
+    let app_data = app_payload;
+    if app_data.is_empty() {
         return;
     }
-    let app_data = &full_ip_payload[tcp_data_offset..];
 
     let (session_data, b_score) = match tcp_reassembler.add_segment(
         src_ip,
@@ -1047,10 +1051,16 @@ fn analyze_tcp(
         tcp.source_port,
         tcp.destination_port,
     ) {
-        // ── Importance-lowering: known provider + standard HTTP port ────
+        // ── Importance-lowering ─────────────────────────────────────────
+        let both_local = is_local_ip(&src_ip) && is_local_ip(&dst_ip);
         let dst_rep = reputation::lookup_ip(&dst_ip);
         let is_standard_http = matches!(tcp.destination_port, 80 | 443 | 8080 | 8443);
-        let (severity, confidence) = if dst_rep.is_trusted && is_standard_http {
+
+        let (severity, confidence) = if both_local {
+            // Local-to-local HTTP (AirPlay, mDNS-SD, IoT, etc.) — almost
+            // always benign; devices often omit User-Agent or use short ones.
+            (Severity::Low, 10u8)
+        } else if dst_rep.is_trusted && is_standard_http {
             // Trusted provider on standard HTTP port — likely benign
             (Severity::Low, 15u8)
         } else if dst_rep.is_trusted {
@@ -1074,7 +1084,8 @@ fn analyze_tcp(
             "http_anomaly",
             "HTTP anomaly detected",
         )
-        .with_meta("dst_provider", &dst_rep.provider);
+        .with_meta("dst_provider", &dst_rep.provider)
+        .with_meta("both_local", both_local.to_string());
         enrich_alert_with_dns(dns_tracker, &mut alert, None);
         emit(alert, stats);
     }
