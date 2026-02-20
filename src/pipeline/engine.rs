@@ -321,13 +321,13 @@ pub fn run(
             }
 
             if is_local_ip(&scan_src) {
+                let dst_local = is_local_ip(&scan_dst);
                 match &headers.transport {
                     Some(TransportHeader::Tcp(tcp)) => {
                         // TCP: only pure SYN = connection initiator
                         if tcp.syn && !tcp.ack {
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true, dst_local) {
                                 // ── Importance-lowering: local-to-local scanning ────
-                                let dst_local = is_local_ip(&scan_dst);
                                 let (severity, confidence) = if dst_local {
                                     // Internal network discovery — routine IT activity
                                     (Severity::Low, 30u8)
@@ -359,9 +359,8 @@ pub fn run(
                         // UDP: check ConnTracker — is this an unsolicited packet?
                         if !is_udp_return {
                             let is_initiator = true;
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, is_initiator) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, is_initiator, dst_local) {
                                 // ── Importance-lowering: local-to-local scanning ────
-                                let dst_local = is_local_ip(&scan_dst);
                                 let (severity, confidence) = if dst_local {
                                     (Severity::Low, 30u8)
                                 } else {
@@ -398,7 +397,7 @@ pub fn run(
                     Some(TransportHeader::Tcp(tcp)) => {
                         // Inbound TCP SYN = someone scanning us
                         if tcp.syn && !tcp.ack {
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true, true) {
                                 let mut alert = MitreAlert::new(
                                     "T1046",
                                     "Network Service Discovery",
@@ -422,7 +421,7 @@ pub fn run(
                         // Inbound UDP: only count if NOT return traffic
                         if !is_udp_return {
                             // Unsolicited inbound UDP — potential scan
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, true) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, true, true) {
                                 let mut alert = MitreAlert::new(
                                     "T1046",
                                     "Network Service Discovery",

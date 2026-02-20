@@ -113,10 +113,28 @@ impl ConnTracker {
     }
 }
 
+/// Ports that are commonly used by browsers and legitimate applications.
+/// Horizontal scans targeting *only* these ports on external hosts are
+/// almost certainly normal traffic (CDN, API, web browsing).
+const WELL_KNOWN_SERVICE_PORTS: &[u16] = &[
+    80,   // HTTP
+    443,  // HTTPS
+    8080, // HTTP alt
+    8443, // HTTPS alt
+];
+
+/// Returns `true` when every port in the set is a well-known service port.
+fn all_ports_well_known(ports: &HashSet<u16>) -> bool {
+    !ports.is_empty()
+        && ports.iter().all(|p| WELL_KNOWN_SERVICE_PORTS.contains(p))
+}
+
 #[derive(Debug, Clone)]
 struct HostScanStats {
     // Map destination IP to set of ports visited on that IP
     dst_ports_per_ip: HashMap<IpAddr, HashSet<u16>>,
+    /// How many of the unique destination IPs are *external* (non-local).
+    external_dst_count: usize,
     first_seen: Instant,
     last_seen: Instant,
     connection_attempts: u32,
@@ -126,6 +144,7 @@ impl HostScanStats {
     fn new(now: Instant) -> Self {
         Self {
             dst_ports_per_ip: HashMap::new(),
+            external_dst_count: 0,
             first_seen: now,
             last_seen: now,
             connection_attempts: 0,
@@ -134,6 +153,7 @@ impl HostScanStats {
 
     fn reset(&mut self, now: Instant) {
         self.dst_ports_per_ip.clear();
+        self.external_dst_count = 0;
         self.connection_attempts = 0;
         self.first_seen = now;
         // last_seen is updated separately
@@ -172,7 +192,7 @@ impl ScannerTracker {
         self
     }
 
-    pub fn update(&mut self, src_ip: IpAddr, dst_ip: IpAddr, dst_port: u16, is_initiator: bool) -> Option<ScanAlert> {
+    pub fn update(&mut self, src_ip: IpAddr, dst_ip: IpAddr, dst_port: u16, is_initiator: bool, dst_is_local: bool) -> Option<ScanAlert> {
         let now = Instant::now();
         let mut is_new = false;
         let mut old_last_seen = None;
@@ -209,12 +229,18 @@ impl ScannerTracker {
         let stats = self.scanners.get_mut(&src_ip).unwrap();
         
         if is_initiator {
+            let is_new_ip = !stats.dst_ports_per_ip.contains_key(&dst_ip);
             let ports = stats.dst_ports_per_ip
                 .entry(dst_ip)
                 .or_insert_with(HashSet::new);
                 
             if ports.insert(dst_port) {
                 stats.connection_attempts += 1;
+            }
+
+            // Track external destination count
+            if is_new_ip && !dst_is_local {
+                stats.external_dst_count += 1;
             }
         }
 
@@ -233,7 +259,23 @@ impl ScannerTracker {
         let mut triggered = false;
 
         // Trigger 1: Horizontal Scan (> 15 unique IPs)
+        //
+        // Suppress when ALL of the following are true:
+        //   - every destination is external (not on the local network)
+        //   - every targeted port is a well-known service port (80, 443, …)
+        // This pattern matches normal browser / app traffic hitting many
+        // CDN / API endpoints and is not indicative of network discovery.
         if unique_targets > 15 {
+            let all_external = stats.external_dst_count == unique_targets;
+            let benign_ports = all_ports_well_known(&all_unique_ports);
+
+            if all_external && benign_ports {
+                // Suppress — this is normal outbound web traffic.
+                // Reset the window so we don't accumulate stale state.
+                stats.reset(now);
+                return None;
+            }
+
             trigger_reason = format!("Horizontal Scan: {} unique IPs", unique_targets);
             triggered = true;
         }
