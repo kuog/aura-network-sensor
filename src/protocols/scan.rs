@@ -117,16 +117,31 @@ impl ConnTracker {
 /// Horizontal scans targeting *only* these ports on external hosts are
 /// almost certainly normal traffic (CDN, API, web browsing).
 const WELL_KNOWN_SERVICE_PORTS: &[u16] = &[
+    53,   // DNS
     80,   // HTTP
-    443,  // HTTPS
+    123,  // NTP
+    443,  // HTTPS / QUIC
+    853,  // DNS-over-TLS
+    993,  // IMAPS
+    995,  // POP3S
+    5228, // Google push / FCM
+    5229, // Google push
+    5230, // Google push
+    5353, // mDNS
     8080, // HTTP alt
     8443, // HTTPS alt
 ];
 
-/// Returns `true` when every port in the set is a well-known service port.
-fn all_ports_well_known(ports: &HashSet<u16>) -> bool {
-    !ports.is_empty()
-        && ports.iter().all(|p| WELL_KNOWN_SERVICE_PORTS.contains(p))
+/// Returns `true` when the *majority* (≥ 80%) of ports are well-known.
+/// This is a softer check for cases where one or two unusual ports
+/// shouldn't invalidate an otherwise benign traffic pattern.
+fn mostly_well_known_ports(ports: &HashSet<u16>) -> bool {
+    if ports.is_empty() {
+        return false;
+    }
+    let known = ports.iter().filter(|p| WELL_KNOWN_SERVICE_PORTS.contains(p)).count();
+    // At least 80% well-known
+    known * 100 / ports.len() >= 80
 }
 
 #[derive(Debug, Clone)]
@@ -258,19 +273,23 @@ impl ScannerTracker {
         let mut trigger_reason = String::new();
         let mut triggered = false;
 
-        // Trigger 1: Horizontal Scan (> 15 unique IPs)
+        // Trigger 1: Horizontal Scan
         //
-        // Suppress when ALL of the following are true:
-        //   - every destination is external (not on the local network)
-        //   - every targeted port is a well-known service port (80, 443, …)
-        // This pattern matches normal browser / app traffic hitting many
-        // CDN / API endpoints and is not indicative of network discovery.
-        if unique_targets > 15 {
-            let all_external = stats.external_dst_count == unique_targets;
-            let benign_ports = all_ports_well_known(&all_unique_ports);
+        // For *external-only* destinations we use a higher threshold (50 IPs)
+        // and suppress when the majority of ports are well-known services.
+        // Normal browsing / app traffic routinely fans out to 20-40 CDN /
+        // API / push-notification endpoints within a 60-second window.
+        //
+        // For mixed or local-only destinations the original threshold (15)
+        // is kept because lateral movement inside a LAN is more suspicious.
+        let all_external = stats.external_dst_count == unique_targets;
 
-            if all_external && benign_ports {
-                // Suppress — this is normal outbound web traffic.
+        let horizontal_threshold: usize = if all_external { 50 } else { 15 };
+
+        if unique_targets > horizontal_threshold {
+            // Suppress when destinations are all external AND ports look benign
+            if all_external && mostly_well_known_ports(&all_unique_ports) {
+                // Suppress — this is normal outbound web / app traffic.
                 // Reset the window so we don't accumulate stale state.
                 stats.reset(now);
                 return None;
