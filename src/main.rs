@@ -37,7 +37,7 @@ use anomaly::detector::AnomalyDetector;
 use anomaly::flow_tracker::FlowTracker;
 use pipeline::engine::EngineStats;
 use pipeline::exporter::ExporterStats;
-use pipeline::sniffer::{CaptureSource, SnifferStats};
+use pipeline::sniffer::{CaptureSource, PacketSource, SnifferStats};
 
 // ── Ring buffer capacity (packets) ────────────────────────────────────────
 const RING_BUFFER_CAPACITY: usize = 10_000;
@@ -149,11 +149,16 @@ fn main() {
     }
 
     // ── Determine capture source ──────────────────────────────────────
+    enum SnifferMode {
+        Live(Box<dyn PacketSource + Send>),
+        File(CaptureSource),
+    }
+
     let (source, source_type, source_name) = if let Some(file) = pcap_file {
         match CaptureSource::file(&file) {
             Ok(s) => {
                 info!("Reading from pcap file: {}", file);
-                (s, "PCAP file", file)
+                (SnifferMode::File(s), "PCAP file", file)
             }
             Err(e) => {
                 error!("Failed to open PCAP file '{}': {}", file, e);
@@ -161,16 +166,26 @@ fn main() {
             }
         }
     } else if let Some(iface) = interface {
-        match CaptureSource::live(&iface) {
-            Ok(s) => {
-                info!("Capturing live traffic on interface: {}", iface);
-                (s, "Live capture", iface)
-            }
+        #[cfg(target_os = "linux")]
+        let source = match pipeline::sniffer::LinuxScanner::new(iface.clone()) {
+            Ok(scanner) => SnifferMode::Live(Box::new(scanner)),
             Err(e) => {
                 error!("Failed to open capture device '{}': {}", iface, e);
                 return;
             }
-        }
+        };
+
+        #[cfg(target_os = "macos")]
+        let source = match pipeline::sniffer::MacScanner::new(iface.clone()) {
+            Ok(scanner) => SnifferMode::Live(Box::new(scanner)),
+            Err(e) => {
+                error!("Failed to open capture device '{}': {}", iface, e);
+                return;
+            }
+        };
+
+        info!("Capturing live traffic on interface: {}", iface);
+        (source, "Live capture", iface)
     } else {
         use colored::Colorize;
         eprintln!("{} {}", "Error:".red().bold(), "no capture source specified.".white());
@@ -294,7 +309,26 @@ fn main() {
     let sniffer_thread = std::thread::Builder::new()
         .name("sniffer".to_string())
         .spawn(move || {
-            pipeline::sniffer::run(source, pkt_tx, sniffer_running, sniffer_stats_clone, SNIFFER_CORE);
+            match source {
+                SnifferMode::File(file_source) => {
+                    pipeline::sniffer::run(
+                        file_source,
+                        pkt_tx,
+                        sniffer_running,
+                        sniffer_stats_clone,
+                        SNIFFER_CORE,
+                    );
+                }
+                SnifferMode::Live(live_source) => {
+                    pipeline::sniffer::run_live(
+                        live_source,
+                        pkt_tx,
+                        sniffer_running,
+                        sniffer_stats_clone,
+                        SNIFFER_CORE,
+                    );
+                }
+            }
         })
         .expect("Failed to spawn sniffer thread");
 
