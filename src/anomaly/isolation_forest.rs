@@ -33,11 +33,27 @@ pub struct IsolationForestConfig {
     pub subsample_size: usize,
     /// Maximum tree depth (auto-calculated as ceil(log2(subsample_size)) if None).
     pub max_depth: Option<usize>,
-    /// Anomaly score threshold (default: 0.5).
-    /// Points with score > threshold are considered anomalous.
+    /// Anomaly score threshold.
+    ///
+    /// When `adaptive_threshold` is `true` (default), this field is **overwritten**
+    /// after training with the score at `threshold_percentile` of the training data.
+    /// This ensures that traffic patterns seen during learning are classified as
+    /// normal.  The static value is only used as a fallback when adaptive
+    /// calibration is disabled.
     pub threshold: f64,
     /// Random seed for reproducibility (None = random).
     pub seed: Option<u64>,
+    /// Whether to compute the threshold adaptively from training data.
+    ///
+    /// When `true` (default), after building the trees the model scores every
+    /// training sample and sets `threshold` to the `threshold_percentile`-th
+    /// percentile of those scores.  This means that ≈`threshold_percentile`%
+    /// of the training traffic will be classified as **normal**.
+    pub adaptive_threshold: bool,
+    /// Percentile (0.0–1.0) used for adaptive threshold calibration.
+    ///
+    /// Default: `0.95` — 95 % of training flows are considered normal.
+    pub threshold_percentile: f64,
 }
 
 impl Default for IsolationForestConfig {
@@ -48,6 +64,8 @@ impl Default for IsolationForestConfig {
             max_depth: None,
             threshold: 0.50,
             seed: None,
+            adaptive_threshold: true,
+            threshold_percentile: 0.95,
         }
     }
 }
@@ -164,11 +182,37 @@ impl IsolationForest {
             trees.push(ITree { root });
         }
 
-        Ok(Self {
+        let mut model = Self {
             trees,
             config,
             n_features,
-        })
+        };
+
+        // ── Adaptive threshold calibration ─────────────────────────────
+        // Score every training sample and pick the percentile-th score as
+        // the threshold.  This guarantees that ≈percentile% of the traffic
+        // observed during the learning phase is classified as NORMAL.
+        if model.config.adaptive_threshold {
+            let mut scores: Vec<f64> = data.iter().map(|row| model.score(row)).collect();
+            scores.sort_unstable_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+            let idx = ((scores.len() as f64 * model.config.threshold_percentile).ceil() as usize)
+                .min(scores.len().saturating_sub(1));
+            let adaptive = scores[idx];
+
+            log::info!(
+                "[IsolationForest] Adaptive threshold calibrated: {:.4} \
+                 (percentile={:.0}%, training_samples={}, static_fallback={:.2})",
+                adaptive,
+                model.config.threshold_percentile * 100.0,
+                scores.len(),
+                model.config.threshold,
+            );
+
+            model.config.threshold = adaptive;
+        }
+
+        Ok(model)
     }
 
     /// Recursively build an isolation tree node.

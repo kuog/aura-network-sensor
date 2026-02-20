@@ -195,7 +195,7 @@ impl AnomalyDetector {
             .map_err(|e| format!("Training failed: {}", e))?;
 
         info!(
-            "[AnomalyDetector] Model trained: {} trees, threshold={:.2}",
+            "[AnomalyDetector] Model trained: {} trees, threshold={:.4} (adaptive)",
             forest.n_trees(),
             forest.threshold()
         );
