@@ -696,13 +696,15 @@ pub fn adjust_t1573(
                 };
             }
         }
-        // Port 443 with trusted IP but no SNI — still downgrade
+        // Port 443 with trusted IP but unknown/missing SNI — suppress.
+        // The destination IP belongs to a known trusted provider (e.g.
+        // Cloudflare, Google, AWS), so even if the SNI doesn't match our
+        // hardcoded trusted-suffix list (e.g. a Workers/R2 subdomain),
+        // this is still legitimate HTTPS traffic.
         if flow.dst_reputation.is_trusted {
-            return ReputationVerdict::Adjust {
-                severity_hint: "LOW",
-                confidence: 15,
+            return ReputationVerdict::Suppress {
                 reason: format!(
-                    "HTTPS to trusted provider {} (no SNI extracted)",
+                    "HTTPS to trusted provider {} (SNI not in trusted-suffix list but IP is trusted)",
                     flow.provider,
                 ),
             };
@@ -889,5 +891,41 @@ mod tests {
         let verdict = adjust_t1573(&flow, 993, 7.8, None);
         // Unknown IP on mail port — no special treatment
         assert!(matches!(verdict, ReputationVerdict::NoChange));
+    }
+
+    #[test]
+    fn test_adjust_t1573_trusted_ip_443_unknown_sni() {
+        // Port 443 + trusted Cloudflare IP + SNI not in trusted-suffix list
+        // → should be suppressed (IP trust is sufficient)
+        let flow = evaluate_flow(
+            "192.168.1.100",
+            "104.16.0.1", // Cloudflare
+            443,
+            Some("unknown-app.example-account.workers.dev"),
+        );
+        let verdict = adjust_t1573(
+            &flow,
+            443,
+            7.95,
+            Some("unknown-app.example-account.workers.dev"),
+        );
+        assert!(
+            matches!(verdict, ReputationVerdict::Suppress { .. }),
+            "Expected Suppress for port 443 + trusted IP even with unknown SNI, got {:?}",
+            verdict,
+        );
+    }
+
+    #[test]
+    fn test_adjust_t1573_trusted_ip_443_no_sni() {
+        // Port 443 + trusted Google IP + no SNI at all
+        // → should be suppressed (IP trust is sufficient)
+        let flow = evaluate_flow("192.168.1.100", "142.250.80.4", 443, None);
+        let verdict = adjust_t1573(&flow, 443, 7.9, None);
+        assert!(
+            matches!(verdict, ReputationVerdict::Suppress { .. }),
+            "Expected Suppress for port 443 + trusted IP with no SNI, got {:?}",
+            verdict,
+        );
     }
 }
