@@ -446,20 +446,20 @@ pub fn run(
                 }
             }
 
-            // ── Application payload extraction (IPv4 defrag / IPv6 direct) ─
+            // ── Application payload extraction (IPv4/IPv6 defrag) ─────────
             // etherparse's `headers.payload` is the data AFTER all parsed
             // headers (link + network + transport), i.e. the application-layer
-            // payload.  For IPv4 we run it through the defragmenter first.
+            // payload. For fragmented packets, the transport header may be
+            // missing, so `headers.payload` is the IP fragment payload which
+            // must be reassembled.
             let app_payload: Option<Vec<u8>> = match &headers.net {
                 Some(NetHeaders::Ipv4(ip_hdr, _)) => {
                     let ip_payload_bytes = headers.payload.slice();
                     defrag.process(ip_hdr, ip_payload_bytes)
                 }
-                Some(NetHeaders::Ipv6(_, _)) => {
-                    // IPv6 fragmentation is handled at the extension header
-                    // level; for now pass the payload through directly.
-                    // (Full IPv6 fragment reassembly is a future enhancement.)
-                    Some(headers.payload.slice().to_vec())
+                Some(NetHeaders::Ipv6(ip_hdr, exts)) => {
+                    let ip_payload_bytes = headers.payload.slice();
+                    defrag.process_ipv6(ip_hdr, exts.fragment.as_ref(), ip_payload_bytes)
                 }
                 _ => None,
             };
