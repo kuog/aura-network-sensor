@@ -27,7 +27,6 @@ pub struct ShellDetectionResult {
 /// Known shell commands that indicate reconnaissance or post-exploitation.
 const RECON_COMMANDS: &[&str] = &[
     "whoami",
-    "id",
     "hostname",
     "net user",
     "net localgroup",
@@ -496,6 +495,27 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
 
     // Convert payload to string lossily to perform string matching
     let payload_str = String::from_utf8_lossy(payload);
+
+    // ── Early exit: skip well-formed HTTP requests and responses.
+    // Shell sessions never start with HTTP method/status lines.  Matching
+    // recon-command keywords inside HTTP headers produces false positives
+    // (e.g. "Proxy-ID" matching "id", "Set-Cookie" matching "set").
+    {
+        let start = &payload_str[..payload_str.len().min(16)];
+        if start.starts_with("HTTP/")
+            || start.starts_with("GET ")
+            || start.starts_with("POST ")
+            || start.starts_with("PUT ")
+            || start.starts_with("HEAD ")
+            || start.starts_with("DELETE ")
+            || start.starts_with("OPTIONS ")
+            || start.starts_with("PATCH ")
+            || start.starts_with("CONNECT ")
+        {
+            return None;
+        }
+    }
+
     let mut matched_patterns = Vec::new();
     let mut shell_type = String::new();
 
@@ -523,10 +543,12 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
     }
 
     // Trigger 2: Command Execution Sequences
-    // These are common reconnaissance commands
+    // These are common reconnaissance commands.
+    // NOTE: very short tokens like "id" are intentionally excluded — they
+    // produce too many false positives even with word-boundary checks
+    // (e.g. HTTP header "Proxy-ID", JSON field "id":, etc.).
     let commands = [
         "whoami",
-        "id",
         "hostname",
         "net user",
         "uname -a",
@@ -535,8 +557,6 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
     ];
 
     for cmd in commands.iter() {
-        // Use word-boundary-aware matching for short commands like "id"
-        // to avoid false positives on words like "valid", "provide", etc.
         if contains_word(&payload_str, cmd) {
              matched_patterns.push(cmd.to_string());
         }
