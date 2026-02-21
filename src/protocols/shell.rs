@@ -82,6 +82,60 @@ const RECON_COMMANDS: &[&str] = &[
     "history",
 ];
 
+/// Maximum length of a "short" command pattern that requires word-boundary
+/// validation to avoid false positives (e.g. "id" matching inside "valid").
+const SHORT_CMD_THRESHOLD: usize = 4;
+
+/// Check whether the character at the given byte position is a word boundary
+/// (i.e. not an ASCII alphanumeric or underscore).  Positions outside the
+/// string are treated as boundaries (start/end of string).
+fn is_word_boundary(s: &str, byte_pos: usize) -> bool {
+    if byte_pos >= s.len() {
+        return true; // end of string is a boundary
+    }
+    let b = s.as_bytes()[byte_pos];
+    // Word characters: a-z, A-Z, 0-9, _
+    !(b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Search for `pattern` in `haystack` with word-boundary awareness for short
+/// patterns.  For patterns longer than [`SHORT_CMD_THRESHOLD`] bytes, a plain
+/// `contains()` is used.  For shorter patterns (like "id", "env", "set",
+/// "dir"), every occurrence is checked to ensure it is surrounded by
+/// non-word characters (spaces, newlines, punctuation, start/end of string).
+fn contains_word(haystack: &str, pattern: &str) -> bool {
+    if pattern.len() > SHORT_CMD_THRESHOLD {
+        // Long patterns are specific enough — plain substring match is fine.
+        return haystack.contains(pattern);
+    }
+
+    let hay = haystack.as_bytes();
+    let pat = pattern.as_bytes();
+    if pat.is_empty() || hay.len() < pat.len() {
+        return false;
+    }
+
+    let mut start = 0;
+    while start + pat.len() <= hay.len() {
+        if let Some(offset) = haystack[start..].find(pattern) {
+            let match_start = start + offset;
+            let match_end = match_start + pat.len();
+
+            let left_ok = match_start == 0 || is_word_boundary(haystack, match_start - 1);
+            let right_ok = is_word_boundary(haystack, match_end);
+
+            if left_ok && right_ok {
+                return true;
+            }
+            // Advance past this occurrence and keep searching.
+            start = match_start + 1;
+        } else {
+            break;
+        }
+    }
+    false
+}
+
 /// Extract individual command lines from a shell session payload.
 ///
 /// Splits on common line terminators (`\r\n`, `\n`) and filters for lines
@@ -105,8 +159,9 @@ fn extract_command_lines(payload_str: &str) -> Vec<String> {
         // (heuristic: lines starting with common output prefixes)
         let lower = line.to_ascii_lowercase();
 
-        // Check if the line contains any known command
-        let has_known_cmd = RECON_COMMANDS.iter().any(|cmd| lower.contains(cmd));
+        // Check if the line contains any known command (with word-boundary
+        // awareness for short patterns like "id", "env", "set", "dir").
+        let has_known_cmd = RECON_COMMANDS.iter().any(|cmd| contains_word(&lower, cmd));
 
         // Also accept lines that look like they were typed at a prompt:
         //   "root@host:~# whoami"  →  extract "whoami"
@@ -431,10 +486,11 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
         return None;
     }
 
-    // ── Early exit: if the payload is overwhelmingly binary, skip detection
-    // entirely.  Shell sessions are text-based; a payload with >80% non-
-    // printable bytes is almost certainly not a real shell session.
-    if is_binary_payload(payload, 0.80) {
+    // ── Early exit: if the payload is predominantly binary, skip detection
+    // entirely.  Shell sessions are text-based; a payload with >40% non-
+    // printable bytes is almost certainly not a real shell session (e.g.
+    // TLS ciphertext on port 443 typically has ~50% non-printable bytes).
+    if is_binary_payload(payload, 0.40) {
         return None;
     }
 
@@ -479,9 +535,9 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
     ];
 
     for cmd in commands.iter() {
-        // Check for command followed by newline or space to avoid partial matches in other words
-        // This is a simple heuristic.
-        if payload_str.contains(cmd) {
+        // Use word-boundary-aware matching for short commands like "id"
+        // to avoid false positives on words like "valid", "provide", etc.
+        if contains_word(&payload_str, cmd) {
              matched_patterns.push(cmd.to_string());
         }
     }
