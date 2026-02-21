@@ -474,14 +474,8 @@ pub fn print_usage() {
     println!(
         "  {} {}  mcp-network-sensor {}",
         "Live capture".green(),
-        "(default):".dimmed(),
+        ":".dimmed(),
         "-i <interface>".white().bold(),
-    );
-    println!(
-        "  {} {}  mcp-network-sensor {}",
-        "Read pcap   ".green(),
-        "(file):   ".dimmed(),
-        "-f <path_to_pcap>".white().bold(),
     );
     println!();
     println!("{}", "Options:".bright_white().bold());
@@ -489,11 +483,6 @@ pub fn print_usage() {
         "  {}   {}",
         "-i <interface>".cyan(),
         "Capture live traffic from the specified network interface".white(),
-    );
-    println!(
-        "  {}   {}",
-        "-f <file>     ".cyan(),
-        "Analyze traffic from a pcap file".white(),
     );
     println!(
         "  {}   {}",

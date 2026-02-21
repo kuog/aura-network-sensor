@@ -38,7 +38,7 @@ use anomaly::detector::AnomalyDetector;
 use anomaly::flow_tracker::FlowTracker;
 use pipeline::engine::EngineStats;
 use pipeline::exporter::ExporterStats;
-use pipeline::sniffer::{CaptureSource, PacketSource, SnifferStats};
+use pipeline::sniffer::{PacketSource, SnifferStats};
 
 // ── Ring buffer capacity (packets) ────────────────────────────────────────
 const RING_BUFFER_CAPACITY: usize = 10_000;
@@ -77,7 +77,6 @@ fn main() {
     // ── Parse CLI arguments ───────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let mut interface: Option<String> = None;
-    let mut pcap_file: Option<String> = None;
     let mut db_path: Option<String> = None;
     let mut learning_time: u64 = DEFAULT_LEARNING_TIME_MINUTES;
     let mut i = 1;
@@ -90,16 +89,6 @@ fn main() {
                     i += 2;
                 } else {
                     eprintln!("Error: -i requires an interface name");
-                    print_usage();
-                    return;
-                }
-            }
-            "-f" => {
-                if i + 1 < args.len() {
-                    pcap_file = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Error: -f requires a file path");
                     print_usage();
                     return;
                 }
@@ -142,34 +131,18 @@ fn main() {
                 return;
             }
             other => {
-                // Backward compatibility: treat bare argument as pcap file
-                pcap_file = Some(other.to_string());
-                i += 1;
+                eprintln!("Error: unknown argument '{}'", other);
+                print_usage();
+                return;
             }
         }
     }
 
     // ── Determine capture source ──────────────────────────────────────
-    enum SnifferMode {
-        Live(Box<dyn PacketSource + Send>),
-        File(CaptureSource),
-    }
-
-    let (source, source_type, source_name) = if let Some(file) = pcap_file {
-        match CaptureSource::file(&file) {
-            Ok(s) => {
-                info!("Reading from pcap file: {}", file);
-                (SnifferMode::File(s), "PCAP file", file)
-            }
-            Err(e) => {
-                error!("Failed to open PCAP file '{}': {}", file, e);
-                return;
-            }
-        }
-    } else if let Some(iface) = interface {
+    let (source, source_name): (Box<dyn PacketSource + Send>, String) = if let Some(iface) = interface {
         #[cfg(target_os = "linux")]
-        let source = match pipeline::sniffer::LinuxScanner::new(iface.clone()) {
-            Ok(scanner) => SnifferMode::Live(Box::new(scanner)),
+        let source: Box<dyn PacketSource + Send> = match pipeline::sniffer::LinuxScanner::new(iface.clone()) {
+            Ok(scanner) => Box::new(scanner),
             Err(e) => {
                 error!("Failed to open capture device '{}': {}", iface, e);
                 return;
@@ -177,8 +150,8 @@ fn main() {
         };
 
         #[cfg(target_os = "macos")]
-        let source = match pipeline::sniffer::MacScanner::new(iface.clone()) {
-            Ok(scanner) => SnifferMode::Live(Box::new(scanner)),
+        let source: Box<dyn PacketSource + Send> = match pipeline::sniffer::MacScanner::new(iface.clone()) {
+            Ok(scanner) => Box::new(scanner),
             Err(e) => {
                 error!("Failed to open capture device '{}': {}", iface, e);
                 return;
@@ -186,10 +159,10 @@ fn main() {
         };
 
         info!("Capturing live traffic on interface: {}", iface);
-        (source, "Live capture", iface)
+        (source, iface)
     } else {
         use colored::Colorize;
-        eprintln!("{} {}", "Error:".red().bold(), "no capture source specified.".white());
+        eprintln!("{} {}", "Error:".red().bold(), "no interface specified. Use -i <interface>.".white());
         eprintln!();
         print_usage();
         return;
@@ -262,7 +235,7 @@ fn main() {
     let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel();
 
     pipeline::console_fmt::print_banner();
-    pipeline::console_fmt::print_source_info(&source_type, &source_name);
+    pipeline::console_fmt::print_source_info("Live capture", &source_name);
     pipeline::console_fmt::print_pipeline_config(RING_BUFFER_CAPACITY, SNIFFER_CORE, ENGINE_CORE);
 
     // ── Stage 3: Async Exporter (Tokio runtime on remaining cores) ────
@@ -335,26 +308,13 @@ fn main() {
     let sniffer_thread = std::thread::Builder::new()
         .name("sniffer".to_string())
         .spawn(move || {
-            match source {
-                SnifferMode::File(file_source) => {
-                    pipeline::sniffer::run(
-                        file_source,
-                        pkt_tx,
-                        sniffer_running,
-                        sniffer_stats_clone,
-                        SNIFFER_CORE,
-                    );
-                }
-                SnifferMode::Live(live_source) => {
-                    pipeline::sniffer::run_live(
-                        live_source,
-                        pkt_tx,
-                        sniffer_running,
-                        sniffer_stats_clone,
-                        SNIFFER_CORE,
-                    );
-                }
-            }
+            pipeline::sniffer::run_live(
+                source,
+                pkt_tx,
+                sniffer_running,
+                sniffer_stats_clone,
+                SNIFFER_CORE,
+            );
         })
         .expect("Failed to spawn sniffer thread");
 
