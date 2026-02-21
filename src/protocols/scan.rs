@@ -275,26 +275,33 @@ impl ScannerTracker {
 
         // Trigger 1: Horizontal Scan
         //
-        // For *external-only* destinations we use a higher threshold (50 IPs)
-        // and suppress when the majority of ports are well-known services.
-        // Normal browsing / app traffic routinely fans out to 20-40 CDN /
+        // Normal browsing / app traffic routinely fans out to many CDN /
         // API / push-notification endpoints within a 60-second window.
+        // We use graduated thresholds:
         //
-        // For mixed or local-only destinations the original threshold (15)
-        // is kept because lateral movement inside a LAN is more suspicious.
+        //   - All external + well-known ports → suppress entirely (normal browsing)
+        //   - Mixed (some local) + well-known ports → 50 IPs (browsing + local services)
+        //   - All external + unusual ports → 50 IPs
+        //   - Mixed + unusual ports → 15 IPs (lateral movement is suspicious)
         let all_external = stats.external_dst_count == unique_targets;
+        let benign_ports = mostly_well_known_ports(&all_unique_ports);
 
-        let horizontal_threshold: usize = if all_external { 50 } else { 15 };
+        let horizontal_threshold: usize = match (all_external, benign_ports) {
+            (true,  true)  => {
+                // Pure outbound web/app traffic — suppress entirely.
+                // If we exceed 50 unique targets, just reset; never alert.
+                if unique_targets > 50 {
+                    stats.reset(now);
+                    return None;
+                }
+                usize::MAX // effectively never triggers below
+            }
+            (true,  false) => 50,  // external but unusual ports
+            (false, true)  => 50,  // mixed destinations but benign ports (browsing + local DNS/router)
+            (false, false) => 15,  // mixed destinations + unusual ports — suspicious
+        };
 
         if unique_targets > horizontal_threshold {
-            // Suppress when destinations are all external AND ports look benign
-            if all_external && mostly_well_known_ports(&all_unique_ports) {
-                // Suppress — this is normal outbound web / app traffic.
-                // Reset the window so we don't accumulate stale state.
-                stats.reset(now);
-                return None;
-            }
-
             trigger_reason = format!("Horizontal Scan: {} unique IPs", unique_targets);
             triggered = true;
         }
