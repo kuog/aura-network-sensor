@@ -8,15 +8,10 @@ struct FragBuffer {
 }
 
 /// Handles IPv4 fragmentation reassembly.
+#[derive(Default)]
 pub struct Defragmenter {
     // Key: (Source IP, Destination IP, IP ID)
     cache: HashMap<(IpAddr, IpAddr, u16), FragBuffer>,
-}
-
-impl Default for Defragmenter {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl Defragmenter {
