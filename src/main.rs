@@ -30,6 +30,7 @@ pub mod pipeline;
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use clap::Parser;
 
 use analysis::arp_provider::ArpGuardian;
 use analysis::dns_resolver::DnsCache;
@@ -53,6 +54,27 @@ const DEFAULT_LEARNING_TIME_MINUTES: u64 = 10;
 // ── Default flow flush interval (seconds) ─────────────────────────────────
 const FLOW_FLUSH_INTERVAL_SECS: u64 = 5;
 
+#[derive(Debug, Parser)]
+#[command(name = "mcp-network-sensor")]
+#[command(about = "High-Performance NDR Pipeline", long_about = None)]
+struct Args {
+    /// Interface name to capture from
+    #[arg(short = 'i', value_name = "interface")]
+    interface: Option<String>,
+
+    /// SQLite database path (default: alerts.db)
+    #[arg(short = 'd', value_name = "db_path")]
+    db_path: Option<String>,
+
+    /// Learning time in minutes
+    #[arg(long = "learning-time", value_name = "minutes", default_value_t = DEFAULT_LEARNING_TIME_MINUTES)]
+    learning_time: u64,
+
+    /// List available interfaces
+    #[arg(short = 'l', long = "list")]
+    list_interfaces: bool,
+}
+
 fn print_usage() {
     pipeline::console_fmt::print_usage();
 }
@@ -75,68 +97,15 @@ fn main() {
         .init();
 
     // ── Parse CLI arguments ───────────────────────────────────────────
-    let args: Vec<String> = std::env::args().collect();
-    let mut interface: Option<String> = None;
-    let mut db_path: Option<String> = None;
-    let mut learning_time: u64 = DEFAULT_LEARNING_TIME_MINUTES;
-    let mut i = 1;
-
-    while i < args.len() {
-        match args[i].as_str() {
-            "-i" => {
-                if i + 1 < args.len() {
-                    interface = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Error: -i requires an interface name");
-                    print_usage();
-                    return;
-                }
-            }
-            "-d" => {
-                if i + 1 < args.len() {
-                    db_path = Some(args[i + 1].clone());
-                    i += 2;
-                } else {
-                    eprintln!("Error: -d requires a database path");
-                    print_usage();
-                    return;
-                }
-            }
-            "--learning-time" => {
-                if i + 1 < args.len() {
-                    match args[i + 1].parse::<u64>() {
-                        Ok(minutes) => {
-                            learning_time = minutes;
-                            i += 2;
-                        }
-                        Err(_) => {
-                            eprintln!("Error: --learning-time requires a number (minutes)");
-                            print_usage();
-                            return;
-                        }
-                    }
-                } else {
-                    eprintln!("Error: --learning-time requires a value in minutes");
-                    print_usage();
-                    return;
-                }
-            }
-            "-l" => {
-                list_interfaces();
-                return;
-            }
-            "-h" | "--help" => {
-                print_usage();
-                return;
-            }
-            other => {
-                eprintln!("Error: unknown argument '{}'", other);
-                print_usage();
-                return;
-            }
-        }
+    let args = Args::parse();
+    if args.list_interfaces {
+        list_interfaces();
+        return;
     }
+
+    let interface = args.interface;
+    let db_path = args.db_path;
+    let learning_time = args.learning_time;
 
     // ── Determine capture source ──────────────────────────────────────
     let (source, source_name): (Box<dyn PacketSource + Send>, String) = if let Some(iface) = interface {
