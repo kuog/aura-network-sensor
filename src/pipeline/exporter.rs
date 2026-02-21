@@ -656,51 +656,12 @@ fn alert_to_flow_metrics(alert: &MitreAlert) -> Option<FlowMetrics> {
             payload_ratio,
         })
     } else {
-        // Fallback: try legacy metadata keys (entropy, observed_entropy)
-        // Only score if we have at least entropy data
-        let entropy = alert.metadata.get("entropy")
-            .or_else(|| alert.metadata.get("observed_entropy"))
-            .and_then(|e| e.parse::<f64>().ok());
-
-        // Without any real data, skip scoring entirely
-        let entropy = entropy?;
-
-        let duration_ms = alert.metadata.get("duration_ms")
-            .and_then(|d| d.parse::<u64>().ok())
-            .unwrap_or(1000);
-        let packet_count = alert.metadata.get("packet_count")
-            .and_then(|p| p.parse::<u32>().ok())
-            .unwrap_or(10);
-        let bytes_count = alert.metadata.get("bytes_count")
-            .and_then(|b| b.parse::<u64>().ok())
-            .unwrap_or(5000);
-        let iat_mean = alert.metadata.get("iat_mean")
-            .and_then(|i| i.parse::<f64>().ok())
-            .unwrap_or(100.0);
-
-        // Compute derived features from available data
-        let bytes_per_packet = if packet_count > 0 {
-            bytes_count as f64 / packet_count as f64
-        } else {
-            0.0
-        };
-
-        Some(FlowMetrics {
-            timestamp: alert.timestamp.timestamp() as f64,
-            src_ip,
-            dst_ip,
-            src_port: alert.src_port,
-            dst_port: alert.dst_port,
-            protocol,
-            entropy,
-            duration_ms,
-            packet_count,
-            bytes_count,
-            iat_mean,
-            bytes_per_packet,
-            pkt_size_variance: 0.0,  // Unknown without real packet data
-            iat_std: 0.0,            // Unknown without real IAT data
-            payload_ratio: 0.5,      // Assume mid-range
-        })
+        // No real flow data available — skip scoring entirely.
+        //
+        // Previously this branch fabricated defaults (duration=1000ms,
+        // packet_count=10, etc.) which made all legacy-scored alerts look
+        // identical to the model, producing misleading scores.  Returning
+        // None causes the caller to tag the alert as NO_FLOW_DATA instead.
+        None
     }
 }

@@ -222,6 +222,12 @@ impl AnomalyDetector {
     ///
     /// Returns `None` if the model is not yet trained (learning phase).
     /// Returns `Some(AnomalyResult)` with the anomaly score and classification.
+    ///
+    /// Confidence is calibrated using the training score distribution:
+    /// - For **normal** flows: confidence reflects how far below the threshold
+    ///   the score is, relative to the p5 percentile of training scores.
+    /// - For **anomalous** flows: confidence reflects how far above the threshold
+    ///   the score is, relative to the p99 percentile of training scores.
     pub fn predict(&self, flow: &FlowMetrics) -> Option<AnomalyResult> {
         let model_guard = self.model.read().unwrap();
         let model = model_guard.as_ref()?;
@@ -230,12 +236,20 @@ impl AnomalyDetector {
         let score = model.score(&features);
         let is_normal = score <= model.threshold();
 
-        // Confidence: how far the score is from the threshold.
-        // Amplified by 5× (was 2×) for better separation with 12-feature model.
-        // A distance of 0.10 from threshold → confidence 0.50
-        // A distance of 0.20 from threshold → confidence 1.00
-        let distance = (score - model.threshold()).abs();
-        let confidence = (distance * 5.0).min(1.0);
+        // Percentile-based confidence calibration using training score distribution.
+        // Falls back to linear distance formula if distribution is unavailable
+        // (e.g., model loaded from an older format).
+        let confidence = if let Some(dist) = model.score_distribution() {
+            if is_normal {
+                dist.confidence_normal(score, model.threshold())
+            } else {
+                dist.confidence_anomalous(score, model.threshold())
+            }
+        } else {
+            // Legacy fallback: linear distance × 5
+            let distance = (score - model.threshold()).abs();
+            (distance * 5.0).min(1.0)
+        };
 
         Some(AnomalyResult {
             anomaly_score: score,
@@ -323,6 +337,11 @@ pub async fn background_flush_task(
                 Err(e) => {
                     warn!("[AnomalyDetector] Failed to flush flows: {}", e);
                 }
+            }
+
+            // Prune old rows to enforce retention policy
+            if let Err(e) = db::prune_old_features(&conn, db::DEFAULT_MAX_FEATURES_ROWS) {
+                warn!("[AnomalyDetector] Failed to prune old features: {}", e);
             }
         }
 

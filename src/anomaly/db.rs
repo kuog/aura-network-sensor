@@ -260,6 +260,41 @@ pub fn count_features(conn: &Connection) -> Result<u64, DbError> {
     Ok(count as u64)
 }
 
+/// Default maximum number of rows to retain in the features table.
+pub const DEFAULT_MAX_FEATURES_ROWS: u64 = 100_000;
+
+/// Prune old feature rows to keep the table within `max_rows`.
+///
+/// Deletes the oldest rows (by `id`) when the table exceeds `max_rows`.
+/// Returns the number of rows deleted.
+///
+/// This implements a sliding-window retention policy so that:
+/// - The DB doesn't grow unbounded on long-running deployments.
+/// - Training always uses the most recent data (via `ORDER BY id DESC LIMIT`).
+pub fn prune_old_features(conn: &Connection, max_rows: u64) -> Result<u64, DbError> {
+    let current = count_features(conn)?;
+    if current <= max_rows {
+        return Ok(0);
+    }
+
+    let excess = current - max_rows;
+
+    // Delete the oldest rows by id
+    conn.execute(
+        "DELETE FROM network_features WHERE id IN (
+            SELECT id FROM network_features ORDER BY id ASC LIMIT ?1
+        )",
+        params![excess as i64],
+    )?;
+
+    info!(
+        "[AnomalyDB] Pruned {} old feature rows (kept {}, limit {})",
+        excess, max_rows, max_rows
+    );
+
+    Ok(excess)
+}
+
 /// Get the database file path, creating parent directories if needed.
 pub fn ensure_db_path(base_path: &str) -> String {
     let features_db = if base_path.ends_with(".db") {
