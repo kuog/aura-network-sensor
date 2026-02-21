@@ -497,12 +497,19 @@ pub fn run(
 
                                 // ── T1071.004: DNS tunneling / anomaly detection ────
                                 if let Some(dns_report) = dns::analyze_dns(dns_data) {
+                                    // Normalize direction for alert: local = src, remote = dst
+                                    let (alert_src, alert_dst, alert_sp, alert_dp) =
+                                        normalize_alert_direction(
+                                            src_ip, dst_ip,
+                                            udp.source_port, udp.destination_port,
+                                        );
+
                                     // ── Importance-lowering: known DNS resolver ──────
                                     // DNS queries to well-known public resolvers
                                     // (Google, Cloudflare, etc.) on standard port 53
                                     // are far less likely to be tunneling.
-                                    let dst_rep = reputation::lookup_ip(&dst_ip);
-                                    let is_standard_dns = udp.destination_port == 53;
+                                    let dst_rep = reputation::lookup_ip(&alert_dst);
+                                    let is_standard_dns = alert_dp == 53;
                                     let (severity, confidence) = if dst_rep.is_trusted && is_standard_dns {
                                         // Known resolver on standard port — likely benign
                                         (Severity::Low, 20u8)
@@ -519,10 +526,10 @@ pub fn run(
                                         "Application Layer Protocol: DNS",
                                         severity,
                                         confidence,
-                                        src_ip.to_string(),
-                                        dst_ip.to_string(),
-                                        udp.source_port,
-                                        udp.destination_port,
+                                        alert_src.to_string(),
+                                        alert_dst.to_string(),
+                                        alert_sp,
+                                        alert_dp,
                                         "udp",
                                         "dns_anomaly",
                                         serde_json::to_string(&dns_report).unwrap_or_default(),
@@ -551,6 +558,28 @@ pub fn run(
     );
 }
 
+/// Normalize packet direction for alert display.
+///
+/// Raw packet src/dst reflects the wire direction, which for response packets
+/// is remote→local.  For alerts we always want the *connection initiator*
+/// (our local machine) as Source and the remote server as Destination.
+///
+/// Returns `(src_ip, dst_ip, src_port, dst_port)` in normalized order.
+fn normalize_alert_direction(
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+) -> (IpAddr, IpAddr, u16, u16) {
+    if !is_local_ip(&src_ip) && is_local_ip(&dst_ip) {
+        // Response packet (remote→local): swap to show local→remote
+        (dst_ip, src_ip, dst_port, src_port)
+    } else {
+        // Outbound packet or both-local/both-remote: keep as-is
+        (src_ip, dst_ip, src_port, dst_port)
+    }
+}
+
 /// Full TCP session analysis — extracted to keep the main loop readable.
 #[allow(clippy::too_many_arguments)]
 fn analyze_tcp(
@@ -569,6 +598,13 @@ fn analyze_tcp(
     let is_upload = is_local_ip(&src_ip);
     let packet_len = app_payload.len() as u64;
 
+    // ── Normalized direction for alerts ─────────────────────────────────
+    // The raw `src_ip`/`dst_ip` and `tcp.source_port`/`tcp.destination_port`
+    // reflect the wire direction of whichever packet triggered analysis.
+    // For alert display, we normalize so local IP = source, remote = dest.
+    let (alert_src, alert_dst, alert_sp, alert_dp) =
+        normalize_alert_direction(src_ip, dst_ip, tcp.source_port, tcp.destination_port);
+
     // ── Exfiltration detection (T1041) ────────────────────────────────
     if let Some((up, down, ratio)) = tcp_reassembler.update_stats(
         src_ip,
@@ -580,8 +616,8 @@ fn analyze_tcp(
     ) {
         // ── Importance-lowering: known provider + standard port ─────────
         let dst_rep = reputation::lookup_ip(&dst_ip);
-        let is_standard_port = reputation::is_expected_encrypted_port(tcp.destination_port)
-            || matches!(tcp.destination_port, 80 | 443 | 8080 | 8443);
+        let is_standard_port = reputation::is_expected_encrypted_port(alert_dp)
+            || matches!(alert_dp, 80 | 443 | 8080 | 8443);
         let (severity, confidence) = if dst_rep.is_trusted && is_standard_port {
             // Trusted cloud/CDN on standard port — very likely backup/sync
             (Severity::Low, 15u8)
@@ -601,10 +637,10 @@ fn analyze_tcp(
             "Exfiltration Over C2 Channel",
             severity,
             confidence,
-            src_ip.to_string(),
-            dst_ip.to_string(),
-            tcp.source_port,
-            tcp.destination_port,
+            alert_src.to_string(),
+            alert_dst.to_string(),
+            alert_sp,
+            alert_dp,
             "tcp",
             "exfiltration",
             "Asymmetric outbound flow detected",
@@ -639,23 +675,23 @@ fn analyze_tcp(
     };
 
     let entropy = telemetry::shannon_entropy(&session_data);
-    let port = tcp.destination_port;
+    let port = alert_dp;
 
     // ── T1059 Interactive Shell ────────────────────────────────────────
     if let Some(shell_result) = shell::detect_interactive_shell(
         &session_data,
-        &src_ip.to_string(),
-        &dst_ip.to_string(),
-        tcp.source_port,
-        tcp.destination_port,
+        &alert_src.to_string(),
+        &alert_dst.to_string(),
+        alert_sp,
+        alert_dp,
     ) {
         // ── Protocol-aware false-positive filter ───────────────────────
         // Inspect the reassembled payload for legitimate multimedia /
         // streaming protocol signatures before emitting a T1059 alert.
         let filter_verdict = protocol_filter::check_payload(
             &session_data,
-            tcp.source_port,
-            tcp.destination_port,
+            alert_sp,
+            alert_dp,
         );
 
         match filter_verdict {
@@ -665,8 +701,8 @@ fn analyze_tcp(
                 debug!(
                     "[Engine] T1059 suppressed: {} ({}:{} → {}:{})",
                     reason,
-                    src_ip, tcp.source_port,
-                    dst_ip, tcp.destination_port,
+                    alert_src, alert_sp,
+                    alert_dst, alert_dp,
                 );
             }
             FilterVerdict::Downgrade {
@@ -687,10 +723,10 @@ fn analyze_tcp(
                     "Command and Scripting Interpreter",
                     Severity::Low, // Downgraded to lowest severity
                     suggested_confidence,
-                    src_ip.to_string(),
-                    dst_ip.to_string(),
-                    tcp.source_port,
-                    tcp.destination_port,
+                    alert_src.to_string(),
+                    alert_dst.to_string(),
+                    alert_sp,
+                    alert_dp,
                     "tcp",
                     "interactive_shell",
                     &logic,
@@ -741,10 +777,10 @@ fn analyze_tcp(
                     "Command and Scripting Interpreter",
                     severity,
                     confidence,
-                    src_ip.to_string(),
-                    dst_ip.to_string(),
-                    tcp.source_port,
-                    tcp.destination_port,
+                    alert_src.to_string(),
+                    alert_dst.to_string(),
+                    alert_sp,
+                    alert_dp,
                     "tcp",
                     "interactive_shell",
                     &logic,
@@ -776,7 +812,7 @@ fn analyze_tcp(
     // ── T1571 Port Anomaly ────────────────────────────────────────────
     if let Some(anomaly) = matrix.check(port, entropy, &session_data) {
         // ── Importance-lowering: known provider → downgrade ─────────────
-        let dst_rep = reputation::lookup_ip(&dst_ip);
+        let dst_rep = reputation::lookup_ip(&alert_dst);
         let (severity, confidence) = if dst_rep.is_trusted {
             // Trusted provider — port anomaly is likely benign protocol variation
             (Severity::Low, 20u8)
@@ -790,10 +826,10 @@ fn analyze_tcp(
             "Non-Standard Port",
             severity,
             confidence,
-            src_ip.to_string(),
-            dst_ip.to_string(),
-            tcp.source_port,
-            tcp.destination_port,
+            alert_src.to_string(),
+            alert_dst.to_string(),
+            alert_sp,
+            alert_dp,
             "tcp",
             "port_anomaly",
             &anomaly.observation,
@@ -810,10 +846,10 @@ fn analyze_tcp(
     // in the enrichment path would be ideal, but we extract it here too
     // to keep the obfuscation module self-contained for the fast path).
     let sni_for_steg = crate::analysis::enrichment::extract_sni(&session_data);
-    let dst_ip_str = dst_ip.to_string();
+    let alert_dst_str = alert_dst.to_string();
     let steg_ctx = protocols::obfuscation::StegContext {
         sni: sni_for_steg.as_deref(),
-        dst_ip: &dst_ip_str,
+        dst_ip: &alert_dst_str,
     };
     if let Some(steg) = protocols::obfuscation::analyze_steganography_with_context(
         &session_data,
@@ -826,7 +862,7 @@ fn analyze_tcp(
         let is_tls13 = crate::analysis::context::looks_like_tls_1_3(&session_data);
         let rep_score = crate::analysis::reputation_engine::compute_contextual_score(
             100,
-            &dst_ip_str,
+            &alert_dst_str,
             port,
             sni_for_steg.as_deref(),
             &steg.pattern_type,
@@ -839,7 +875,7 @@ fn analyze_tcp(
             // the new reputation engine for contextual scoring.
             let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
                 &session_data,
-                &dst_ip_str,
+                &alert_dst_str,
                 port,
                 sni_for_steg.as_deref(),
                 steg.observed_entropy,
@@ -852,8 +888,8 @@ fn analyze_tcp(
                 // Fully suppress — log to suppressed.log for audit
                 crate::analysis::context::log_suppressed(
                     &steg.technique_id,
-                    &src_ip.to_string(),
-                    &dst_ip_str,
+                    &alert_src.to_string(),
+                    &alert_dst_str,
                     port,
                     ctx_verdict.suppression_reason.as_deref().unwrap_or("Known CDN behavior"),
                     steg.cdn_provider.as_deref(),
@@ -862,8 +898,8 @@ fn analyze_tcp(
                 debug!(
                     "[Engine] T1001 suppressed: {} ({}:{} → {}:{}) [rep_confidence={}, is_standard_tls={}]",
                     ctx_verdict.suppression_reason.as_deref().unwrap_or("CDN"),
-                    src_ip, tcp.source_port,
-                    dst_ip, tcp.destination_port,
+                    alert_src, alert_sp,
+                    alert_dst, alert_dp,
                     rep_score.confidence,
                     rep_score.is_standard_tls_feature,
                 );
@@ -882,10 +918,10 @@ fn analyze_tcp(
                     "Data Obfuscation",
                     severity,
                     rep_score.confidence,
-                    src_ip.to_string(),
-                    dst_ip.to_string(),
-                    tcp.source_port,
-                    tcp.destination_port,
+                    alert_src.to_string(),
+                    alert_dst.to_string(),
+                    alert_sp,
+                    alert_dp,
                     "tcp",
                     "obfuscation_benign",
                     &steg.reason,
@@ -926,7 +962,7 @@ fn analyze_tcp(
             // to see if relief factors should reduce severity.
             let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
                 &session_data,
-                &dst_ip_str,
+                &alert_dst_str,
                 port,
                 sni_for_steg.as_deref(),
                 steg.observed_entropy,
@@ -952,8 +988,8 @@ fn analyze_tcp(
             if effective_confidence < 30 && rep_score.dst_identity.is_known_provider() {
                 crate::analysis::context::log_suppressed(
                     &steg.technique_id,
-                    &src_ip.to_string(),
-                    &dst_ip_str,
+                    &alert_src.to_string(),
+                    &alert_dst_str,
                     port,
                     &format!("Reputation-adjusted confidence {} < 30 for {}", effective_confidence, rep_score.provider_name),
                     Some(rep_score.dst_identity.provider),
@@ -963,8 +999,8 @@ fn analyze_tcp(
                     "[Engine] T1001 suppressed (reputation): confidence={} provider={} ({}:{} → {}:{})",
                     effective_confidence,
                     rep_score.provider_name,
-                    src_ip, tcp.source_port,
-                    dst_ip, tcp.destination_port,
+                    alert_src, alert_sp,
+                    alert_dst, alert_dp,
                 );
                 // Don't emit — suppressed entirely
             } else {
@@ -973,10 +1009,10 @@ fn analyze_tcp(
                     "Data Obfuscation",
                     severity,
                     confidence,
-                    src_ip.to_string(),
-                    dst_ip.to_string(),
-                    tcp.source_port,
-                    tcp.destination_port,
+                    alert_src.to_string(),
+                    alert_dst.to_string(),
+                    alert_sp,
+                    alert_dp,
                     "tcp",
                     "obfuscation_detected",
                     &steg.reason,
@@ -1004,13 +1040,13 @@ fn analyze_tcp(
     }
 
     // ── T1039 SMB/RPC Anomaly ─────────────────────────────────────────
-    if tcp.source_port == 445 || tcp.destination_port == 445 {
+    if alert_sp == 445 || alert_dp == 445 {
         let anomalies = smb_tracker.analyze_smb(
             &session_data,
-            &src_ip.to_string(),
-            &dst_ip.to_string(),
-            tcp.source_port,
-            tcp.destination_port,
+            &alert_src.to_string(),
+            &alert_dst.to_string(),
+            alert_sp,
+            alert_dp,
         );
         for smb_anomaly in anomalies {
             // ── Importance-lowering: local-to-local SMB on standard port ──
@@ -1028,10 +1064,10 @@ fn analyze_tcp(
                 "Data from Network Shared Drive",
                 severity,
                 confidence,
-                src_ip.to_string(),
-                dst_ip.to_string(),
-                tcp.source_port,
-                tcp.destination_port,
+                alert_src.to_string(),
+                alert_dst.to_string(),
+                alert_sp,
+                alert_dp,
                 "tcp",
                 "smb_anomaly",
                 serde_json::to_string(&smb_anomaly).unwrap_or_default(),
@@ -1045,15 +1081,15 @@ fn analyze_tcp(
     // ── T1071.001 HTTP Anomaly ────────────────────────────────────────
     if let Some(_http_report) = protocols::http::analyze_http(
         &session_data,
-        &src_ip.to_string(),
-        &dst_ip.to_string(),
-        tcp.source_port,
-        tcp.destination_port,
+        &alert_src.to_string(),
+        &alert_dst.to_string(),
+        alert_sp,
+        alert_dp,
     ) {
         // ── Importance-lowering ─────────────────────────────────────────
         let both_local = is_local_ip(&src_ip) && is_local_ip(&dst_ip);
-        let dst_rep = reputation::lookup_ip(&dst_ip);
-        let is_standard_http = matches!(tcp.destination_port, 80 | 443 | 8080 | 8443);
+        let dst_rep = reputation::lookup_ip(&alert_dst);
+        let is_standard_http = matches!(alert_dp, 80 | 443 | 8080 | 8443);
 
         let (severity, confidence) = if both_local {
             // Local-to-local HTTP (AirPlay, mDNS-SD, IoT, etc.) — almost
@@ -1075,10 +1111,10 @@ fn analyze_tcp(
             "Application Layer Protocol: Web Protocols",
             severity,
             confidence,
-            src_ip.to_string(),
-            dst_ip.to_string(),
-            tcp.source_port,
-            tcp.destination_port,
+            alert_src.to_string(),
+            alert_dst.to_string(),
+            alert_sp,
+            alert_dp,
             "tcp",
             "http_anomaly",
             "HTTP anomaly detected",
@@ -1092,18 +1128,18 @@ fn analyze_tcp(
     // ── T1562.001 SSL Stripping ───────────────────────────────────────
     if let Some(_stripping_alert) = protocols::stripping::analyze(
         &session_data,
-        &src_ip.to_string(),
-        &dst_ip.to_string(),
-        tcp.source_port,
-        tcp.destination_port,
+        &alert_src.to_string(),
+        &alert_dst.to_string(),
+        alert_sp,
+        alert_dp,
     ) {
         // ── Importance-lowering: known provider + standard port ─────────
         // SSL stripping from a trusted CDN/cloud provider on port 80/443
         // is almost certainly a legitimate HTTP→HTTPS redirect, not an attack.
-        let dst_rep = reputation::lookup_ip(&dst_ip);
-        let src_rep = reputation::lookup_ip(&src_ip);
-        let is_standard_http = matches!(tcp.destination_port, 80 | 443 | 8080 | 8443)
-            || matches!(tcp.source_port, 80 | 443 | 8080 | 8443);
+        let dst_rep = reputation::lookup_ip(&alert_dst);
+        let src_rep = reputation::lookup_ip(&alert_src);
+        let is_standard_http = matches!(alert_dp, 80 | 443 | 8080 | 8443)
+            || matches!(alert_sp, 80 | 443 | 8080 | 8443);
         let either_trusted = dst_rep.is_trusted || src_rep.is_trusted;
         let (severity, confidence) = if either_trusted && is_standard_http {
             // Trusted provider on standard HTTP port — likely legitimate redirect
@@ -1121,10 +1157,10 @@ fn analyze_tcp(
             "Impair Defenses: SSL Stripping",
             severity,
             confidence,
-            src_ip.to_string(),
-            dst_ip.to_string(),
-            tcp.source_port,
-            tcp.destination_port,
+            alert_src.to_string(),
+            alert_dst.to_string(),
+            alert_sp,
+            alert_dp,
             "tcp",
             "ssl_stripping",
             "SSL stripping attack detected",
@@ -1149,10 +1185,10 @@ fn analyze_tcp(
                 "Encrypted Channel: Asymmetric Cryptography",
                 Severity::Critical,
                 95,
-                src_ip.to_string(),
-                dst_ip.to_string(),
-                tcp.source_port,
-                tcp.destination_port,
+                alert_src.to_string(),
+                alert_dst.to_string(),
+                alert_sp,
+                alert_dp,
                 "tcp",
                 "known_malware_ja3",
                 "Known Meterpreter JA3 fingerprint detected",
@@ -1163,15 +1199,15 @@ fn analyze_tcp(
     }
 
     // Expand "standard TLS" to include all well-known encrypted ports
-    let is_standard_encrypted = reputation::is_expected_encrypted_port(tcp.source_port)
-        || reputation::is_expected_encrypted_port(tcp.destination_port);
+    let is_standard_encrypted = reputation::is_expected_encrypted_port(alert_sp)
+        || reputation::is_expected_encrypted_port(alert_dp);
     let high_entropy_trigger = entropy > 7.5 && !is_standard_encrypted;
 
     if high_entropy_trigger || ja3_hash_str.is_some() || is_beaconing {
         // ── Step 1: Context Enrichment (SNI + domain reputation) ───────
         let scoring_input = ScoringInput {
             tls_payload: &session_data,
-            dst_port: tcp.destination_port,
+            dst_port: alert_dp,
             is_beaconing,
             session_data: &session_data,
         };
@@ -1180,9 +1216,9 @@ fn analyze_tcp(
 
         // ── Step 1b: IP Reputation Lookup ─────────────────────────────
         let flow_rep = reputation::evaluate_flow(
-            &src_ip.to_string(),
-            &dst_ip.to_string(),
-            tcp.destination_port,
+            &alert_src.to_string(),
+            &alert_dst.to_string(),
+            alert_dp,
             sni_ref,
         );
 
@@ -1190,8 +1226,8 @@ fn analyze_tcp(
         // Also compute reputation engine score for enriched metadata
         let t1573_rep_score = crate::analysis::reputation_engine::compute_contextual_score(
             100,
-            &dst_ip.to_string(),
-            tcp.destination_port,
+            &alert_dst.to_string(),
+            alert_dp,
             sni_ref,
             "encrypted_channel",
             crate::analysis::context::looks_like_tls_1_3(&session_data),
@@ -1200,7 +1236,7 @@ fn analyze_tcp(
         if high_entropy_trigger || (entropy > 7.5 && is_standard_encrypted) {
             let verdict = reputation::adjust_t1573(
                 &flow_rep,
-                tcp.destination_port,
+                alert_dp,
                 entropy,
                 sni_ref,
             );
@@ -1211,8 +1247,8 @@ fn analyze_tcp(
                     debug!(
                         "[Engine] T1573 suppressed: {} ({}:{} → {}:{})",
                         reason,
-                        src_ip, tcp.source_port,
-                        dst_ip, tcp.destination_port,
+                        alert_src, alert_sp,
+                        alert_dst, alert_dp,
                     );
                 }
                 ReputationVerdict::Downgrade { reason } => {
@@ -1227,10 +1263,10 @@ fn analyze_tcp(
                         "Encrypted Channel",
                         severity,
                         0,
-                        src_ip.to_string(),
-                        dst_ip.to_string(),
-                        tcp.source_port,
-                        tcp.destination_port,
+                        alert_src.to_string(),
+                        alert_dst.to_string(),
+                        alert_sp,
+                        alert_dp,
                         "tcp",
                         "high_entropy",
                         &reason,
@@ -1270,10 +1306,10 @@ fn analyze_tcp(
                         "Encrypted Channel",
                         severity,
                         confidence,
-                        src_ip.to_string(),
-                        dst_ip.to_string(),
-                        tcp.source_port,
-                        tcp.destination_port,
+                        alert_src.to_string(),
+                        alert_dst.to_string(),
+                        alert_sp,
+                        alert_dp,
                         "tcp",
                         "high_entropy",
                         &reason,
@@ -1302,16 +1338,16 @@ fn analyze_tcp(
                         76..=89 => Severity::High,
                         _ => Severity::Critical,
                     };
-                    let is_standard = reputation::is_expected_encrypted_port(tcp.destination_port);
+                    let is_standard = reputation::is_expected_encrypted_port(alert_dp);
                     let logic_desc = if is_standard {
                         format!(
                             "High-entropy encrypted payload to unknown provider on port {} ({})",
-                            tcp.destination_port, flow_rep.port_service,
+                            alert_dp, flow_rep.port_service,
                         )
                     } else {
                         format!(
                             "Encrypted payload on non-standard port {}",
-                            tcp.destination_port,
+                            alert_dp,
                         )
                     };
                     let mut alert = MitreAlert::new(
@@ -1319,10 +1355,10 @@ fn analyze_tcp(
                         "Encrypted Channel",
                         severity,
                         enrichment_result.confidence_score,
-                        src_ip.to_string(),
-                        dst_ip.to_string(),
-                        tcp.source_port,
-                        tcp.destination_port,
+                        alert_src.to_string(),
+                        alert_dst.to_string(),
+                        alert_sp,
+                        alert_dp,
                         "tcp",
                         "high_entropy",
                         &logic_desc,
@@ -1350,8 +1386,8 @@ fn analyze_tcp(
             // ── Importance-lowering: trusted provider + standard port ───
             // Beaconing to known cloud/CDN on standard encrypted ports is
             // almost always legitimate keep-alive / polling traffic.
-            let is_standard_port = reputation::is_expected_encrypted_port(tcp.destination_port)
-                || matches!(tcp.destination_port, 80 | 8080 | 8443);
+            let is_standard_port = reputation::is_expected_encrypted_port(alert_dp)
+                || matches!(alert_dp, 80 | 8080 | 8443);
             let effective_confidence = if flow_rep.is_whitelisted {
                 // Whitelisted flow (trusted IP + expected port, or trusted SNI on 443)
                 enrichment_result.confidence_score.min(10)
@@ -1389,10 +1425,10 @@ fn analyze_tcp(
                 "Exfiltration Over Other Network Medium",
                 severity,
                 effective_confidence,
-                src_ip.to_string(),
-                dst_ip.to_string(),
-                tcp.source_port,
-                tcp.destination_port,
+                alert_src.to_string(),
+                alert_dst.to_string(),
+                alert_sp,
+                alert_dp,
                 "tcp",
                 "beaconing",
                 logic,
@@ -1440,9 +1476,17 @@ fn enrich_alert_with_flow_metrics(
             _ => return,
         };
 
-        if let Some(metrics) = flow_tracker.peek_metrics(
-            src, dst, alert.src_port, alert.dst_port, protocol,
-        ) {
+        // Try both directions since alert IPs are normalized (local=src)
+        // but the flow may have been recorded with the raw packet direction.
+        let metrics_opt = flow_tracker
+            .peek_metrics(src, dst, alert.src_port, alert.dst_port, protocol)
+            .or_else(|| {
+                flow_tracker.peek_metrics(
+                    dst, src, alert.dst_port, alert.src_port, protocol,
+                )
+            });
+
+        if let Some(metrics) = metrics_opt {
             alert.metadata.insert("flow_entropy".to_string(), format!("{:.4}", metrics.entropy));
             alert.metadata.insert("flow_duration_ms".to_string(), metrics.duration_ms.to_string());
             alert.metadata.insert("flow_packet_count".to_string(), metrics.packet_count.to_string());
