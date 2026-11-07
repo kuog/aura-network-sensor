@@ -70,9 +70,31 @@ Use a separate target directory so the Linux and macOS builds don't share
 `target/`:
 
 ```bash
-orb -m mcp-sensor bash -lc 'CARGO_TARGET_DIR=$HOME/.cache/mcp-target cargo build --release --features ebpf'
+orb -m mcp-sensor bash -lc 'CARGO_TARGET_DIR=$HOME/.cache/mcp-sensor-target cargo build --release --features ebpf'
 ```
 
 ```bash
-orb -m mcp-sensor bash -lc 'sudo $HOME/.cache/mcp-target/release/mcp-network-sensor -i eth0'
+orb -m mcp-sensor bash -lc 'sudo $HOME/.cache/mcp-sensor-target/release/mcp-network-sensor -i eth0'
+```
+
+## Editing and compiling BPF code
+
+`cargo build --features ebpf` hands clang the libbpf headers and `vmlinux.h`
+itself. For editors and for running clang by hand, collect the same headers
+into `target/bpf-include` (re-run after updating libbpf-rs or vmlinux):
+
+```bash
+scripts/bpf-headers.sh            # host arch; or: scripts/bpf-headers.sh x86_64
+```
+
+VSCode (C/C++ extension) picks them up through `.vscode/c_cpp_properties.json`;
+reload the window after the first run. The config targets arm64 — on x86_64,
+run the script with `x86_64` and change `__TARGET_ARCH_arm64` to
+`__TARGET_ARCH_x86`.
+
+Apple clang has no BPF backend, so compile a single program by hand in the
+Linux machine (or with LLVM from Homebrew):
+
+```bash
+orb -m mcp-sensor bash -lc 'clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 -fno-stack-protector -Wno-missing-declarations -I target/bpf-include -c src/bpf/flowfilter.bpf.c -o /tmp/flowfilter.bpf.o'
 ```

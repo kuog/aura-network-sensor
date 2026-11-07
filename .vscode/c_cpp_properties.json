@@ -1,0 +1,21 @@
+{
+  "configurations": [
+    {
+      "name": "BPF (Linux, arm64)",
+      "includePath": [
+        "${workspaceFolder}/src/bpf",
+        "${workspaceFolder}/target/bpf-include"
+      ],
+      "defines": [
+        "__TARGET_ARCH_arm64",
+        "__builtin_preserve_access_index(x)=(x)",
+        "__typeof_unqual__=typeof"
+      ],
+      "compilerPath": "/usr/bin/clang",
+      "compilerArgs": ["--target=aarch64-unknown-linux-gnu"],
+      "cStandard": "gnu17",
+      "intelliSenseMode": "linux-clang-arm64"
+    }
+  ],
+  "version": 4
+}
