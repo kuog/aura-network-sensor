@@ -60,5 +60,15 @@ rand = "0.8"
 # Serialization for ML model persistence
 bincode = "1"
 
+[features]
+# Linux-only eBPF sensing: process attribution, reverse-shell detection and
+# in-kernel flow accounting. Building it needs clang, libelf and zlib.
+ebpf = ["dep:libbpf-rs", "dep:libbpf-cargo", "dep:vmlinux"]
+
 [target.'cfg(target_os = "linux")'.dependencies]
-pnet = "0.35"
+libbpf-rs = { version = "0.27", optional = true }
+
+[build-dependencies]
+libbpf-cargo = { version = "0.27", optional = true }
+# Pre-generated vmlinux.h per architecture; CO-RE adapts it to the running kernel.
+vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "c32912840154a82205530cd6d498b346ac73a6d1", optional = true }

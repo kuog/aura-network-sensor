@@ -405,10 +405,14 @@ fn print_stat_line(category: &str, entries: &[(&str, &str, bool)]) {
 }
 
 /// Print a colored shutdown summary.
+#[allow(clippy::too_many_arguments)]
 pub fn print_shutdown_summary(
     captured: u64,
     dropped: u64,
+    kernel_dropped: u64,
+    if_dropped: u64,
     analyzed: u64,
+    parse_errors: u64,
     alerts: u64,
     console_writes: u64,
     db_writes: u64,
@@ -443,11 +447,22 @@ pub fn print_shutdown_summary(
     print_stat_line("Sniffer ", &[
         ("Captured", &captured.to_string(), true),
         ("Dropped", &dropped.to_string(), dropped == 0),
+        ("Kernel drops", &kernel_dropped.to_string(), kernel_dropped == 0),
     ]);
+    if if_dropped > 0 {
+        print_stat_line("        ", &[
+            ("NIC drops", &if_dropped.to_string(), false),
+        ]);
+    }
     print_stat_line("Engine  ", &[
         ("Analyzed", &analyzed.to_string(), true),
         ("Alerts", &alerts.to_string(), true),
     ]);
+    if parse_errors > 0 {
+        print_stat_line("        ", &[
+            ("Parse errors", &parse_errors.to_string(), false),
+        ]);
+    }
     print_stat_line("Exporter", &[
         ("Console", &console_writes.to_string(), true),
         ("DB", &db_writes.to_string(), true),

@@ -400,7 +400,11 @@ fn reverse_lookup_blocking(ip: IpAddr) -> Option<String> {
             let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
             sa.sin_family = libc::AF_INET as libc::sa_family_t;
             sa.sin_addr.s_addr = u32::from_ne_bytes(octets);
-            sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            // BSD-family sockaddrs carry their own length; Linux has no such field.
+            #[cfg(target_os = "macos")]
+            {
+                sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            }
             unsafe {
                 libc::getnameinfo(
                     &sa as *const libc::sockaddr_in as *const libc::sockaddr,
@@ -418,7 +422,10 @@ fn reverse_lookup_blocking(ip: IpAddr) -> Option<String> {
             let mut sa: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
             sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sa.sin6_addr.s6_addr = octets;
-            sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            #[cfg(target_os = "macos")]
+            {
+                sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            }
             unsafe {
                 libc::getnameinfo(
                     &sa as *const libc::sockaddr_in6 as *const libc::sockaddr,

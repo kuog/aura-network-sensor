@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use super::db;
-use super::flow_tracker::FlowTracker;
+use super::flow_tracker::FlowAccounting;
 use super::isolation_forest::{IsolationForest, IsolationForestConfig};
 use super::types::{AnomalyResult, DetectorPhase, FlowMetrics};
 
@@ -288,7 +288,7 @@ impl AnomalyDetector {
 /// * `flush_interval_secs` — How often to flush completed flows (default: 5s).
 pub async fn background_flush_task(
     detector: Arc<AnomalyDetector>,
-    flow_tracker: Arc<FlowTracker>,
+    flow_tracker: Arc<dyn FlowAccounting>,
     db_path: String,
     running: Arc<AtomicBool>,
     flush_interval_secs: u64,

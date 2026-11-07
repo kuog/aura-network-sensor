@@ -2,6 +2,24 @@ use std::net::IpAddr;
 use lru::LruCache;
 use std::num::NonZeroUsize;
 
+/// T1041: minimum payload uploaded within one TCP connection (50 MiB)...
+pub const EXFIL_MIN_UPLOAD_BYTES: u64 = 50 * 1024 * 1024;
+/// ...and minimum upload/download ratio.
+pub const EXFIL_MIN_RATIO: f64 = 10.0;
+
+/// The upload/download ratio if a connection crossed the T1041 thresholds.
+pub fn exfil_ratio(uploaded: u64, downloaded: u64) -> Option<f64> {
+    if uploaded <= EXFIL_MIN_UPLOAD_BYTES {
+        return None;
+    }
+    let ratio = if downloaded > 0 {
+        uploaded as f64 / downloaded as f64
+    } else {
+        uploaded as f64 // Treat 0 download as high ratio
+    };
+    (ratio > EXFIL_MIN_RATIO).then_some(ratio)
+}
+
 #[derive(Hash, PartialEq, Eq, Clone, Debug)]
 pub struct FlowKey {
     pub src: IpAddr,
@@ -68,15 +86,8 @@ impl Reassembler {
         }
 
         // Check for Exfiltration (T1041)
-        // Thresholds: > 50MB Uploaded AND Ratio > 10.0
-        if !stream.is_exfil_alerted && stream.bytes_uploaded > 50 * 1024 * 1024 {
-            let ratio = if stream.bytes_downloaded > 0 {
-                stream.bytes_uploaded as f64 / stream.bytes_downloaded as f64
-            } else {
-                stream.bytes_uploaded as f64 // Treat 0 download as high ratio
-            };
-
-            if ratio > 10.0 {
+        if !stream.is_exfil_alerted {
+            if let Some(ratio) = exfil_ratio(stream.bytes_uploaded, stream.bytes_downloaded) {
                 stream.is_exfil_alerted = true;
                 return Some((stream.bytes_uploaded, stream.bytes_downloaded, ratio));
             }

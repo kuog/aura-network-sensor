@@ -12,6 +12,49 @@ pub fn shannon_entropy(data: &[u8]) -> f64 {
         }).sum()
 }
 
+/// Byte-frequency histogram: a constant-memory replacement for buffering
+/// payload bytes just to compute [`shannon_entropy`] over them later.
+#[derive(Debug, Clone)]
+pub struct ByteHistogram {
+    counts: [u32; 256],
+    total: u64,
+}
+
+impl Default for ByteHistogram {
+    fn default() -> Self {
+        Self { counts: [0; 256], total: 0 }
+    }
+}
+
+impl ByteHistogram {
+    /// Count bytes from `data`, stopping once `limit` bytes were counted in total.
+    pub fn add(&mut self, data: &[u8], limit: usize) {
+        let room = (limit as u64).saturating_sub(self.total) as usize;
+        let take = data.len().min(room);
+        for &b in &data[..take] {
+            self.counts[b as usize] += 1;
+        }
+        self.total += take as u64;
+    }
+
+    /// Number of bytes counted so far.
+    pub fn total(&self) -> u64 {
+        self.total
+    }
+
+    /// Shannon entropy of the counted bytes — the same value
+    /// [`shannon_entropy`] returns for those bytes.
+    pub fn entropy(&self) -> f64 {
+        if self.total == 0 { return 0.0; }
+        let len = self.total as f64;
+        self.counts.iter().filter(|&&c| c > 0)
+            .map(|&c| {
+                let p = c as f64 / len;
+                -p * p.log2()
+            }).sum()
+    }
+}
+
 /// Calculates the Coefficient of Variation (CV) for packet intervals.
 /// A very low CV (close to 0) means the timing is mechanical (Beaconing).
 pub fn calculate_jitter_score(intervals: &[f64]) -> f64 {

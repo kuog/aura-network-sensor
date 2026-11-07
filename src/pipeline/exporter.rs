@@ -19,6 +19,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::analysis::dns_resolver::{self, DnsCache};
 use crate::analysis::dns_tracker::{self, DnsTracker};
 use crate::analysis::enrichment;
+use crate::analysis::process::{self, ProcessLookup};
 use crate::analysis::reputation;
 use crate::anomaly::detector::AnomalyDetector;
 use crate::anomaly::types::{DetectorPhase, FlowMetrics, Protocol};
@@ -153,6 +154,7 @@ pub async fn run(
     dns_tracker: Arc<DnsTracker>,
     dns_cache: Arc<DnsCache>,
     anomaly_detector: Arc<AnomalyDetector>,
+    process_lookup: Option<Arc<dyn ProcessLookup>>,
 ) {
     let db_file = db_path.unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
 
@@ -173,6 +175,13 @@ pub async fn run(
     // ── Main drain loop ───────────────────────────────────────────────
     while let Some(mut alert) = rx.recv().await {
         alert_count += 1;
+
+        // ── Process context (eBPF connection attribution) ─────────────
+        // Done here rather than in the engine: by now the connect/accept
+        // event has had time to arrive from the kernel.
+        if let Some(lookup) = &process_lookup {
+            process::enrich_alert(lookup.as_ref(), &mut alert);
+        }
 
         // ── AI-driven Alert Suppression (Isolation Forest) ─────────────
         apply_anomaly_suppression(&mut alert, &anomaly_detector);

@@ -13,136 +13,124 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::types::{FlowKey, FlowMetrics, Protocol};
-use crate::telemetry;
+use crate::telemetry::ByteHistogram;
 
 /// Default flow timeout in seconds.
 const DEFAULT_FLOW_TIMEOUT_SECS: u64 = 60;
 
+/// Running mean/variance (Welford) — constant memory, numerically stable.
+#[derive(Debug, Default, Clone, Copy)]
+struct RunningStats {
+    n: u64,
+    mean: f64,
+    m2: f64,
+}
+
+impl RunningStats {
+    fn push(&mut self, x: f64) {
+        self.n += 1;
+        let delta = x - self.mean;
+        self.mean += delta / self.n as f64;
+        self.m2 += delta * (x - self.mean);
+    }
+
+    fn mean(&self) -> f64 {
+        if self.n == 0 { 0.0 } else { self.mean }
+    }
+
+    /// Sample variance (n − 1 denominator); 0 with fewer than two samples.
+    fn sample_variance(&self) -> f64 {
+        if self.n < 2 { 0.0 } else { self.m2 / (self.n - 1) as f64 }
+    }
+}
+
 /// Internal state for a tracked flow.
 #[derive(Debug)]
 struct FlowState {
-    /// When the first packet of this flow was seen.
-    first_seen: Instant,
-    /// When the last packet of this flow was seen.
+    /// Wall-clock time of the last packet — used only for idle timeouts.
     last_seen: Instant,
-    /// Timestamp of the first packet (epoch seconds from pcap).
+    /// Capture timestamp of the first packet (epoch seconds).
     first_timestamp: f64,
+    /// Latest capture timestamp seen in this flow (epoch seconds).
+    last_timestamp: f64,
     /// Total number of packets.
     packet_count: u32,
     /// Total bytes transferred (including headers).
     bytes_count: u64,
     /// Total payload bytes transferred (excluding headers).
     payload_bytes: u64,
-    /// Concatenated payload bytes (capped for entropy calculation).
-    payload_sample: Vec<u8>,
-    /// Individual packet sizes for variance calculation (capped).
-    packet_sizes: Vec<u64>,
+    /// Byte histogram of the first `MAX_PAYLOAD_SAMPLE` payload bytes (entropy).
+    payload_hist: ByteHistogram,
+    /// Packet sizes (bytes), over every packet of the flow.
+    sizes: RunningStats,
     /// Inter-arrival times between consecutive packets (milliseconds).
-    inter_arrival_times: Vec<f64>,
+    iats: RunningStats,
     /// Whether a TCP FIN was observed.
     fin_seen: bool,
     /// Whether a TCP RST was observed.
     rst_seen: bool,
 }
 
-/// Maximum payload sample size for entropy calculation (64 KB).
+/// Payload bytes per flow that feed the entropy feature (64 KB).
 const MAX_PAYLOAD_SAMPLE: usize = 65_536;
-
-/// Maximum number of individual packet sizes to track for variance calculation.
-const MAX_PACKET_SIZES_TRACKED: usize = 1024;
 
 impl FlowState {
     fn new(timestamp: f64) -> Self {
-        let now = Instant::now();
         Self {
-            first_seen: now,
-            last_seen: now,
+            last_seen: Instant::now(),
             first_timestamp: timestamp,
+            last_timestamp: timestamp,
             packet_count: 0,
             bytes_count: 0,
             payload_bytes: 0,
-            payload_sample: Vec::with_capacity(4096),
-            packet_sizes: Vec::with_capacity(64),
-            inter_arrival_times: Vec::with_capacity(64),
+            payload_hist: ByteHistogram::default(),
+            sizes: RunningStats::default(),
+            iats: RunningStats::default(),
             fin_seen: false,
             rst_seen: false,
         }
     }
 
-    /// Update the flow state with a new packet.
-    fn update(&mut self, payload_len: u64, payload: Option<&[u8]>) {
-        let now = Instant::now();
-
-        // Calculate inter-arrival time
+    /// Update the flow state with a new packet captured at `timestamp`.
+    fn update(&mut self, payload_len: u64, payload: Option<&[u8]>, timestamp: f64) {
+        // Inter-arrival time from capture timestamps, not processing time, so
+        // queueing inside the pipeline does not distort it. Timestamps from
+        // different CPUs can be slightly out of order: never go negative.
         if self.packet_count > 0 {
-            let iat_ms = now.duration_since(self.last_seen).as_secs_f64() * 1000.0;
-            self.inter_arrival_times.push(iat_ms);
+            let iat_ms = ((timestamp - self.last_timestamp) * 1000.0).max(0.0);
+            self.iats.push(iat_ms);
         }
+        self.last_timestamp = self.last_timestamp.max(timestamp);
+        self.last_seen = Instant::now();
 
-        self.last_seen = now;
-        self.packet_count += 1;
+        self.packet_count = self.packet_count.saturating_add(1);
         self.bytes_count += payload_len;
+        self.sizes.push(payload_len as f64);
 
-        // Track individual packet sizes for variance calculation
-        if self.packet_sizes.len() < MAX_PACKET_SIZES_TRACKED {
-            self.packet_sizes.push(payload_len);
-        }
-
-        // Collect payload sample for entropy calculation
         if let Some(data) = payload {
             self.payload_bytes += data.len() as u64;
-            let remaining = MAX_PAYLOAD_SAMPLE.saturating_sub(self.payload_sample.len());
-            if remaining > 0 {
-                let take = data.len().min(remaining);
-                self.payload_sample.extend_from_slice(&data[..take]);
-            }
+            self.payload_hist.add(data, MAX_PAYLOAD_SAMPLE);
         }
     }
 
-    /// Calculate the duration of this flow in milliseconds.
+    /// Duration of this flow in milliseconds (capture time).
     fn duration_ms(&self) -> u64 {
-        self.last_seen
-            .duration_since(self.first_seen)
-            .as_millis() as u64
+        ((self.last_timestamp - self.first_timestamp) * 1000.0).max(0.0).round() as u64
     }
 
-    /// Calculate the mean inter-arrival time in milliseconds.
+    /// Mean inter-arrival time in milliseconds.
     fn iat_mean(&self) -> f64 {
-        if self.inter_arrival_times.is_empty() {
-            return 0.0;
-        }
-        let sum: f64 = self.inter_arrival_times.iter().sum();
-        sum / self.inter_arrival_times.len() as f64
+        self.iats.mean()
     }
 
-    /// Calculate the standard deviation of inter-arrival times (milliseconds).
+    /// Standard deviation of inter-arrival times (milliseconds).
     fn iat_std(&self) -> f64 {
-        if self.inter_arrival_times.len() < 2 {
-            return 0.0;
-        }
-        let mean = self.iat_mean();
-        let variance: f64 = self
-            .inter_arrival_times
-            .iter()
-            .map(|&t| (t - mean).powi(2))
-            .sum::<f64>()
-            / (self.inter_arrival_times.len() as f64 - 1.0);
-        variance.sqrt()
+        self.iats.sample_variance().sqrt()
     }
 
-    /// Calculate the variance of packet sizes (bytes²).
+    /// Variance of packet sizes (bytes²).
     fn pkt_size_variance(&self) -> f64 {
-        if self.packet_sizes.len() < 2 {
-            return 0.0;
-        }
-        let mean = self.packet_sizes.iter().sum::<u64>() as f64 / self.packet_sizes.len() as f64;
-        let variance: f64 = self
-            .packet_sizes
-            .iter()
-            .map(|&s| (s as f64 - mean).powi(2))
-            .sum::<f64>()
-            / (self.packet_sizes.len() as f64 - 1.0);
-        variance
+        self.sizes.sample_variance()
     }
 
     /// Calculate average bytes per packet.
@@ -163,7 +151,7 @@ impl FlowState {
 
     /// Convert to FlowMetrics for persistence and ML inference.
     fn to_metrics(&self, key: &FlowKey) -> FlowMetrics {
-        let entropy = telemetry::shannon_entropy(&self.payload_sample);
+        let entropy = self.payload_hist.entropy();
 
         FlowMetrics {
             timestamp: self.first_timestamp,
@@ -182,6 +170,102 @@ impl FlowState {
             iat_std: self.iat_std(),
             payload_ratio: self.payload_ratio(),
         }
+    }
+}
+
+/// Per-flow accounting behind the anomaly features.
+///
+/// The engine records packets and peeks at live flows; the anomaly
+/// background task flushes completed ones. Implemented in userspace by
+/// [`FlowTracker`] and, on Linux with the `ebpf` feature, by an in-kernel
+/// tracker that sees every frame while userspace only receives each flow's
+/// DPI window.
+pub trait FlowAccounting: Send + Sync {
+    /// Record a captured packet. Returns `true` if it opened a new flow.
+    #[allow(clippy::too_many_arguments)]
+    fn record_packet(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: Protocol,
+        payload_len: u64,
+        payload: Option<&[u8]>,
+        timestamp: f64,
+        tcp_fin: bool,
+        tcp_rst: bool,
+    ) -> bool;
+
+    /// Current metrics of a live flow, without removing it.
+    fn peek_metrics(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: Protocol,
+    ) -> Option<FlowMetrics>;
+
+    /// Remove and return flows that ended (idle timeout or TCP FIN/RST).
+    fn flush_completed(&self) -> Vec<FlowMetrics>;
+
+    /// Remove and return every flow (shutdown).
+    fn flush_all(&self) -> Vec<FlowMetrics>;
+
+    /// Number of flows currently tracked.
+    fn active_count(&self) -> usize;
+
+    /// Payload byte totals of live TCP flows, per direction, from the latest
+    /// flush; taking a snapshot consumes it. `None` when there is no new
+    /// snapshot — always, for trackers fed by the packet path, where the
+    /// engine counts exfiltration bytes itself.
+    fn take_tcp_payload_totals(&self) -> Option<Vec<(FlowKey, u64)>> {
+        None
+    }
+}
+
+impl FlowAccounting for FlowTracker {
+    fn record_packet(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: Protocol,
+        payload_len: u64,
+        payload: Option<&[u8]>,
+        timestamp: f64,
+        tcp_fin: bool,
+        tcp_rst: bool,
+    ) -> bool {
+        FlowTracker::record_packet(
+            self, src_ip, dst_ip, src_port, dst_port, protocol, payload_len, payload, timestamp,
+            tcp_fin, tcp_rst,
+        )
+    }
+
+    fn peek_metrics(
+        &self,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: Protocol,
+    ) -> Option<FlowMetrics> {
+        FlowTracker::peek_metrics(self, src_ip, dst_ip, src_port, dst_port, protocol)
+    }
+
+    fn flush_completed(&self) -> Vec<FlowMetrics> {
+        FlowTracker::flush_completed(self)
+    }
+
+    fn flush_all(&self) -> Vec<FlowMetrics> {
+        FlowTracker::flush_all(self)
+    }
+
+    fn active_count(&self) -> usize {
+        FlowTracker::active_count(self)
     }
 }
 
@@ -263,7 +347,7 @@ impl FlowTracker {
                 FlowState::new(timestamp)
             });
 
-        entry.update(payload_len, payload);
+        entry.update(payload_len, payload, timestamp);
 
         if tcp_fin {
             entry.fin_seen = true;
@@ -364,5 +448,68 @@ impl FlowTracker {
     /// Number of currently active flows.
     pub fn active_count(&self) -> usize {
         self.flows.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::shannon_entropy;
+    use std::net::Ipv4Addr;
+
+    const BASE: f64 = 1_700_000_000.0;
+
+    fn ip(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, last))
+    }
+
+    fn record(t: &FlowTracker, size: u64, payload: &[u8], ts: f64) {
+        t.record_packet(ip(1), ip(2), 40000, 443, Protocol::Tcp, size, Some(payload), ts, false, false);
+    }
+
+    fn metrics(t: &FlowTracker) -> FlowMetrics {
+        t.peek_metrics(ip(1), ip(2), 40000, 443, Protocol::Tcp).expect("flow exists")
+    }
+
+    #[test]
+    fn timing_comes_from_capture_timestamps() {
+        let t = FlowTracker::new();
+        // Gaps of 10, 20 and 30 ms, recorded back-to-back in wall-clock time.
+        for (size, offset) in [(100, 0.0), (110, 0.010), (120, 0.030), (130, 0.060)] {
+            record(&t, size, b"x", BASE + offset);
+        }
+        let m = metrics(&t);
+        assert_eq!(m.packet_count, 4);
+        assert_eq!(m.duration_ms, 60);
+        assert!((m.timestamp - BASE).abs() < 1e-9);
+        assert!((m.iat_mean - 20.0).abs() < 1e-3, "iat_mean = {}", m.iat_mean);
+        assert!((m.iat_std - 10.0).abs() < 1e-3, "iat_std = {}", m.iat_std);
+        // Sample variance of 100, 110, 120, 130.
+        assert!((m.pkt_size_variance - 500.0 / 3.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn out_of_order_timestamps_never_give_negative_gaps() {
+        let t = FlowTracker::new();
+        record(&t, 100, b"x", BASE + 1.0);
+        record(&t, 100, b"x", BASE + 0.5); // reordered: gap clamped to 0
+        record(&t, 100, b"x", BASE + 2.0); // 1 s after the latest seen
+        let m = metrics(&t);
+        assert!((m.iat_mean - 500.0).abs() < 1e-3, "iat_mean = {}", m.iat_mean);
+        assert_eq!(m.duration_ms, 1000);
+    }
+
+    #[test]
+    fn entropy_covers_the_first_64k_of_payload() {
+        let t = FlowTracker::new();
+        let first: Vec<u8> = (0..60_000u32).map(|i| (i % 251) as u8).collect();
+        let second = vec![0u8; 20_000];
+        record(&t, 1500, &first, BASE);
+        record(&t, 1500, &second, BASE + 0.1);
+
+        let mut sample = first.clone();
+        sample.extend_from_slice(&second[..MAX_PAYLOAD_SAMPLE - first.len()]);
+        let expected = shannon_entropy(&sample);
+        assert!((metrics(&t).entropy - expected).abs() < 1e-12);
     }
 }

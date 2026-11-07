@@ -11,10 +11,11 @@
 use crossbeam_channel::Receiver;
 use etherparse::{LinkHeader, NetHeaders, PacketHeaders, TransportHeader, VlanHeader};
 use log::{debug, info};
+use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::analysis::arp_provider::{ArpGuardian, ArpVerdict};
@@ -23,10 +24,10 @@ use crate::analysis::enrichment::{self, ScoringInput};
 use crate::analysis::protocol_filter::{self, FilterVerdict};
 use crate::analysis::reputation::{self, ReputationVerdict};
 use crate::anomaly::detector::AnomalyDetector;
-use crate::anomaly::flow_tracker::FlowTracker;
-use crate::anomaly::types::Protocol;
+use crate::anomaly::flow_tracker::FlowAccounting;
+use crate::anomaly::types::{FlowKey, Protocol};
 use crate::l3_defrag::Defragmenter;
-use crate::l4_reassembly::Reassembler;
+use crate::l4_reassembly::{self, Reassembler};
 use crate::protocols;
 use crate::protocols::arp::parse_arp;
 use crate::protocols::dns;
@@ -39,10 +40,15 @@ use super::alert::{MitreAlert, Severity};
 use super::pin_to_core;
 use super::sniffer::RawPacket;
 
+/// How often T1041 is re-evaluated from out-of-band (kernel) byte counts.
+const EXFIL_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Shared counters for the analysis engine.
 pub struct EngineStats {
     /// Total packets analyzed.
     pub analyzed: AtomicU64,
+    /// Frames the header parser rejected (truncated or malformed).
+    pub parse_errors: AtomicU64,
     /// Total alerts generated.
     pub alerts: AtomicU64,
 }
@@ -51,6 +57,7 @@ impl EngineStats {
     pub fn new() -> Self {
         Self {
             analyzed: AtomicU64::new(0),
+            parse_errors: AtomicU64::new(0),
             alerts: AtomicU64::new(0),
         }
     }
@@ -98,7 +105,7 @@ pub fn run(
     stats: Arc<EngineStats>,
     core_id: usize,
     dns_tracker: Arc<DnsTracker>,
-    flow_tracker: Arc<FlowTracker>,
+    flow_tracker: Arc<dyn FlowAccounting>,
     _anomaly_detector: Arc<AnomalyDetector>,
     arp_guardian: Arc<ArpGuardian>,
 ) {
@@ -117,15 +124,30 @@ pub fn run(
 
     // Helper closure: enrich alert with flow metrics and emit without blocking
     let emit = |mut alert: MitreAlert, stats: &Arc<EngineStats>| {
-        enrich_alert_with_flow_metrics(&flow_tracker, &mut alert);
+        enrich_alert_with_flow_metrics(flow_tracker.as_ref(), &mut alert);
         stats.alerts.fetch_add(1, Ordering::Relaxed);
         if let Err(e) = alert_tx.send(alert) {
             debug!("[Engine] Alert channel closed: {}", e);
         }
     };
 
+    // T1041 from out-of-band byte counts (kernel flow accounting): the engine
+    // then only sees each flow's DPI window, so per-packet counting in the
+    // reassembler can never reach the threshold.
+    let mut exfil_alerted: HashSet<l4_reassembly::FlowKey> = HashSet::new();
+    let mut last_exfil_check = Instant::now();
+
     // ── Main analysis loop ────────────────────────────────────────────
     loop {
+        if last_exfil_check.elapsed() >= EXFIL_CHECK_INTERVAL {
+            last_exfil_check = Instant::now();
+            if let Some(totals) = flow_tracker.take_tcp_payload_totals() {
+                for alert in exfil_alerts_from_totals(totals, &mut exfil_alerted, &dns_tracker) {
+                    emit(alert, &stats);
+                }
+            }
+        }
+
         // Use recv_timeout so we can periodically check the shutdown flag
         let raw = match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(pkt) => pkt,
@@ -146,7 +168,13 @@ pub fn run(
         // ── Parse Ethernet frame ──────────────────────────────────────
         let headers = match PacketHeaders::from_ethernet_slice(&raw.data) {
             Ok(h) => h,
-            Err(_) => continue,
+            Err(e) => {
+                let n = stats.parse_errors.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n % 10_000 == 0 {
+                    debug!("[Engine] Unparseable frame ({} so far): {}", n, e);
+                }
+                continue;
+            }
         };
 
         // ── ARP detection (T1557) ─────────────────────────────────────
@@ -606,6 +634,8 @@ fn analyze_tcp(
         normalize_alert_direction(src_ip, dst_ip, tcp.source_port, tcp.destination_port);
 
     // ── Exfiltration detection (T1041) ────────────────────────────────
+    // Per-packet byte counting; with kernel flow accounting the engine only
+    // sees the DPI window and T1041 comes from `exfil_alerts_from_totals`.
     if let Some((up, down, ratio)) = tcp_reassembler.update_stats(
         src_ip,
         dst_ip,
@@ -614,43 +644,10 @@ fn analyze_tcp(
         packet_len,
         is_upload,
     ) {
-        // ── Importance-lowering: known provider + standard port ─────────
-        let dst_rep = reputation::lookup_ip(&dst_ip);
-        let is_standard_port = reputation::is_expected_encrypted_port(alert_dp)
-            || matches!(alert_dp, 80 | 443 | 8080 | 8443);
-        let (severity, confidence) = if dst_rep.is_trusted && is_standard_port {
-            // Trusted cloud/CDN on standard port — very likely backup/sync
-            (Severity::Low, 15u8)
-        } else if dst_rep.is_trusted {
-            // Trusted provider but unusual port — still suspicious
-            (Severity::Medium, 40u8)
-        } else if is_standard_port {
-            // Standard port but unknown provider — moderate suspicion
-            (Severity::Medium, 55u8)
-        } else {
-            // Unknown provider + non-standard port — full severity
-            (Severity::High, 75u8)
-        };
-
-        let mut alert = MitreAlert::new(
-            "T1041",
-            "Exfiltration Over C2 Channel",
-            severity,
-            confidence,
-            alert_src.to_string(),
-            alert_dst.to_string(),
-            alert_sp,
-            alert_dp,
-            "tcp",
-            "exfiltration",
-            "Asymmetric outbound flow detected",
-        )
-        .with_meta("total_uploaded_mb", format!("{:.2}", up as f64 / 1_000_000.0))
-        .with_meta("total_downloaded_mb", format!("{:.2}", down as f64 / 1_000_000.0))
-        .with_meta("ratio", format!("{:.2}", ratio))
-        .with_meta("dst_provider", &dst_rep.provider);
-        enrich_alert_with_dns(dns_tracker, &mut alert, None);
-        emit(alert, stats);
+        emit(
+            exfil_alert(alert_src, alert_dst, alert_sp, alert_dp, up, down, ratio, dns_tracker),
+            stats,
+        );
     }
 
     // ── TCP reassembly + deep inspection ──────────────────────────────
@@ -1443,6 +1440,117 @@ fn analyze_tcp(
     }
 }
 
+// ── Exfiltration (T1041) ───────────────────────────────────────────────────
+
+/// T1041 alert for a TCP connection whose upload crossed the thresholds.
+/// `local`/`remote` are already normalized (local = source).
+#[allow(clippy::too_many_arguments)]
+fn exfil_alert(
+    local: IpAddr,
+    remote: IpAddr,
+    local_port: u16,
+    remote_port: u16,
+    uploaded: u64,
+    downloaded: u64,
+    ratio: f64,
+    dns_tracker: &DnsTracker,
+) -> MitreAlert {
+    // ── Importance-lowering: known provider + standard port ─────────
+    let dst_rep = reputation::lookup_ip(&remote);
+    let is_standard_port = reputation::is_expected_encrypted_port(remote_port)
+        || matches!(remote_port, 80 | 443 | 8080 | 8443);
+    let (severity, confidence) = if dst_rep.is_trusted && is_standard_port {
+        // Trusted cloud/CDN on standard port — very likely backup/sync
+        (Severity::Low, 15u8)
+    } else if dst_rep.is_trusted {
+        // Trusted provider but unusual port — still suspicious
+        (Severity::Medium, 40u8)
+    } else if is_standard_port {
+        // Standard port but unknown provider — moderate suspicion
+        (Severity::Medium, 55u8)
+    } else {
+        // Unknown provider + non-standard port — full severity
+        (Severity::High, 75u8)
+    };
+
+    let mut alert = MitreAlert::new(
+        "T1041",
+        "Exfiltration Over C2 Channel",
+        severity,
+        confidence,
+        local.to_string(),
+        remote.to_string(),
+        local_port,
+        remote_port,
+        "tcp",
+        "exfiltration",
+        "Asymmetric outbound flow detected",
+    )
+    .with_meta("total_uploaded_mb", format!("{:.2}", uploaded as f64 / 1_000_000.0))
+    .with_meta("total_downloaded_mb", format!("{:.2}", downloaded as f64 / 1_000_000.0))
+    .with_meta("ratio", format!("{:.2}", ratio))
+    .with_meta("dst_provider", &dst_rep.provider);
+    enrich_alert_with_dns(dns_tracker, &mut alert, None);
+    alert
+}
+
+/// T1041 from per-direction payload totals of live TCP flows (kernel flow
+/// accounting). Directions are paired into connections the same way the
+/// reassembler does; each connection alerts at most once while it lives.
+fn exfil_alerts_from_totals(
+    totals: Vec<(FlowKey, u64)>,
+    alerted: &mut HashSet<l4_reassembly::FlowKey>,
+    dns_tracker: &DnsTracker,
+) -> Vec<MitreAlert> {
+    #[derive(Default)]
+    struct Conn {
+        uploaded: u64,
+        downloaded: u64,
+        /// (local, remote, local port, remote port) of the largest upload
+        /// direction — both directions count as uploads when both ends are local.
+        upload_side: Option<(IpAddr, IpAddr, u16, u16)>,
+        upload_side_bytes: u64,
+    }
+
+    let mut conns: HashMap<l4_reassembly::FlowKey, Conn> = HashMap::new();
+    for (key, bytes) in totals {
+        let (canonical, _) = l4_reassembly::FlowKey::canonical(
+            key.src_ip, key.dst_ip, key.src_port, key.dst_port,
+        );
+        let conn = conns.entry(canonical).or_default();
+        if is_local_ip(&key.src_ip) {
+            conn.uploaded += bytes;
+            if conn.upload_side.is_none() || bytes > conn.upload_side_bytes {
+                conn.upload_side = Some((key.src_ip, key.dst_ip, key.src_port, key.dst_port));
+                conn.upload_side_bytes = bytes;
+            }
+        } else {
+            conn.downloaded += bytes;
+        }
+    }
+
+    // Forget connections that ended, so a reused tuple can alert again.
+    alerted.retain(|key| conns.contains_key(key));
+
+    let mut alerts = Vec::new();
+    for (key, conn) in conns {
+        let Some((local, remote, local_port, remote_port)) = conn.upload_side else {
+            continue;
+        };
+        if alerted.contains(&key) {
+            continue;
+        }
+        if let Some(ratio) = l4_reassembly::exfil_ratio(conn.uploaded, conn.downloaded) {
+            alerted.insert(key);
+            alerts.push(exfil_alert(
+                local, remote, local_port, remote_port,
+                conn.uploaded, conn.downloaded, ratio, dns_tracker,
+            ));
+        }
+    }
+    alerts
+}
+
 // ── DNS Enrichment Helper ──────────────────────────────────────────────────
 
 /// Enrich a [`MitreAlert`] with DNS-resolved domain names and adjust confidence.
@@ -1462,7 +1570,7 @@ fn analyze_tcp(
 /// keys prefixed with `flow_`. These are used by the anomaly detector in the
 /// exporter to score the alert with real data instead of hardcoded defaults.
 fn enrich_alert_with_flow_metrics(
-    flow_tracker: &FlowTracker,
+    flow_tracker: &dyn FlowAccounting,
     alert: &mut MitreAlert,
 ) {
     let src_ip: Option<IpAddr> = alert.src_ip.parse().ok();
@@ -1542,5 +1650,70 @@ fn enrich_alert_with_dns(
                 .insert("dns_confidence_reason".to_string(), adj.reason.clone());
             alert.confidence = adj.confidence;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn tcp(src: [u8; 4], src_port: u16, dst: [u8; 4], dst_port: u16) -> FlowKey {
+        FlowKey {
+            src_ip: IpAddr::V4(Ipv4Addr::from(src)),
+            dst_ip: IpAddr::V4(Ipv4Addr::from(dst)),
+            src_port,
+            dst_port,
+            protocol: Protocol::Tcp,
+        }
+    }
+
+    #[test]
+    fn kernel_totals_raise_t1041_once_per_connection() {
+        let dns = DnsTracker::new();
+        let mut alerted = HashSet::new();
+        let (local, remote) = ([192, 168, 1, 10], [203, 0, 113, 5]);
+        let totals = vec![
+            (tcp(local, 40000, remote, 9000), 60 * MIB),
+            (tcp(remote, 9000, local, 40000), 1000),
+        ];
+
+        let alerts = exfil_alerts_from_totals(totals.clone(), &mut alerted, &dns);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].technique_id, "T1041");
+        assert_eq!((alerts[0].src_ip.as_str(), alerts[0].dst_port), ("192.168.1.10", 9000));
+
+        // The same connection in the next snapshot does not alert again...
+        assert!(exfil_alerts_from_totals(totals.clone(), &mut alerted, &dns).is_empty());
+        // ...until it is gone and the tuple comes back.
+        assert!(exfil_alerts_from_totals(Vec::new(), &mut alerted, &dns).is_empty());
+        assert_eq!(exfil_alerts_from_totals(totals, &mut alerted, &dns).len(), 1);
+    }
+
+    #[test]
+    fn kernel_totals_below_thresholds_do_not_alert() {
+        let dns = DnsTracker::new();
+        let mut alerted = HashSet::new();
+        let (local, remote) = ([192, 168, 1, 10], [203, 0, 113, 5]);
+        let balanced = vec![
+            (tcp(local, 40000, remote, 443), 60 * MIB),
+            (tcp(remote, 443, local, 40000), 10 * MIB), // ratio 6
+        ];
+        let small = vec![(tcp(local, 40001, remote, 443), 10 * MIB)];
+        assert!(exfil_alerts_from_totals(balanced, &mut alerted, &dns).is_empty());
+        assert!(exfil_alerts_from_totals(small, &mut alerted, &dns).is_empty());
+    }
+
+    #[test]
+    fn both_ends_local_uses_the_larger_direction() {
+        let dns = DnsTracker::new();
+        let mut alerted = HashSet::new();
+        let (a, b) = ([10, 0, 0, 1], [10, 0, 0, 2]);
+        let totals = vec![(tcp(a, 5000, b, 9000), 1000), (tcp(b, 9000, a, 5000), 60 * MIB)];
+        let alerts = exfil_alerts_from_totals(totals, &mut alerted, &dns);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].src_ip, "10.0.0.2");
     }
 }

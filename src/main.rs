@@ -26,6 +26,8 @@ pub mod report;
 pub mod analysis;
 pub mod anomaly;
 pub mod pipeline;
+#[cfg(all(target_os = "linux", feature = "ebpf"))]
+pub mod ebpf;
 
 use log::{error, info, warn};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,11 +37,12 @@ use clap::Parser;
 use analysis::arp_provider::ArpGuardian;
 use analysis::dns_resolver::DnsCache;
 use analysis::dns_tracker::DnsTracker;
+use analysis::process::ProcessLookup;
 use anomaly::detector::AnomalyDetector;
-use anomaly::flow_tracker::FlowTracker;
+use anomaly::flow_tracker::{FlowAccounting, FlowTracker};
 use pipeline::engine::EngineStats;
 use pipeline::exporter::ExporterStats;
-use pipeline::sniffer::{PacketSource, SnifferStats};
+use pipeline::sniffer::{PcapSource, SnifferStats};
 
 // ── Ring buffer capacity (packets) ────────────────────────────────────────
 const RING_BUFFER_CAPACITY: usize = 10_000;
@@ -73,6 +76,11 @@ struct Args {
     /// List available interfaces
     #[arg(short = 'l', long = "list")]
     list_interfaces: bool,
+
+    /// Disable eBPF sensing (process attribution, kernel flow accounting)
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    #[arg(long = "no-ebpf")]
+    no_ebpf: bool,
 }
 
 fn print_usage() {
@@ -107,22 +115,23 @@ fn main() {
     let db_path = args.db_path;
     let learning_time = args.learning_time;
 
-    // ── Determine capture source ──────────────────────────────────────
-    let (source, source_name): (Box<dyn PacketSource + Send>, String) = if let Some(iface) = interface {
-        #[cfg(target_os = "linux")]
-        let source: Box<dyn PacketSource + Send> = match pipeline::sniffer::LinuxScanner::new(iface.clone()) {
-            Ok(scanner) => Box::new(scanner),
-            Err(e) => {
-                error!("Failed to open capture device '{}': {}", iface, e);
-                return;
-            }
-        };
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    let use_ebpf = if args.no_ebpf {
+        info!("[eBPF] Disabled (--no-ebpf)");
+        false
+    } else if !ebpf::kernel_btf_available() {
+        warn!("[eBPF] Kernel has no BTF (/sys/kernel/btf/vmlinux) — running without eBPF");
+        false
+    } else {
+        true
+    };
 
-        #[cfg(target_os = "macos")]
-        let source: Box<dyn PacketSource + Send> = match pipeline::sniffer::MacScanner::new(iface.clone()) {
-            Ok(scanner) => Box::new(scanner),
+    // ── Determine capture source ──────────────────────────────────────
+    let (source, source_name): (PcapSource, String) = if let Some(iface) = interface {
+        let source = match PcapSource::open(&iface) {
+            Ok(source) => source,
             Err(e) => {
-                error!("Failed to open capture device '{}': {}", iface, e);
+                error!("Failed to open capture device '{}': {:#}", iface, e);
                 return;
             }
         };
@@ -158,8 +167,27 @@ fn main() {
     // ── Shared DNS resolver cache (active, hickory-resolver) ────────────
     let dns_cache = DnsCache::shared();
 
-    // ── Anomaly Detection: FlowTracker + AnomalyDetector ───────────────
-    let flow_tracker = FlowTracker::shared();
+    // ── Anomaly Detection: flow accounting + AnomalyDetector ───────────
+    // In-kernel accounting (eBPF socket filter on the capture socket) when
+    // available; otherwise every packet is accounted in userspace.
+    #[allow(unused_mut)]
+    let mut flow_tracker: Arc<dyn FlowAccounting> = FlowTracker::shared();
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    if use_ebpf {
+        match ebpf::flow::load() {
+            Ok(filter) => match source.attach_socket_filter(filter.program) {
+                Ok(()) => {
+                    info!(
+                        "[eBPF] Flow accounting in the kernel; userspace gets the first {} KiB of each flow direction",
+                        ebpf::flow::DPI_LIMIT / 1024
+                    );
+                    flow_tracker = Arc::new(filter.tracker);
+                }
+                Err(e) => warn!("[eBPF] Flow filter not attached: {:#}", e),
+            },
+            Err(e) => warn!("[eBPF] Flow filter unavailable: {:#}", e),
+        }
+    }
     let anomaly_detector = AnomalyDetector::shared(learning_time, None);
 
     // Try to load a previously trained model
@@ -203,6 +231,23 @@ fn main() {
     // ── Channel: Engine → Exporter (tokio unbounded mpsc) ─────────────
     let (alert_tx, alert_rx) = tokio::sync::mpsc::unbounded_channel();
 
+    // ── Process attribution + reverse-shell detection (eBPF) ──────────
+    #[allow(unused_mut)]
+    let mut process_lookup: Option<Arc<dyn ProcessLookup>> = None;
+    #[allow(unused_mut)]
+    let mut procmon_thread: Option<std::thread::JoinHandle<()>> = None;
+    #[cfg(all(target_os = "linux", feature = "ebpf"))]
+    if use_ebpf {
+        match ebpf::procmon::spawn(alert_tx.clone(), running.clone()) {
+            Ok((cache, handle, probes)) => {
+                info!("[eBPF] Process attribution on: {}", probes.join(", "));
+                process_lookup = Some(cache);
+                procmon_thread = Some(handle);
+            }
+            Err(e) => warn!("[eBPF] Process attribution unavailable: {:#}", e),
+        }
+    }
+
     pipeline::console_fmt::print_banner();
     pipeline::console_fmt::print_source_info("Live capture", &source_name);
     pipeline::console_fmt::print_pipeline_config(RING_BUFFER_CAPACITY, SNIFFER_CORE, ENGINE_CORE);
@@ -230,6 +275,7 @@ fn main() {
         dns_tracker_exporter,
         dns_cache_exporter,
         anomaly_detector_exporter,
+        process_lookup,
     ));
 
     // Spawn the anomaly detection background flush task
@@ -278,7 +324,7 @@ fn main() {
         .name("sniffer".to_string())
         .spawn(move || {
             pipeline::sniffer::run_live(
-                source,
+                Box::new(source),
                 pkt_tx,
                 sniffer_running,
                 sniffer_stats_clone,
@@ -302,8 +348,15 @@ fn main() {
     }
     pipeline::console_fmt::print_stage_done("Engine thread");
 
+    // The procmon thread holds an alert sender too; it stops on the shutdown flag.
+    if let Some(handle) = procmon_thread {
+        if let Err(e) = handle.join() {
+            error!("Procmon thread panicked: {:?}", e);
+        }
+    }
+
     // Stage 3 finishes when the tokio mpsc channel is drained
-    // (the Engine dropped alert_tx when it exited)
+    // (the Engine and procmon dropped their alert senders when they exited)
     rt.block_on(async {
         if let Err(e) = exporter_handle.await {
             error!("Exporter task panicked: {:?}", e);
@@ -333,7 +386,10 @@ fn main() {
     pipeline::console_fmt::print_shutdown_summary(
         sniffer_stats.captured.load(Ordering::Relaxed),
         sniffer_stats.dropped.load(Ordering::Relaxed),
+        sniffer_stats.kernel_dropped.load(Ordering::Relaxed),
+        sniffer_stats.if_dropped.load(Ordering::Relaxed),
         engine_stats.analyzed.load(Ordering::Relaxed),
+        engine_stats.parse_errors.load(Ordering::Relaxed),
         engine_stats.alerts.load(Ordering::Relaxed),
         exporter_stats.console_writes.load(Ordering::Relaxed),
         exporter_stats.db_writes.load(Ordering::Relaxed),
