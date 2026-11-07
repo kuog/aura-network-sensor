@@ -67,7 +67,7 @@ impl EngineStats {
 ///
 /// For IPv4: RFC-1918 private ranges (10/8, 172.16/12, 192.168/16).
 /// For IPv6: link-local (fe80::/10), ULA (fc00::/7), and loopback (::1).
-fn is_local_ip(ip: &IpAddr) -> bool {
+pub(crate) fn is_local_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ipv4) => {
             let o = ipv4.octets();

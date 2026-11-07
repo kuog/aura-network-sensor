@@ -52,6 +52,43 @@ runs without eBPF. Switching flow accounting between kernel and userspace
 changes the anomaly features slightly: delete `anomaly_model.bin` so the
 model retrains.
 
+## Alert output
+
+Every alert is printed to the console and stored in SQLite (`-d`, default
+`alerts.db`). The console shows a header line, the detection's explanation and
+a few key details, colored by severity:
+
+```text
+15:57:52 LOW      T1046 Network Service Discovery [port_scan] tcp 192.168.139.161:59136 → 192.168.139.1:41 conf 30
+         Vertical Scan: 21 ports on 192.168.139.1 (scanner_ip=192.168.139.161 unique_ports_count=21 unique_targets_count=1)
+         proc_comm=nmap proc_pid=11137 proc_exe=/usr/bin/nmap
+```
+
+Two optional exports run alongside, on their own thread:
+
+- `--ocsf-file <path>` appends each alert to the file as an
+  [OCSF](https://schema.ocsf.io) Detection Finding (class 2004, schema 1.9.0),
+  one JSON object per line, for SIEM and data-lake pipelines (Vector, Fluent
+  Bit, Filebeat). ATT&CK technique and tactic are in `finding_info.attacks`;
+  the connection and the owning process are in `evidences`; any other metadata
+  is in `unmapped`.
+- `--syslog <target>` sends each alert as one text line (the console content
+  without color), facility local0, severity taken from the alert:
+  - `local`: the local syslog socket (`/dev/log`; on macOS `/var/run/syslog`);
+  - `udp://host[:port]` or `tcp://host[:port]`: RFC 5424 to a remote
+    collector (TCP uses octet counting), port 514 by default.
+
+Debug-level alerts (suppressed by reputation or by the anomaly model) are only
+printed and stored, not exported.
+
+```bash
+sudo ./target/release/mcp-network-sensor -i eth0 --ocsf-file /var/log/mcp-sensor/alerts.ocsf.jsonl --syslog local
+```
+
+```bash
+journalctl -t mcp-network-sensor
+```
+
 ## Testing on a Mac with OrbStack
 
 OrbStack Linux machines share one kernel with BTF, kprobes and TCX, so the

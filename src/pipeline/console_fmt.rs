@@ -1,410 +1,202 @@
-//! Colored console formatter for [`MitreAlert`] output.
+//! Console output: plain lines, colored by severity.
 //!
-//! Provides a human-friendly, color-coded representation of alerts for terminal
-//! display. The JSON format itself is **not** modified — this module only affects
-//! how alerts are rendered to the console via `println!`.
+//! Each alert is a header line followed by its logic and a few key details:
 //!
-//! Severity → color mapping:
-//! - **CRITICAL** → bright red, bold
-//! - **HIGH**     → red
-//! - **MEDIUM**   → yellow
-//! - **LOW**      → cyan
-//! - **INFO**     → green
-//! - **DEBUG**    → dimmed white
+//! ```text
+//! 13:44:15 CRITICAL T1059 Command and Scripting Interpreter [reverse_shell] tcp 127.0.0.1:41092 → 127.0.0.1:4444 conf 95
+//!          'bash' (pid 8260) redirected its stdout to a TCP connection with 127.0.0.1:4444
+//!          proc_comm=bash proc_pid=8260 proc_exe=/usr/bin/bash
+//! ```
+//!
+//! The complete alert, with all metadata, goes to SQLite and to the OCSF /
+//! syslog exports; the console shows what a person scans for.
 
-use colored::Colorize;
-use unicode_width::UnicodeWidthStr;
+use colored::{ColoredString, Colorize};
 
 use super::alert::{MitreAlert, Severity};
 
-// ── Visual-width helpers ──────────────────────────────────────────────────
+/// Metadata shown on the console, in this order, when present.
+const DETAIL_KEYS: &[&str] = &[
+    "proc_comm",
+    "proc_pid",
+    "proc_exe",
+    "proc_cmdline",
+    "dns_src",
+    "dns_dst",
+    "sni",
+    "provider",
+    "dst_provider",
+    "ja3",
+    "shell_type",
+    "commands",
+    "stdio_fd",
+    "total_uploaded_mb",
+    "ratio",
+    "entropy",
+    "discovered_mac",
+    "previous_mac",
+    "conflicting_mac",
+    "suppression_reason",
+    "ai_suppression",
+];
 
-/// Strip ANSI escape sequences from a string, returning only visible characters.
-fn strip_ansi(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip until we hit a letter (the terminator of the escape sequence)
-            for c2 in chars.by_ref() {
-                if c2.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
+/// Longest metadata value printed before it is cut with "…".
+const MAX_VALUE_CHARS: usize = 80;
 
-/// Calculate the visual (terminal column) width of a string, ignoring ANSI codes.
-///
-/// Uses `unicode-width` to correctly handle wide characters (emoji = 2 columns).
-fn visual_width(s: &str) -> usize {
-    let clean = strip_ansi(s);
-    UnicodeWidthStr::width(clean.as_str())
-}
+/// Detail lines line up under the severity column.
+const INDENT: &str = "         ";
 
-/// Pad a plain-text string on the right so its visual width reaches `target_width`.
-/// Returns the number of spaces needed (0 if already wider).
-fn pad_count(plain_text: &str, target_width: usize) -> usize {
-    let w = visual_width(plain_text);
-    target_width.saturating_sub(w)
-}
-
-// ── Box-drawing constants ─────────────────────────────────────────────────
-
-/// Total box width in terminal columns (including the ║ borders).
-const BOX_WIDTH: usize = 76;
-
-/// Inner content width (between "║ " and " ║").
-const INNER_WIDTH: usize = BOX_WIDTH - 4; // 72
-
-/// Draw a top border: ╔═══...═══╗
-fn top_border() -> String {
-    format!("╔{}╗", "═".repeat(BOX_WIDTH - 2))
-}
-
-/// Draw a mid border: ╠═══...═══╣
-fn mid_border() -> String {
-    format!("╠{}╣", "═".repeat(BOX_WIDTH - 2))
-}
-
-/// Draw a bottom border: ╚═══...═══╝
-fn bot_border() -> String {
-    format!("╚{}╝", "═".repeat(BOX_WIDTH - 2))
-}
-
-/// Print a line inside the box: ║ <content padded to INNER_WIDTH> ║
-///
-/// `plain_content` is the content *without* ANSI codes (for width calculation).
-/// `colored_content` is the content *with* ANSI codes (for display).
-fn box_line(plain_content: &str, colored_content: &str) {
-    let pad = pad_count(plain_content, INNER_WIDTH);
-    println!("║ {}{} ║", colored_content, " ".repeat(pad));
-}
-
-/// Print a line inside the box using only plain (uncolored) text.
-fn box_line_plain(content: &str) {
-    box_line(content, content);
-}
-
-// ── Severity helpers ──────────────────────────────────────────────────────
-
-/// Color a border string according to severity.
-fn color_border(border: &str, severity: Severity) -> String {
+fn severity_label(severity: Severity) -> ColoredString {
+    let text = format!("{:<8}", severity.to_string());
     match severity {
-        Severity::Critical => border.bright_red().to_string(),
-        Severity::High => border.red().to_string(),
-        Severity::Medium => border.yellow().to_string(),
-        Severity::Low => border.cyan().to_string(),
-        Severity::Info => border.green().to_string(),
-        Severity::Debug => border.dimmed().to_string(),
+        Severity::Critical => text.bright_red().bold(),
+        Severity::High => text.red().bold(),
+        Severity::Medium => text.yellow().bold(),
+        Severity::Low => text.cyan(),
+        Severity::Info => text.green(),
+        Severity::Debug => text.dimmed(),
     }
 }
 
-/// Get the emoji icon for a severity level.
-fn severity_icon(severity: Severity) -> &'static str {
-    match severity {
-        Severity::Critical => "🚨",
-        Severity::High => "🔴",
-        Severity::Medium => "🟡",
-        Severity::Low => "🔵",
-        Severity::Info => "🟢",
-        Severity::Debug => "⚪",
+/// `ip:port`, `[v6]:port`, or just the address when there is no port (ARP).
+fn endpoint(ip: &str, port: u16) -> String {
+    match (port, ip.contains(':')) {
+        (0, _) => ip.to_string(),
+        (_, true) => format!("[{ip}]:{port}"),
+        (_, false) => format!("{ip}:{port}"),
     }
 }
 
-/// Color a text string according to severity.
-fn color_text(text: &str, severity: Severity) -> String {
-    match severity {
-        Severity::Critical => text.bright_red().bold().to_string(),
-        Severity::High => text.red().bold().to_string(),
-        Severity::Medium => text.yellow().bold().to_string(),
-        Severity::Low => text.cyan().bold().to_string(),
-        Severity::Info => text.green().bold().to_string(),
-        Severity::Debug => text.dimmed().to_string(),
+fn detail_value(value: &str) -> String {
+    let mut v: String = value.chars().take(MAX_VALUE_CHARS).collect();
+    if value.chars().count() > MAX_VALUE_CHARS {
+        v.push('…');
     }
-}
-
-// ── Alert box printer ─────────────────────────────────────────────────────
-
-/// Format and print a [`MitreAlert`] to stdout with colored output.
-///
-/// Layout:
-/// ```text
-/// ╔══════════════════════════════════════════════════════════════════════════╗
-/// ║ 🚨 ALERT — T1071.004 DNS Tunneling                     [CRITICAL 95]  ║
-/// ╠══════════════════════════════════════════════════════════════════════════╣
-/// ║ Trigger   : high_entropy                                               ║
-/// ║ Protocol  : udp                                                        ║
-/// ║ Source    : 192.168.1.10:54321                                         ║
-/// ║ Dest      : 8.8.8.8:53                                                ║
-/// ║ Timestamp : 2024-01-15 12:34:56 UTC                                    ║
-/// ╠══════════════════════════════════════════════════════════════════════════╣
-/// ║ Logic : DNS query with entropy 7.8 to suspicious domain                ║
-/// ╠══════════════════════════════════════════════════════════════════════════╣
-/// ║ Metadata:                                                              ║
-/// ║   entropy                = 7.82                                        ║
-/// ║   provider               = Cloudflare                                  ║
-/// ╚══════════════════════════════════════════════════════════════════════════╝
-/// ```
-pub fn print_alert(alert: &MitreAlert) {
-    let sev = alert.severity;
-    let icon = severity_icon(sev);
-
-    // ── Severity badge ────────────────────────────────────────────────
-    let badge_plain = format!("[{} {}]", alert.severity, alert.confidence);
-    let badge_colored = match sev {
-        Severity::Critical => badge_plain.bright_red().bold().to_string(),
-        Severity::High => badge_plain.red().bold().to_string(),
-        Severity::Medium => badge_plain.yellow().bold().to_string(),
-        Severity::Low => badge_plain.cyan().to_string(),
-        Severity::Info => badge_plain.green().to_string(),
-        Severity::Debug => badge_plain.dimmed().to_string(),
-    };
-
-    // ── Title line ────────────────────────────────────────────────────
-    let title_plain = format!(
-        "{} ALERT -- {} {}",
-        icon, alert.technique_id, alert.technique_name
-    );
-    let title_colored = format!(
-        "{} {}",
-        icon,
-        color_text(
-            &format!("ALERT -- {} {}", alert.technique_id, alert.technique_name),
-            sev,
-        ),
-    );
-
-    // Calculate gap between title and badge
-    let title_vw = visual_width(&title_plain);
-    let badge_vw = visual_width(&badge_plain);
-    let gap = INNER_WIDTH.saturating_sub(title_vw + badge_vw);
-
-    let title_line_plain = format!("{}{}{}", title_plain, " ".repeat(gap), badge_plain);
-    let title_line_colored = format!("{}{}{}", title_colored, " ".repeat(gap), badge_colored);
-
-    // ── Borders ───────────────────────────────────────────────────────
-    let top = color_border(&top_border(), sev);
-    let mid = color_border(&mid_border(), sev);
-    let bot = color_border(&bot_border(), sev);
-
-    // ── Print ─────────────────────────────────────────────────────────
-    println!();
-    println!("{}", top);
-    box_line(&title_line_plain, &title_line_colored);
-    println!("{}", mid);
-
-    // ── Detail fields ─────────────────────────────────────────────────
-    let detail_fields: &[(&str, &str)] = &[
-        ("Trigger  ", &alert.trigger),
-        ("Protocol ", &alert.protocol),
-    ];
-    for (label, value) in detail_fields {
-        let plain = format!("{} : {}", label, value);
-        box_line_plain(&plain);
-    }
-
-    let src = format!("{}:{}", alert.src_ip, alert.src_port);
-    let dst = format!("{}:{}", alert.dst_ip, alert.dst_port);
-
-    box_line_plain(&format!("Source    : {}", src));
-    box_line_plain(&format!("Dest      : {}", dst));
-    box_line_plain(&format!(
-        "Timestamp : {}",
-        alert.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
-    ));
-
-    println!("{}", mid);
-
-    // ── Logic (word-wrapped) ──────────────────────────────────────────
-    let logic_prefix = "Logic : ";
-    let cont_prefix = "        ";
-    let wrap_width = INNER_WIDTH.saturating_sub(visual_width(logic_prefix));
-    let logic_lines = wrap_text(&alert.logic, wrap_width);
-
-    for (i, line) in logic_lines.iter().enumerate() {
-        if i == 0 {
-            box_line_plain(&format!("{}{}", logic_prefix, line));
-        } else {
-            box_line_plain(&format!("{}{}", cont_prefix, line));
-        }
-    }
-
-    // ── Metadata ──────────────────────────────────────────────────────
-    if !alert.metadata.is_empty() {
-        println!("{}", mid);
-        box_line_plain("Metadata:");
-
-        for (key, value) in &alert.metadata {
-            let entry = format!("  {:<22} = {}", key, value);
-            // Truncate if too long
-            if visual_width(&entry) > INNER_WIDTH {
-                let mut truncated = String::new();
-                let mut w = 0;
-                for ch in entry.chars() {
-                    let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                    if w + cw >= INNER_WIDTH {
-                        truncated.push('…');
-                        break;
-                    }
-                    truncated.push(ch);
-                    w += cw;
-                }
-                box_line_plain(&truncated);
-            } else {
-                box_line_plain(&entry);
-            }
-        }
-    }
-
-    println!("{}", bot);
-}
-
-/// Wrap text to fit within a given width, breaking at word boundaries.
-fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
-    if max_width == 0 || visual_width(text) <= max_width {
-        return vec![text.to_string()];
-    }
-
-    let mut lines = Vec::new();
-    let mut current_line = String::new();
-    let mut current_width = 0;
-
-    for word in text.split_whitespace() {
-        let word_width = visual_width(word);
-        if current_width == 0 {
-            // First word on the line
-            current_line = word.to_string();
-            current_width = word_width;
-        } else if current_width + 1 + word_width <= max_width {
-            // Fits on current line
-            current_line.push(' ');
-            current_line.push_str(word);
-            current_width += 1 + word_width;
-        } else {
-            // Start a new line
-            lines.push(current_line);
-            current_line = word.to_string();
-            current_width = word_width;
-        }
-    }
-    if !current_line.is_empty() {
-        lines.push(current_line);
-    }
-
-    if lines.is_empty() {
-        vec![text.to_string()]
+    if v.contains(char::is_whitespace) {
+        format!("\"{v}\"")
     } else {
-        lines
+        v
     }
 }
 
-// ── Banner & startup ──────────────────────────────────────────────────────
+/// `key=value` pairs of the metadata worth showing.
+fn detail_pairs(alert: &MitreAlert) -> Vec<String> {
+    DETAIL_KEYS
+        .iter()
+        .filter_map(|key| alert.metadata.get(*key).map(|v| format!("{key}={}", detail_value(v))))
+        .collect()
+}
 
-/// Print a colored startup banner.
+/// The alert as one uncolored line (for syslog, which adds its own time):
+/// `SEVERITY ID name [trigger] proto src -> dst conf=N | logic | details`.
+pub fn alert_text(alert: &MitreAlert) -> String {
+    let mut text = format!(
+        "{} {} {} [{}] {} {} -> {} conf={}",
+        alert.severity,
+        alert.technique_id,
+        alert.technique_name,
+        alert.trigger,
+        alert.protocol,
+        endpoint(&alert.src_ip, alert.src_port),
+        endpoint(&alert.dst_ip, alert.dst_port),
+        alert.confidence,
+    );
+    let logic = alert.logic_text();
+    if !logic.is_empty() {
+        text.push_str(" | ");
+        text.push_str(&logic);
+    }
+    let details = detail_pairs(alert);
+    if !details.is_empty() {
+        text.push_str(" | ");
+        text.push_str(&details.join(" "));
+    }
+    // A syslog message is a single line.
+    text.replace(['\n', '\r'], " ")
+}
+
+/// The console lines for one alert.
+pub fn alert_lines(alert: &MitreAlert) -> Vec<String> {
+    let time = alert.timestamp.with_timezone(&chrono::Local).format("%H:%M:%S").to_string();
+    let header = format!(
+        "{} {} {} {} {} {} {} {} {} {}",
+        time.dimmed(),
+        severity_label(alert.severity),
+        alert.technique_id.bold(),
+        alert.technique_name,
+        format!("[{}]", alert.trigger).dimmed(),
+        alert.protocol,
+        endpoint(&alert.src_ip, alert.src_port),
+        "→".dimmed(),
+        endpoint(&alert.dst_ip, alert.dst_port),
+        format!("conf {}", alert.confidence).dimmed(),
+    );
+    let mut lines = vec![header];
+
+    let logic = alert.logic_text();
+    if !logic.is_empty() {
+        lines.push(format!("{INDENT}{logic}"));
+    }
+
+    let details = detail_pairs(alert);
+    if !details.is_empty() {
+        lines.push(format!("{INDENT}{}", details.join(" ").dimmed()));
+    }
+    lines
+}
+
+/// Print an alert to stdout.
+pub fn print_alert(alert: &MitreAlert) {
+    for line in alert_lines(alert) {
+        println!("{line}");
+    }
+}
+
+// ── Startup ───────────────────────────────────────────────────────────────
+
 pub fn print_banner() {
-    let border = "═".repeat(BOX_WIDTH - 2);
-    println!("{}", format!("╔{}╗", border).bright_blue());
-
-    let title_plain = "MCP Network Sensor -- NDR Pipeline";
-    let title_colored = title_plain.bright_blue().bold().to_string();
-    let title_vw = visual_width(title_plain);
-    let left_pad = (INNER_WIDTH.saturating_sub(title_vw)) / 2;
-    let right_pad = INNER_WIDTH.saturating_sub(title_vw + left_pad);
-
-    println!(
-        "{}",
-        format!(
-            "║ {}{}{} ║",
-            " ".repeat(left_pad),
-            title_colored,
-            " ".repeat(right_pad),
-        )
-        .bright_blue()
-    );
-
-    println!("{}", format!("╚{}╝", border).bright_blue());
+    println!("{} {}", "mcp-network-sensor".bold(), env!("CARGO_PKG_VERSION").dimmed());
 }
 
-/// Print a colored pipeline status line.
+/// One `label: value` line of the startup settings.
+pub fn print_setting(label: &str, value: &str) {
+    println!("  {} {}", format!("{label}:").dimmed(), value);
+}
+
 pub fn print_pipeline_config(ring_capacity: usize, sniffer_core: usize, engine_core: usize) {
-    println!(
-        "  {} Ring buffer: {} packets | Sniffer->Core {} | Engine->Core {}",
-        ">>".bright_blue(),
-        ring_capacity.to_string().white().bold(),
-        sniffer_core.to_string().white().bold(),
-        engine_core.to_string().white().bold(),
+    print_setting(
+        "pipeline",
+        &format!("ring buffer {ring_capacity} packets, sniffer on core {sniffer_core}, engine on core {engine_core}"),
     );
 }
 
-/// Print a colored source info line.
-pub fn print_source_info(source_type: &str, source_name: &str) {
-    println!(
-        "  {} {}: {}",
-        ">>".bright_green(),
-        source_type.green(),
-        source_name.white().bold(),
-    );
-}
-
-/// Print a colored "ready" message.
 pub fn print_ready() {
-    println!(
-        "  {} {}",
-        ">>".green(),
-        "All pipeline stages running. Press Ctrl+C to stop.".green().bold(),
-    );
+    println!("  {}", "running, Ctrl+C to stop".green());
     println!();
 }
 
-/// Print a colored stage completion message.
 pub fn print_stage_done(stage: &str) {
-    println!(
-        "  {} {} {}",
-        "[ok]".green(),
-        stage.white(),
-        "finished".dimmed(),
-    );
+    println!("  {} {}", stage, "stopped".dimmed());
 }
 
 // ── Shutdown summary ──────────────────────────────────────────────────────
 
-/// Print a single stats line inside the shutdown summary box.
-///
-/// Each entry is `(label, value, is_ok)`. If `is_ok` is false, the value is
-/// printed in red; otherwise in green.
-fn print_stat_line(category: &str, entries: &[(&str, &str, bool)]) {
-    // Build the plain-text version for width calculation
-    let mut parts_plain: Vec<String> = Vec::new();
-    let mut parts_colored: Vec<String> = Vec::new();
-
-    for (label, value, is_ok) in entries {
-        parts_plain.push(format!("{}: {}", label, value));
-
-        let colored_val = if *is_ok {
-            value.green().bold().to_string()
-        } else {
-            value.red().bold().to_string()
-        };
-        parts_colored.push(format!("{}: {}", label.dimmed(), colored_val));
-    }
-
-    let plain_content = format!("  {} | {}", category, parts_plain.join("  "));
-    let colored_content = format!(
-        "  {} {} {}",
-        category.white().bold(),
-        "|".bright_blue(),
-        parts_colored.join("  "),
-    );
-
-    box_line(&plain_content, &colored_content);
+/// `name value` pairs; a pair marked `false` is a problem and shows in red.
+fn print_stat_line(category: &str, entries: &[(&str, u64, bool)]) {
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|(name, value, ok)| {
+            let value = if *ok {
+                value.to_string().bold()
+            } else {
+                value.to_string().red().bold()
+            };
+            format!("{name} {value}")
+        })
+        .collect();
+    println!("  {} {}", format!("{category:<9}").dimmed(), parts.join(", "));
 }
 
-/// Print a colored shutdown summary.
 #[allow(clippy::too_many_arguments)]
 pub fn print_shutdown_summary(
     captured: u64,
@@ -419,150 +211,136 @@ pub fn print_shutdown_summary(
     db_errors: u64,
     dns_entries: usize,
 ) {
-    let border_top = top_border();
-    let border_mid = mid_border();
-    let border_bot = bot_border();
-
     println!();
-    println!("{}", border_top.bright_blue());
+    println!("{}", "summary".bold());
 
-    // Centered title
-    let title_plain = "Pipeline Shutdown Summary";
-    let title_colored = title_plain.bright_blue().bold().to_string();
-    let title_vw = visual_width(title_plain);
-    let left_pad = (INNER_WIDTH.saturating_sub(title_vw)) / 2;
-    let right_pad = INNER_WIDTH.saturating_sub(title_vw + left_pad);
-    println!(
-        "{} {}{}{} {}",
-        "║".bright_blue(),
-        " ".repeat(left_pad),
-        title_colored,
-        " ".repeat(right_pad),
-        "║".bright_blue(),
-    );
-
-    println!("{}", border_mid.bright_blue());
-
-    // Stats lines
-    print_stat_line("Sniffer ", &[
-        ("Captured", &captured.to_string(), true),
-        ("Dropped", &dropped.to_string(), dropped == 0),
-        ("Kernel drops", &kernel_dropped.to_string(), kernel_dropped == 0),
-    ]);
+    let mut sniffer = vec![
+        ("captured", captured, true),
+        ("dropped", dropped, dropped == 0),
+        ("kernel drops", kernel_dropped, kernel_dropped == 0),
+    ];
     if if_dropped > 0 {
-        print_stat_line("        ", &[
-            ("NIC drops", &if_dropped.to_string(), false),
-        ]);
+        sniffer.push(("NIC drops", if_dropped, false));
     }
-    print_stat_line("Engine  ", &[
-        ("Analyzed", &analyzed.to_string(), true),
-        ("Alerts", &alerts.to_string(), true),
-    ]);
-    if parse_errors > 0 {
-        print_stat_line("        ", &[
-            ("Parse errors", &parse_errors.to_string(), false),
-        ]);
-    }
-    print_stat_line("Exporter", &[
-        ("Console", &console_writes.to_string(), true),
-        ("DB", &db_writes.to_string(), true),
-    ]);
-    if db_errors > 0 {
-        print_stat_line("        ", &[
-            ("DB Errors", &db_errors.to_string(), false),
-        ]);
-    }
-    print_stat_line("DNS     ", &[
-        ("Cache entries", &dns_entries.to_string(), true),
-    ]);
+    print_stat_line("sniffer", &sniffer);
 
-    println!("{}", border_bot.bright_blue());
+    let mut engine = vec![("analyzed", analyzed, true), ("alerts", alerts, true)];
+    if parse_errors > 0 {
+        engine.push(("parse errors", parse_errors, false));
+    }
+    print_stat_line("engine", &engine);
+
+    let mut exporter = vec![("console", console_writes, true), ("db", db_writes, true)];
+    if db_errors > 0 {
+        exporter.push(("db errors", db_errors, false));
+    }
+    print_stat_line("exporter", &exporter);
+
+    print_stat_line("dns", &[("cache entries", dns_entries as u64, true)]);
     println!();
 }
 
 // ── Usage / Help ──────────────────────────────────────────────────────────
 
-/// Print the usage/help text with colors.
 pub fn print_usage() {
+    let option = |flag: &str, text: &str| println!("  {:<24} {}", flag.cyan(), text);
+
     println!();
-    println!("{}", "Usage:".bright_white().bold());
-    println!(
-        "  {} {}  mcp-network-sensor {}",
-        "Live capture".green(),
-        ":".dimmed(),
-        "-i <interface>".white().bold(),
-    );
+    println!("{} mcp-network-sensor {}", "Usage:".bold(), "-i <interface> [options]".bold());
     println!();
-    println!("{}", "Options:".bright_white().bold());
-    println!(
-        "  {}   {}",
-        "-i <interface>".cyan(),
-        "Capture live traffic from the specified network interface".white(),
-    );
-    println!(
-        "  {}   {}",
-        "-d <db_path>  ".cyan(),
-        "SQLite database path (default: alerts.db)".white(),
-    );
-    println!(
-        "  {}   {}",
-        "-l            ".cyan(),
-        "List available network interfaces".white(),
-    );
-    println!(
-        "  {}   {}",
-        "--learning-time <min>".cyan(),
-        "AI learning phase duration in minutes (default: 10)".white(),
-    );
-    println!(
-        "  {}   {}",
-        "-h, --help    ".cyan(),
-        "Show this help message".white(),
-    );
+    println!("{}", "Options:".bold());
+    option("-i <interface>", "Capture live traffic from this network interface");
+    option("-d <db_path>", "SQLite database path (default: alerts.db)");
+    option("-l, --list", "List available network interfaces");
+    option("--learning-time <min>", "AI learning phase in minutes (default: 10)");
+    option("--ocsf-file <path>", "Also append alerts as OCSF JSON lines to this file");
+    option("--syslog <target>", "Also send alerts to syslog: local, udp://host[:port], tcp://host[:port]");
+    option("--no-ebpf", "Disable eBPF sensing (Linux builds with the ebpf feature)");
+    option("-h, --help", "Show this help message");
     println!();
-    println!("{}", "Anomaly Detection:".bright_white().bold());
     println!(
-        "  {}",
-        "The sensor includes an Isolation Forest ML model for automatic".dimmed(),
-    );
-    println!(
-        "  {}",
-        "false-positive suppression. During --learning-time, it collects".dimmed(),
-    );
-    println!(
-        "  {}",
-        "baseline traffic patterns. After training, it scores each alert".dimmed(),
-    );
-    println!(
-        "  {}",
-        "and suppresses those matching normal network behavior.".dimmed(),
+        "{}",
+        "Anomaly detection: an Isolation Forest learns normal traffic during --learning-time,\n\
+         then scores each alert and suppresses those that match normal behavior."
+            .dimmed()
     );
     println!();
 }
 
-/// Print the interface list with colors.
 pub fn print_interfaces(devices: &[pcap::Device]) {
     println!();
-    println!("{}", "Available network interfaces:".bright_white().bold());
+    println!("{}", "Available network interfaces:".bold());
     for dev in devices {
-        let desc = dev.desc.as_deref().unwrap_or("");
-        let addrs: Vec<String> = dev.addresses.iter().map(|a| format!("{}", a.addr)).collect();
-        let addr_str = if addrs.is_empty() {
-            String::from("no addresses")
+        let addrs: Vec<String> = dev.addresses.iter().map(|a| a.addr.to_string()).collect();
+        let addrs = if addrs.is_empty() {
+            "no addresses".to_string()
         } else {
             addrs.join(", ")
         };
-        let desc_part = if desc.is_empty() {
-            String::new()
-        } else {
-            format!(" -- {}", desc)
-        };
-        println!(
-            "  {} {} [{}]",
-            dev.name.cyan().bold(),
-            desc_part.dimmed(),
-            addr_str.white(),
-        );
+        let desc = dev.desc.as_deref().map(|d| format!(" {d}")).unwrap_or_default();
+        println!("  {}{} {}", dev.name.cyan().bold(), desc.dimmed(), format!("[{addrs}]").dimmed());
     }
     println!();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> MitreAlert {
+        MitreAlert::new(
+            "T1059",
+            "Command and Scripting Interpreter",
+            Severity::Critical,
+            95,
+            "127.0.0.1",
+            "127.0.0.1",
+            41092,
+            4444,
+            "tcp",
+            "reverse_shell",
+            "'bash' (pid 8260) redirected its stdout to a TCP connection with 127.0.0.1:4444",
+        )
+        .with_meta("proc_comm", "bash")
+        .with_meta("proc_cmdline", "bash -i")
+        .with_meta("flow_iat_mean", "1.0")
+    }
+
+    #[test]
+    fn alert_renders_as_plain_lines() {
+        colored::control::set_override(false);
+        let lines = alert_lines(&sample());
+        assert_eq!(lines.len(), 3);
+        assert!(lines[0].contains("CRITICAL T1059 Command and Scripting Interpreter [reverse_shell] tcp"));
+        assert!(lines[0].contains("127.0.0.1:41092 → 127.0.0.1:4444 conf 95"));
+        assert!(lines[1].starts_with(INDENT) && lines[1].contains("redirected its stdout"));
+        // Curated keys only, values with spaces quoted.
+        assert_eq!(lines[2].trim(), "proc_comm=bash proc_cmdline=\"bash -i\"");
+    }
+
+    #[test]
+    fn syslog_text_is_one_uncolored_line() {
+        let text = alert_text(&sample());
+        assert_eq!(
+            text,
+            "CRITICAL T1059 Command and Scripting Interpreter [reverse_shell] tcp \
+             127.0.0.1:41092 -> 127.0.0.1:4444 conf=95 \
+             | 'bash' (pid 8260) redirected its stdout to a TCP connection with 127.0.0.1:4444 \
+             | proc_comm=bash proc_cmdline=\"bash -i\""
+        );
+    }
+
+    #[test]
+    fn endpoints_without_port_or_with_ipv6() {
+        assert_eq!(endpoint("192.168.1.1", 0), "192.168.1.1");
+        assert_eq!(endpoint("fd07::1", 9000), "[fd07::1]:9000");
+        assert_eq!(endpoint("10.0.0.1", 80), "10.0.0.1:80");
+    }
+
+    #[test]
+    fn long_values_are_cut() {
+        let v = detail_value(&"x".repeat(200));
+        assert_eq!(v.chars().count(), MAX_VALUE_CHARS + 1);
+        assert!(v.ends_with('…'));
+    }
 }

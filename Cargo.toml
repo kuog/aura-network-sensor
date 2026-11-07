@@ -47,9 +47,6 @@ hickory-resolver = "0.25"
 # Colored terminal output for human-readable console alerts
 colored = "3"
 
-# Accurate terminal column-width for Unicode (emoji = 2 columns, etc.)
-unicode-width = "0.2"
-
 # Error handling
 anyhow = "1"
 thiserror = "2"

@@ -77,6 +77,14 @@ struct Args {
     #[arg(short = 'l', long = "list")]
     list_interfaces: bool,
 
+    /// Also append alerts as OCSF Detection Finding JSON lines to this file
+    #[arg(long = "ocsf-file", value_name = "path")]
+    ocsf_file: Option<std::path::PathBuf>,
+
+    /// Also send alerts to syslog: local, udp://host[:port] or tcp://host[:port]
+    #[arg(long = "syslog", value_name = "target")]
+    syslog: Option<pipeline::syslog::Target>,
+
     /// Disable eBPF sensing (process attribution, kernel flow accounting)
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     #[arg(long = "no-ebpf")]
@@ -114,6 +122,8 @@ fn main() {
     let interface = args.interface;
     let db_path = args.db_path;
     let learning_time = args.learning_time;
+    let ocsf_file = args.ocsf_file;
+    let syslog_target = args.syslog;
 
     #[cfg(all(target_os = "linux", feature = "ebpf"))]
     let use_ebpf = if args.no_ebpf {
@@ -144,6 +154,23 @@ fn main() {
         eprintln!();
         print_usage();
         return;
+    };
+
+    // ── Optional exports: OCSF file, syslog (own thread) ──────────────
+    let (events, export_thread) = if ocsf_file.is_some() || syslog_target.is_some() {
+        let config = pipeline::event_export::ExportConfig {
+            ocsf_file: ocsf_file.clone(),
+            syslog: syslog_target.clone(),
+        };
+        match pipeline::event_export::start(config) {
+            Ok((events, handle)) => (Some(events), Some(handle)),
+            Err(e) => {
+                error!("{:#}", e);
+                return;
+            }
+        }
+    } else {
+        (None, None)
     };
 
     // ── Shared shutdown flag ──────────────────────────────────────────
@@ -249,8 +276,14 @@ fn main() {
     }
 
     pipeline::console_fmt::print_banner();
-    pipeline::console_fmt::print_source_info("Live capture", &source_name);
+    pipeline::console_fmt::print_setting("live capture", &source_name);
     pipeline::console_fmt::print_pipeline_config(RING_BUFFER_CAPACITY, SNIFFER_CORE, ENGINE_CORE);
+    if let Some(path) = &ocsf_file {
+        pipeline::console_fmt::print_setting("OCSF file", &path.display().to_string());
+    }
+    if let Some(target) = &syslog_target {
+        pipeline::console_fmt::print_setting("syslog", &target.to_string());
+    }
 
     // ── Stage 3: Async Exporter (Tokio runtime on remaining cores) ────
     //
@@ -276,6 +309,7 @@ fn main() {
         dns_cache_exporter,
         anomaly_detector_exporter,
         process_lookup,
+        events,
     ));
 
     // Spawn the anomaly detection background flush task
@@ -363,6 +397,13 @@ fn main() {
         }
     });
     pipeline::console_fmt::print_stage_done("Exporter task");
+
+    // The export thread drains its queue once the exporter has dropped its sender.
+    if let Some(handle) = export_thread {
+        if let Err(e) = handle.join() {
+            error!("Export thread panicked: {:?}", e);
+        }
+    }
 
     // ── Persist state to database for next startup ──────────────────────
     {

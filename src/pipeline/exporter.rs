@@ -25,6 +25,7 @@ use crate::anomaly::detector::AnomalyDetector;
 use crate::anomaly::types::{DetectorPhase, FlowMetrics, Protocol};
 
 use super::alert::{MitreAlert, Severity};
+use super::event_export::EventSender;
 
 /// Shared counters for the exporter.
 pub struct ExporterStats {
@@ -155,6 +156,7 @@ pub async fn run(
     dns_cache: Arc<DnsCache>,
     anomaly_detector: Arc<AnomalyDetector>,
     process_lookup: Option<Arc<dyn ProcessLookup>>,
+    events: Option<EventSender>,
 ) {
     let db_file = db_path.unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
 
@@ -269,10 +271,15 @@ pub async fn run(
             }
         }
 
-        // 3. Cloud / Telegram (stub)
+        // 3. OCSF file / syslog (own thread, never blocks here)
+        if let Some(events) = &events {
+            events.submit(&alert);
+        }
+
+        // 4. Cloud / Telegram (stub)
         send_to_cloud(&alert).await;
 
-        // 4. Periodic DNS cache maintenance (every 100 alerts)
+        // 5. Periodic DNS cache maintenance (every 100 alerts)
         if alert_count % 100 == 0 {
             dns_tracker.evict_expired();
             dns_cache.evict_expired();

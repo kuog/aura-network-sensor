@@ -18,8 +18,11 @@
 pub mod alert;
 pub mod console_fmt;
 pub mod engine;
+pub mod event_export;
 pub mod exporter;
+pub mod ocsf;
 pub mod sniffer;
+pub mod syslog;
 
 use log::{info, warn};
 
