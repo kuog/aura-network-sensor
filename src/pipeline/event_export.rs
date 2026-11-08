@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn file_gets_one_ocsf_line_per_alert_and_debug_is_skipped() {
-        let dir = std::env::temp_dir().join(format!("mcp-export-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aura-export-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("alerts.ocsf.jsonl");
         let _ = std::fs::remove_file(&path);

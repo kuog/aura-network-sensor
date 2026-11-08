@@ -1,4 +1,4 @@
-//! # MCP Network Sensor — High-Performance NDR Pipeline
+//! # Aura Network Sensor — High-Performance NDR Pipeline
 //!
 //! A three-stage pipeline architecture for network detection and response:
 //!
@@ -58,7 +58,7 @@ const DEFAULT_LEARNING_TIME_MINUTES: u64 = 10;
 const FLOW_FLUSH_INTERVAL_SECS: u64 = 5;
 
 #[derive(Debug, Parser)]
-#[command(name = "mcp-network-sensor")]
+#[command(name = "aura-network-sensor")]
 #[command(about = "High-Performance NDR Pipeline", long_about = None)]
 struct Args {
     /// Interface name to capture from

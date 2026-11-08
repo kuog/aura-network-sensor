@@ -26,7 +26,7 @@ use super::{from_bytes, ip_from_bytes, namespace_id};
 use crate::analysis::process::{ProcInfo, ProcessLookup};
 use crate::pipeline::alert::{MitreAlert, Severity};
 
-// Must match `enum mcp_proc_event_kind` in common.h.
+// Must match `enum aura_proc_event_kind` in common.h.
 const EV_CONNECT: u32 = 1;
 const EV_ACCEPT: u32 = 2;
 const EV_STDIO_SOCKET: u32 = 3;
@@ -214,7 +214,7 @@ impl<'a> EventHandler<'a> {
     }
 
     fn handle(&mut self, data: &[u8]) {
-        let Some(ev) = from_bytes::<types::mcp_proc_event>(data) else {
+        let Some(ev) = from_bytes::<types::aura_proc_event>(data) else {
             return;
         };
         let v4 = ev.family == AF_INET;
@@ -237,7 +237,7 @@ impl<'a> EventHandler<'a> {
         }
     }
 
-    fn proc_info(&mut self, ev: &types::mcp_proc_event) -> ProcInfo {
+    fn proc_info(&mut self, ev: &types::aura_proc_event) -> ProcInfo {
         let comm = comm_string(&ev.comm);
         let pid_in_ns = ev.pid_in_ns != 0;
         let (exe, cmdline, ppid) = if pid_in_ns {
@@ -261,7 +261,7 @@ impl<'a> EventHandler<'a> {
         self.details.get(&pid).expect("entry was just ensured")
     }
 
-    fn reverse_shell(&mut self, ev: &types::mcp_proc_event, info: ProcInfo, local: IpAddr, remote: IpAddr) {
+    fn reverse_shell(&mut self, ev: &types::aura_proc_event, info: ProcInfo, local: IpAddr, remote: IpAddr) {
         let now = Instant::now();
         self.shell_alerts.retain(|_, at| now.duration_since(*at) < SHELL_ALERT_DEDUP);
         let key = (ev.pid, local, ev.lport, remote, ev.rport);

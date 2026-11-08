@@ -36,7 +36,7 @@ struct {
 } events SEC(".maps");
 
 /* Export the event layout to the Rust skeleton. */
-struct mcp_proc_event _mcp_proc_event_btf = {};
+struct aura_proc_event _aura_proc_event_btf = {};
 
 /*
  * vmlinux.h generated without CONFIG_NET_NS has an empty `possible_net_t`,
@@ -58,7 +58,7 @@ static __always_inline __u32 sk_netns_ino(struct sock *sk)
 	return net ? BPF_CORE_READ(net, ns.inum) : 0;
 }
 
-static __always_inline void fill_task(struct mcp_proc_event *e)
+static __always_inline void fill_task(struct aura_proc_event *e)
 {
 	struct bpf_pidns_info ns = {};
 	__u64 id = bpf_get_current_pid_tgid();
@@ -91,7 +91,7 @@ static __always_inline int emit_sock_event(struct sock *sk, __u32 kind, __u8 fd)
 	if (family != AF_INET && family != AF_INET6)
 		return 0;
 
-	struct mcp_proc_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+	struct aura_proc_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
 	if (!e)
 		return 0;
 	__builtin_memset(e, 0, sizeof(*e));
@@ -126,14 +126,14 @@ static __always_inline int emit_sock_event(struct sock *sk, __u32 kind, __u8 fd)
 SEC("kprobe/tcp_connect")
 int BPF_KPROBE(handle_tcp_connect, struct sock *sk)
 {
-	return emit_sock_event(sk, MCP_EV_CONNECT, 0);
+	return emit_sock_event(sk, AURA_EV_CONNECT, 0);
 }
 
 /* Returns the accepted connection, in the context of the accepting process. */
 SEC("kretprobe/inet_csk_accept")
 int BPF_KRETPROBE(handle_inet_csk_accept, struct sock *sk)
 {
-	return emit_sock_event(sk, MCP_EV_ACCEPT, 0);
+	return emit_sock_event(sk, AURA_EV_ACCEPT, 0);
 }
 
 static __always_inline int handle_dup(unsigned int oldfd, unsigned int newfd)
@@ -159,7 +159,7 @@ static __always_inline int handle_dup(unsigned int oldfd, unsigned int newfd)
 	if (!sock || BPF_CORE_READ(sock, type) != SOCK_STREAM)
 		return 0;
 
-	return emit_sock_event(BPF_CORE_READ(sock, sk), MCP_EV_STDIO_SOCKET, newfd);
+	return emit_sock_event(BPF_CORE_READ(sock, sk), AURA_EV_STDIO_SOCKET, newfd);
 }
 
 SEC("ksyscall/dup3")

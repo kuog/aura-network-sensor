@@ -1,4 +1,4 @@
-# MCP Network Sensor
+# Aura Network Sensor
 
 A passive network detection sensor written in Rust. It watches live traffic on
 an interface, reports suspicious activity as alerts mapped to MITRE ATT&CK
@@ -48,7 +48,7 @@ libpcap (Linux: PACKET_MMAP ring, macOS: BPF device).
 
 ```bash
 cargo build --release
-sudo ./target/release/mcp-network-sensor -i en0
+sudo ./target/release/aura-network-sensor -i en0
 ```
 
 ### Linux
@@ -61,7 +61,7 @@ sudo apt install -y build-essential pkg-config libpcap-dev
 
 ```bash
 cargo build --release
-sudo ./target/release/mcp-network-sensor -i eth0
+sudo ./target/release/aura-network-sensor -i eth0
 ```
 
 ### eBPF sensing (`--features ebpf`, Linux only)
@@ -85,8 +85,8 @@ dependencies: clang, libelf and zlib.
 ```bash
 sudo apt install -y clang llvm libelf-dev zlib1g-dev
 cargo build --release --features ebpf
-sudo ./target/release/mcp-network-sensor -i eth0              # eBPF on
-sudo ./target/release/mcp-network-sensor -i eth0 --no-ebpf    # pcap only (A/B)
+sudo ./target/release/aura-network-sensor -i eth0              # eBPF on
+sudo ./target/release/aura-network-sensor -i eth0 --no-ebpf    # pcap only (A/B)
 ```
 
 Without BTF, or if the programs fail to load, the sensor logs a warning and
@@ -136,11 +136,11 @@ Debug-level alerts (suppressed by reputation or by the anomaly model) are only
 printed and stored, not exported.
 
 ```bash
-sudo ./target/release/mcp-network-sensor -i eth0 --ocsf-file /var/log/mcp-sensor/alerts.ocsf.jsonl --syslog local
+sudo ./target/release/aura-network-sensor -i eth0 --ocsf-file /var/log/aura-sensor/alerts.ocsf.jsonl --syslog local
 ```
 
 ```bash
-journalctl -t mcp-network-sensor
+journalctl -t aura-network-sensor
 ```
 
 ## Data handling
@@ -161,9 +161,9 @@ eBPF build runs there. Each machine has its own pid and network namespaces;
 the sensor only reports sockets of its own network namespace.
 
 ```bash
-orb create ubuntu mcp-sensor
-orb -m mcp-sensor bash -lc 'sudo apt install -y build-essential clang llvm libelf-dev zlib1g-dev pkg-config libpcap-dev'
-orb -m mcp-sensor bash -lc 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+orb create ubuntu aura-sensor
+orb -m aura-sensor bash -lc 'sudo apt install -y build-essential clang llvm libelf-dev zlib1g-dev pkg-config libpcap-dev'
+orb -m aura-sensor bash -lc 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
 ```
 
 Build from the same checkout: run these from the repository root on the Mac
@@ -172,11 +172,11 @@ Use a separate target directory so the Linux and macOS builds don't share
 `target/`:
 
 ```bash
-orb -m mcp-sensor bash -lc 'CARGO_TARGET_DIR=$HOME/.cache/mcp-sensor-target cargo build --release --features ebpf'
+orb -m aura-sensor bash -lc 'CARGO_TARGET_DIR=$HOME/.cache/aura-sensor-target cargo build --release --features ebpf'
 ```
 
 ```bash
-orb -m mcp-sensor bash -lc 'sudo $HOME/.cache/mcp-sensor-target/release/mcp-network-sensor -i eth0'
+orb -m aura-sensor bash -lc 'sudo $HOME/.cache/aura-sensor-target/release/aura-network-sensor -i eth0'
 ```
 
 ### Editing and compiling BPF code
@@ -198,7 +198,7 @@ Apple clang has no BPF backend, so compile a single program by hand in the
 Linux machine (or with LLVM from Homebrew):
 
 ```bash
-orb -m mcp-sensor bash -lc 'clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 -fno-stack-protector -Wno-missing-declarations -I target/bpf-include -c src/bpf/flowfilter.bpf.c -o /tmp/flowfilter.bpf.o'
+orb -m aura-sensor bash -lc 'clang -g -O2 -target bpf -D__TARGET_ARCH_arm64 -fno-stack-protector -Wno-missing-declarations -I target/bpf-include -c src/bpf/flowfilter.bpf.c -o /tmp/flowfilter.bpf.o'
 ```
 
 ## License

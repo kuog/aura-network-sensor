@@ -4,23 +4,23 @@
  * mirror them by hand: each program declares a dummy global of every type it
  * shares, so libbpf-cargo exports the exact layouts into the skeleton.
  */
-#ifndef MCP_SENSOR_COMMON_H
-#define MCP_SENSOR_COMMON_H
+#ifndef AURA_SENSOR_COMMON_H
+#define AURA_SENSOR_COMMON_H
 
 #define COMM_LEN 16
 
 /* ── procmon ─────────────────────────────────────────────────────────── */
 
-enum mcp_proc_event_kind {
-	MCP_EV_CONNECT = 1,      /* outbound TCP connect() */
-	MCP_EV_ACCEPT = 2,       /* inbound TCP connection accepted */
-	MCP_EV_STDIO_SOCKET = 3, /* TCP socket dup'ed onto fd 0, 1 or 2 */
+enum aura_proc_event_kind {
+	AURA_EV_CONNECT = 1,      /* outbound TCP connect() */
+	AURA_EV_ACCEPT = 2,       /* inbound TCP connection accepted */
+	AURA_EV_STDIO_SOCKET = 3, /* TCP socket dup'ed onto fd 0, 1 or 2 */
 };
 
-struct mcp_proc_event {
+struct aura_proc_event {
 	__u64 ts_ns;     /* bpf_ktime_get_ns() */
 	__u64 cgroup_id;
-	__u32 kind;      /* enum mcp_proc_event_kind */
+	__u32 kind;      /* enum aura_proc_event_kind */
 	__u32 pid;       /* tgid: in the sensor's pid namespace if pid_in_ns, else global */
 	__u32 tid;
 	__u32 uid;
@@ -29,7 +29,7 @@ struct mcp_proc_event {
 	__u16 lport;     /* host byte order */
 	__u16 rport;     /* host byte order */
 	__u8 pid_in_ns;
-	__u8 fd;         /* target fd of MCP_EV_STDIO_SOCKET */
+	__u8 fd;         /* target fd of AURA_EV_STDIO_SOCKET */
 	__u8 laddr[16];  /* IPv4 uses the first 4 bytes */
 	__u8 raddr[16];
 	char comm[COMM_LEN];
@@ -38,7 +38,7 @@ struct mcp_proc_event {
 /* ── flowfilter ──────────────────────────────────────────────────────── */
 
 /* Directional 5-tuple, hashed byte-wise: keep padding explicit and zeroed. */
-struct mcp_flow_key {
+struct aura_flow_key {
 	__u8 saddr[16];  /* IPv4 uses the first 4 bytes */
 	__u8 daddr[16];
 	__u16 sport;     /* host byte order */
@@ -48,7 +48,7 @@ struct mcp_flow_key {
 	__u8 pad[2];
 };
 
-struct mcp_flow_stats {
+struct aura_flow_stats {
 	__u64 first_ns;      /* bpf_ktime_get_ns() of the first frame */
 	__u64 last_ns;       /* ... of the latest frame */
 	__u64 packets;       /* frames, as the capture socket sees them */
@@ -63,4 +63,4 @@ struct mcp_flow_stats {
 
 #define IAT_SQ_SHIFT 4
 
-#endif /* MCP_SENSOR_COMMON_H */
+#endif /* AURA_SENSOR_COMMON_H */

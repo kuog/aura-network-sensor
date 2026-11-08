@@ -17,7 +17,7 @@ use chrono::{DateTime, Local, SecondsFormat, Utc};
 
 use super::alert::Severity;
 
-const APP_NAME: &str = "mcp-network-sensor";
+const APP_NAME: &str = "aura-network-sensor";
 const FACILITY_LOCAL0: u8 = 16;
 const DEFAULT_PORT: u16 = 514;
 const TCP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -217,14 +217,14 @@ mod tests {
         let time = Utc.with_ymd_and_hms(2026, 11, 7, 13, 44, 15).unwrap();
         let line = format_rfc5424(Severity::Critical, time, "sensor-1", 42, "T1059", "CRITICAL T1059 ...");
         // local0 (16) * 8 + crit (2) = 130
-        assert_eq!(line, "<130>1 2026-11-07T13:44:15.000Z sensor-1 mcp-network-sensor 42 T1059 - CRITICAL T1059 ...");
+        assert_eq!(line, "<130>1 2026-11-07T13:44:15.000Z sensor-1 aura-network-sensor 42 T1059 - CRITICAL T1059 ...");
     }
 
     #[test]
     fn rfc3164_header() {
         let time = Local.with_ymd_and_hms(2026, 11, 7, 9, 5, 1).unwrap();
         let line = format_rfc3164(Severity::Info, time, 42, "msg");
-        assert_eq!(line, "<134>Nov  7 09:05:01 mcp-network-sensor[42]: msg");
+        assert_eq!(line, "<134>Nov  7 09:05:01 aura-network-sensor[42]: msg");
     }
 
     #[test]
@@ -238,7 +238,7 @@ mod tests {
         let n = server.recv(&mut buf).unwrap();
         let got = std::str::from_utf8(&buf[..n]).unwrap();
         assert!(got.starts_with("<131>1 "), "{got}");
-        assert!(got.contains(" sensor1 mcp-network-sensor "), "{got}");
+        assert!(got.contains(" sensor1 aura-network-sensor "), "{got}");
         assert!(got.ends_with(" T1046 - hello"), "{got}");
     }
 }

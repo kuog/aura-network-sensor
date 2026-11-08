@@ -36,13 +36,13 @@ const volatile __u32 dpi_limit = 16384;
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 131072);
-	__type(key, struct mcp_flow_key);
-	__type(value, struct mcp_flow_stats);
+	__type(key, struct aura_flow_key);
+	__type(value, struct aura_flow_stats);
 } flows SEC(".maps");
 
 /* Export the key/value layouts to the Rust skeleton. */
-struct mcp_flow_key _mcp_flow_key_btf = {};
-struct mcp_flow_stats _mcp_flow_stats_btf = {};
+struct aura_flow_key _aura_flow_key_btf = {};
+struct aura_flow_stats _aura_flow_stats_btf = {};
 
 static __always_inline int is_dns_port(__u16 port)
 {
@@ -71,7 +71,7 @@ int flow_filter(struct __sk_buff *skb)
 		off += 4;
 	}
 
-	struct mcp_flow_key key = {};
+	struct aura_flow_key key = {};
 	__u32 l4_off, ip_payload;
 
 	if (eth_proto == ETH_P_IP) {
@@ -144,7 +144,7 @@ int flow_filter(struct __sk_buff *skb)
 	}
 
 	__u64 now = bpf_ktime_get_ns();
-	struct mcp_flow_stats *st = bpf_map_lookup_elem(&flows, &key);
+	struct aura_flow_stats *st = bpf_map_lookup_elem(&flows, &key);
 
 	/* A handshake on a tuple whose previous connection has ended starts a
 	 * fresh flow, with a fresh DPI window. */
@@ -154,7 +154,7 @@ int flow_filter(struct __sk_buff *skb)
 		st = NULL;
 	}
 	if (!st) {
-		struct mcp_flow_stats fresh = {};
+		struct aura_flow_stats fresh = {};
 
 		fresh.first_ns = now;
 		fresh.last_ns = now;

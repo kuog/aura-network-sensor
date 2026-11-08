@@ -155,7 +155,7 @@ pub fn print_alert(alert: &MitreAlert) {
 // ── Startup ───────────────────────────────────────────────────────────────
 
 pub fn print_banner() {
-    println!("{} {}", "mcp-network-sensor".bold(), env!("CARGO_PKG_VERSION").dimmed());
+    println!("{} {}", "aura-network-sensor".bold(), env!("CARGO_PKG_VERSION").dimmed());
 }
 
 /// One `label: value` line of the startup settings.
@@ -246,7 +246,7 @@ pub fn print_usage() {
     let option = |flag: &str, text: &str| println!("  {:<24} {}", flag.cyan(), text);
 
     println!();
-    println!("{} mcp-network-sensor {}", "Usage:".bold(), "-i <interface> [options]".bold());
+    println!("{} aura-network-sensor {}", "Usage:".bold(), "-i <interface> [options]".bold());
     println!();
     println!("{}", "Options:".bold());
     option("-i <interface>", "Capture live traffic from this network interface");

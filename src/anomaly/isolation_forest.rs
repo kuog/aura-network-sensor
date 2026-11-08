@@ -36,7 +36,7 @@ use std::io::{Read, Write};
 
 /// Starts every model file, so a file in an older format is rejected instead
 /// of being decoded into garbage.
-const MODEL_FILE_MAGIC: &[u8] = b"MCPIF2\n";
+const MODEL_FILE_MAGIC: &[u8] = b"AURAIF2\n";
 
 // ── Configuration ──────────────────────────────────────────────────────────
 

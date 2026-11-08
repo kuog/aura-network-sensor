@@ -1128,7 +1128,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcp-network-sensor"
+name = "aura-network-sensor"
 version = "0.2.0"
 dependencies = [
  "anyhow",

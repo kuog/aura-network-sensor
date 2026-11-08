@@ -101,7 +101,7 @@ impl KernelFlowTracker {
         }
     }
 
-    fn read_map(&self) -> Vec<(types::mcp_flow_key, types::mcp_flow_stats)> {
+    fn read_map(&self) -> Vec<(types::aura_flow_key, types::aura_flow_stats)> {
         let parse = |k: &[u8], v: &[u8]| Some((from_bytes(k)?, from_bytes(v)?));
         match self.flows.lookup_batch(LOOKUP_BATCH, MapFlags::ANY, MapFlags::ANY) {
             Ok(entries) => entries.filter_map(|(k, v)| parse(&k, &v)).collect(),
@@ -211,7 +211,7 @@ impl FlowAccounting for KernelFlowTracker {
             return self.fallback.peek_metrics(src_ip, dst_ip, src_port, dst_port, protocol);
         };
         let value = self.flows.lookup(as_bytes(&raw_key), MapFlags::ANY).ok()??;
-        let stats: types::mcp_flow_stats = from_bytes(&value)?;
+        let stats: types::aura_flow_stats = from_bytes(&value)?;
         let key = FlowKey { src_ip, dst_ip, src_port, dst_port, protocol };
         let hist = self.payload.get(&key);
         Some(flow_metrics(&key, &stats, hist.as_deref()))
@@ -249,13 +249,13 @@ fn bpf_key(
     src_port: u16,
     dst_port: u16,
     protocol: Protocol,
-) -> Option<types::mcp_flow_key> {
+) -> Option<types::aura_flow_key> {
     let proto = match protocol {
         Protocol::Tcp => 6,
         Protocol::Udp => 17,
         _ => return None,
     };
-    let mut key = types::mcp_flow_key { sport: src_port, dport: dst_port, proto, ..Default::default() };
+    let mut key = types::aura_flow_key { sport: src_port, dport: dst_port, proto, ..Default::default() };
     match (src, dst) {
         (IpAddr::V4(s), IpAddr::V4(d)) => {
             key.family = 4;
@@ -272,7 +272,7 @@ fn bpf_key(
     Some(key)
 }
 
-fn flow_key(raw: &types::mcp_flow_key) -> FlowKey {
+fn flow_key(raw: &types::aura_flow_key) -> FlowKey {
     let v4 = raw.family == 4;
     FlowKey {
         src_ip: ip_from_bytes(v4, &raw.saddr),
@@ -284,7 +284,7 @@ fn flow_key(raw: &types::mcp_flow_key) -> FlowKey {
 }
 
 /// Same features as `FlowTracker` computes, from the kernel's running sums.
-fn flow_metrics(key: &FlowKey, st: &types::mcp_flow_stats, hist: Option<&ByteHistogram>) -> FlowMetrics {
+fn flow_metrics(key: &FlowKey, st: &types::aura_flow_stats, hist: Option<&ByteHistogram>) -> FlowMetrics {
     let packets = st.packets as f64;
     let mean_size = if st.packets > 0 { st.bytes as f64 / packets } else { 0.0 };
     let size_variance = if st.packets >= 2 {
@@ -345,7 +345,7 @@ mod tests {
     fn metrics_from_kernel_sums_match_the_userspace_definitions() {
         // Frames of 100, 110, 120, 130 bytes, gaps of 10, 20, 30 ms.
         let gaps_us = [10_000u64, 20_000, 30_000];
-        let stats = types::mcp_flow_stats {
+        let stats = types::aura_flow_stats {
             first_ns: 1_000_000_000,
             last_ns: 1_060_000_000,
             packets: 4,

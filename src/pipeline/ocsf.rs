@@ -13,7 +13,7 @@ use super::engine::is_local_ip;
 
 pub const OCSF_VERSION: &str = "1.9.0";
 
-const PRODUCT: &str = "mcp-network-sensor";
+const PRODUCT: &str = "aura-network-sensor";
 
 /// Alert metadata that lands in `evidences.process` rather than `unmapped`.
 const PROCESS_KEYS: &[&str] = &["proc_pid", "proc_ppid", "proc_uid", "proc_comm", "proc_exe", "proc_cmdline"];
