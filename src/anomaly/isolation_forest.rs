@@ -376,10 +376,10 @@ impl IsolationForest {
             .max_depth
             .unwrap_or_else(|| (config.subsample_size as f64).log2().ceil() as usize);
 
-        let mut rng: Box<dyn RngCore> = if let Some(seed) = config.seed {
+        let mut rng: Box<dyn Rng> = if let Some(seed) = config.seed {
             Box::new(StdRng::seed_from_u64(seed))
         } else {
-            Box::new(thread_rng())
+            Box::new(rand::rng())
         };
 
         let subsample_size = config.subsample_size.min(training_data.len());
@@ -546,7 +546,7 @@ impl IsolationForest {
         depth: usize,
         max_depth: usize,
         n_features: usize,
-        rng: &mut dyn RngCore,
+        rng: &mut dyn Rng,
     ) -> ITreeNode {
         // Base case: leaf node
         if data.len() <= 1 || depth >= max_depth {
@@ -556,7 +556,7 @@ impl IsolationForest {
         // Try to find a feature with non-zero range
         let mut attempts = 0;
         loop {
-            let feature = rng.gen_range(0..n_features);
+            let feature = rng.random_range(0..n_features);
 
             let min_val = data
                 .iter()
@@ -577,7 +577,7 @@ impl IsolationForest {
             }
 
             // Random split point between min and max
-            let threshold = rng.gen_range(min_val..max_val);
+            let threshold = rng.random_range(min_val..max_val);
 
             // Partition data
             let (left_data, right_data): (Vec<&[f64]>, Vec<&[f64]>) =
@@ -760,7 +760,7 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(42);
 
         for _ in 0..200 {
-            data.push(vec![rng.gen_range(4.0..6.0), rng.gen_range(4.0..6.0)]);
+            data.push(vec![rng.random_range(4.0..6.0), rng.random_range(4.0..6.0)]);
         }
 
         let config = IsolationForestConfig {
@@ -840,8 +840,8 @@ mod tests {
 
         for _ in 0..300 {
             data.push(vec![
-                rng.gen_range(0.4..0.6),
-                rng.gen_range(4000.0..6000.0),
+                rng.random_range(0.4..0.6),
+                rng.random_range(4000.0..6000.0),
             ]);
         }
 

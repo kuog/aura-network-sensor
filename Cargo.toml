@@ -7,19 +7,19 @@ license = "MIT"
 default-run = "mcp-network-sensor"
 
 [dependencies]
-md5 = "0.7"
+md5 = "0.8.1"
 tls-parser = "0.12"
-chrono = { version = "0.4.43", features = ["serde"] }
-etherparse = "0.19.0"
+chrono = { version = "0.4.45", features = ["serde"] }
+etherparse = "0.21.0"
 lru = "0.19"
-pcap = "2.4.0"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+pcap = "2.5.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
 ctrlc = { version = "3.4", features = ["termination"] }
-clap = { version = "4.5", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
 
 # Pipeline: high-performance inter-thread communication
-crossbeam-channel = "0.5"
+crossbeam-channel = "0.5.17"
 
 # Pipeline: CPU core pinning for dedicated threads
 core_affinity = "0.8"
@@ -28,17 +28,17 @@ core_affinity = "0.8"
 tokio = { version = "1", features = ["full"] }
 
 # Pipeline: SQLite persistence for alerts
-rusqlite = { version = "0.34", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "fallible_uint"] }
 
 # Concurrent hash map for ARP Guardian state table
-dashmap = "6"
+dashmap = "6.2.1"
 
 # Logging (non-blocking)
-log = "0.4"
-env_logger = "0.11"
+log = "0.4.35"
+env_logger = "0.11.11"
 
 # Fast CIDR / IP-range matching for CDN context layer
-ipnetwork = "0.20"
+ipnetwork = "0.21.1"
 
 # libc bindings for reverse DNS (getnameinfo)
 libc = "0.2"
@@ -54,7 +54,7 @@ anyhow = "1"
 thiserror = "2"
 
 # Random number generation (for Isolation Forest)
-rand = "0.8"
+rand = "0.10.3"
 
 # Serialization for ML model persistence
 postcard = { version = "1", default-features = false, features = ["use-std"] }
