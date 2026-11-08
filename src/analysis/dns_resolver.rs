@@ -46,9 +46,10 @@
 //! - **T1583.001** (Domain Squatting) — detected via Levenshtein distance.
 
 use dashmap::DashMap;
-use hickory_resolver::config::ResolverConfig;
-use hickory_resolver::name_server::TokioConnectionProvider;
-use hickory_resolver::Resolver;
+use hickory_resolver::config::{GOOGLE, ResolverConfig};
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::{Resolver, TokioResolver};
 use log::{debug, info, trace, warn};
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -56,9 +57,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
 use crate::pipeline::alert::{MitreAlert, Severity};
-
-/// Convenience alias for the Tokio-backed async resolver.
-type TokioResolver = Resolver<TokioConnectionProvider>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Cache Entry
@@ -223,30 +221,37 @@ impl DnsCache {
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Global async resolver instance, initialized once per Tokio runtime.
-static ASYNC_RESOLVER: OnceCell<TokioResolver> = OnceCell::const_new();
+static ASYNC_RESOLVER: OnceCell<Option<TokioResolver>> = OnceCell::const_new();
 
 /// Get or initialize the global async DNS resolver.
 ///
-/// Uses the system's `/etc/resolv.conf` configuration on Unix, or the
-/// Google/Cloudflare public resolvers as fallback.
-async fn get_resolver() -> &'static TokioResolver {
+/// Queries Google's public resolvers. Returns `None` if the resolver could
+/// not be built, in which case reverse lookups are skipped.
+async fn get_resolver() -> Option<&'static TokioResolver> {
     ASYNC_RESOLVER
         .get_or_init(|| async {
-            // Build the resolver with default config + Tokio provider
             let mut builder = Resolver::builder_with_config(
-                ResolverConfig::default(),
-                TokioConnectionProvider::default(),
+                ResolverConfig::udp_and_tcp(&GOOGLE),
+                TokioRuntimeProvider::default(),
             );
             let opts = builder.options_mut();
             opts.timeout = Duration::from_secs(3);
             opts.attempts = 2;
             opts.cache_size = 256;
 
-            let resolver = builder.build();
-            info!("[DnsResolver] Async resolver initialized (hickory-resolver)");
-            resolver
+            match builder.build() {
+                Ok(resolver) => {
+                    info!("[DnsResolver] Async resolver initialized (hickory-resolver)");
+                    Some(resolver)
+                }
+                Err(e) => {
+                    warn!("[DnsResolver] Failed to initialize resolver: {}", e);
+                    None
+                }
+            }
         })
         .await
+        .as_ref()
 }
 
 /// Perform an async reverse DNS (PTR) lookup for the given IP using
@@ -257,7 +262,7 @@ async fn get_resolver() -> &'static TokioResolver {
 /// This function is non-blocking and safe to call from the Tokio exporter
 /// task. It will **not** block the main packet capture loop.
 pub async fn reverse_lookup(ip: IpAddr) -> Option<(String, Duration)> {
-    let resolver = get_resolver().await;
+    let resolver = get_resolver().await?;
 
     // Apply a timeout to prevent hanging on unresponsive DNS servers
     let result = tokio::time::timeout(Duration::from_secs(5), resolver.reverse_lookup(ip)).await;
@@ -265,7 +270,11 @@ pub async fn reverse_lookup(ip: IpAddr) -> Option<(String, Duration)> {
     match result {
         Ok(Ok(lookup)) => {
             // Take the first PTR record
-            if let Some(name) = lookup.iter().next() {
+            let first_ptr = lookup.answers().iter().find_map(|record| match &record.data {
+                RData::PTR(ptr) => Some(ptr),
+                _ => None,
+            });
+            if let Some(name) = first_ptr {
                 let hostname = name.to_string().trim_end_matches('.').to_string();
                 // hickory-resolver doesn't directly expose per-record TTL in
                 // reverse_lookup results, so we use a sensible default.

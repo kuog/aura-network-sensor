@@ -34,6 +34,10 @@ use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
+/// Starts every model file, so a file in an older format is rejected instead
+/// of being decoded into garbage.
+const MODEL_FILE_MAGIC: &[u8] = b"MCPIF2\n";
+
 // ── Configuration ──────────────────────────────────────────────────────────
 
 /// Configuration for the Isolation Forest.
@@ -702,15 +706,16 @@ impl IsolationForest {
         self.metrics.as_ref()
     }
 
-    /// Save the model to a file using bincode serialization.
+    /// Save the model to a file using postcard serialization.
     pub fn save_to_file(&self, path: &str) -> Result<(), String> {
         let encoded =
-            bincode::serialize(self).map_err(|e| format!("Serialization error: {}", e))?;
+            postcard::to_stdvec(self).map_err(|e| format!("Serialization error: {}", e))?;
 
         let mut file = std::fs::File::create(path)
             .map_err(|e| format!("Failed to create file '{}': {}", path, e))?;
 
-        file.write_all(&encoded)
+        file.write_all(MODEL_FILE_MAGIC)
+            .and_then(|()| file.write_all(&encoded))
             .map_err(|e| format!("Failed to write model to '{}': {}", path, e))?;
 
         Ok(())
@@ -725,8 +730,12 @@ impl IsolationForest {
         file.read_to_end(&mut buffer)
             .map_err(|e| format!("Failed to read file '{}': {}", path, e))?;
 
+        let encoded = buffer
+            .strip_prefix(MODEL_FILE_MAGIC)
+            .ok_or_else(|| format!("'{}' is not a model file in the current format", path))?;
+
         let model: Self =
-            bincode::deserialize(&buffer).map_err(|e| format!("Deserialization error: {}", e))?;
+            postcard::from_bytes(encoded).map_err(|e| format!("Deserialization error: {}", e))?;
 
         Ok(model)
     }
@@ -811,6 +820,15 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(tmp_path);
+    }
+
+    #[test]
+    fn test_load_rejects_file_in_old_format() {
+        let path = std::env::temp_dir().join(format!("iforest-old-{}.bin", std::process::id()));
+        std::fs::write(&path, [0u8; 64]).unwrap();
+        let result = IsolationForest::load_from_file(path.to_str().unwrap());
+        let _ = std::fs::remove_file(&path);
+        assert!(result.is_err(), "A file without the magic header must not load");
     }
 
     #[test]
