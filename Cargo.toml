@@ -2,6 +2,8 @@
 name = "mcp-network-sensor"
 version = "0.2.0"
 edition = "2024"
+description = "Passive network detection sensor with MITRE ATT&CK alerts"
+license = "MIT"
 default-run = "mcp-network-sensor"
 
 [dependencies]
