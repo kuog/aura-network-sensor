@@ -98,29 +98,29 @@ fn persist_alert(conn: &Connection, alert: &MitreAlert) -> Result<(), rusqlite::
         Some(serde_json::to_string(&alert.metadata).unwrap_or_default())
     };
 
-    conn.execute(
+    let mut insert = conn.prepare_cached(
         "INSERT INTO alerts (
             timestamp, technique_id, technique_name, severity, confidence,
             src_ip, dst_ip, src_port, dst_port, protocol,
             trigger_name, logic, metadata, raw_json
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        rusqlite::params![
-            alert.timestamp.to_rfc3339(),
-            alert.technique_id,
-            alert.technique_name,
-            alert.severity.to_string(),
-            alert.confidence,
-            alert.src_ip,
-            alert.dst_ip,
-            alert.src_port,
-            alert.dst_port,
-            alert.protocol,
-            alert.trigger,
-            alert.logic,
-            metadata_json,
-            raw_json,
-        ],
     )?;
+    insert.execute(rusqlite::params![
+        alert.timestamp.to_rfc3339(),
+        alert.technique_id,
+        alert.technique_name,
+        alert.severity.to_string(),
+        alert.confidence,
+        alert.src_ip,
+        alert.dst_ip,
+        alert.src_port,
+        alert.dst_port,
+        alert.protocol,
+        alert.trigger,
+        alert.logic,
+        metadata_json,
+        raw_json,
+    ])?;
     Ok(())
 }
 
@@ -212,7 +212,7 @@ pub async fn run(
                     let tracker = dns_tracker.clone();
                     let ip = dst_ip;
 
-                    if let Some(name) = dns_tracker::reverse_lookup(ip).await {
+                    if let Some(name) = dns_tracker::reverse_lookup(&tracker, ip).await {
                         debug!("[Exporter] Reverse DNS (libc fallback): {} → {}", ip, name);
                         tracker.set_reverse(ip, name.clone());
                         alert.metadata.insert("dns_dst".to_string(), name.clone());
@@ -245,7 +245,7 @@ pub async fn run(
         {
             if let Ok(src_ip) = alert.src_ip.parse::<IpAddr>() {
                 if !dns_tracker.has_entry(&src_ip) {
-                    if let Some(name) = dns_tracker::reverse_lookup(src_ip).await {
+                    if let Some(name) = dns_tracker::reverse_lookup(&dns_tracker, src_ip).await {
                         debug!("[Exporter] Reverse DNS (libc fallback): {} → {}", src_ip, name);
                         dns_tracker.set_reverse(src_ip, name.clone());
                         alert.metadata.insert("dns_src".to_string(), name);

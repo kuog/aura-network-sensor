@@ -149,8 +149,9 @@ The sensor writes `alerts.db`, `alerts_features.db`, `suppressed.log` and
 `anomaly_model.bin` to the working directory. These files describe real
 traffic, so keep them out of version control and shared locations.
 
-To enrich alerts, the sensor sends reverse DNS (PTR) queries for observed IP
-addresses to Google Public DNS.
+To enrich alerts, the sensor sends reverse DNS (PTR) queries for observed
+public IP addresses to Google Public DNS. Private addresses are only looked up
+through the system resolver.
 
 ## Development
 

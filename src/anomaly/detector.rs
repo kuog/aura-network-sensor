@@ -322,9 +322,14 @@ pub async fn background_flush_task(
             break;
         }
 
-        // Flush completed flows to database
-        let completed = flow_tracker.flush_completed();
-        if !completed.is_empty() {
+        // Flush completed flows to database. This blocks on SQLite, so the
+        // runtime is told to move its other tasks to another worker.
+        tokio::task::block_in_place(|| {
+            let completed = flow_tracker.flush_completed();
+            if completed.is_empty() {
+                return;
+            }
+
             match db::insert_flows_batch(&conn, &completed) {
                 Ok(count) => {
                     total_flushed += count as u64;
@@ -343,7 +348,7 @@ pub async fn background_flush_task(
             if let Err(e) = db::prune_old_features(&conn, db::DEFAULT_MAX_FEATURES_ROWS) {
                 warn!("[AnomalyDetector] Failed to prune old features: {}", e);
             }
-        }
+        });
 
         // Check if we should trigger training
         if detector.should_train() {

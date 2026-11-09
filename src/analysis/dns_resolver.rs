@@ -48,6 +48,7 @@
 use dashmap::DashMap;
 use hickory_resolver::config::{GOOGLE, ResolverConfig};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
+use hickory_resolver::net::NetError;
 use hickory_resolver::proto::rr::RData;
 use hickory_resolver::{Resolver, TokioResolver};
 use log::{debug, info, trace, warn};
@@ -56,7 +57,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::OnceCell;
 
+use super::dns_tracker::LookupBackoff;
 use crate::pipeline::alert::{MitreAlert, Severity};
+use crate::pipeline::engine::is_local_ip;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Cache Entry
@@ -223,6 +226,9 @@ impl DnsCache {
 /// Global async resolver instance, initialized once per Tokio runtime.
 static ASYNC_RESOLVER: OnceCell<Option<TokioResolver>> = OnceCell::const_new();
 
+/// Backoff for lookups through the async resolver.
+static RESOLVER_BACKOFF: LookupBackoff = LookupBackoff::new();
+
 /// Get or initialize the global async DNS resolver.
 ///
 /// Queries Google's public resolvers. Returns `None` if the resolver could
@@ -262,6 +268,10 @@ async fn get_resolver() -> Option<&'static TokioResolver> {
 /// This function is non-blocking and safe to call from the Tokio exporter
 /// task. It will **not** block the main packet capture loop.
 pub async fn reverse_lookup(ip: IpAddr) -> Option<(String, Duration)> {
+    if RESOLVER_BACKOFF.is_active(Instant::now()) {
+        return None;
+    }
+
     let resolver = get_resolver().await?;
 
     // Apply a timeout to prevent hanging on unresponsive DNS servers
@@ -288,10 +298,14 @@ pub async fn reverse_lookup(ip: IpAddr) -> Option<(String, Duration)> {
         }
         Ok(Err(e)) => {
             trace!("[DnsResolver] Reverse lookup failed for {}: {}", ip, e);
+            if matches!(e, NetError::Timeout) {
+                RESOLVER_BACKOFF.trip(Instant::now());
+            }
             None
         }
         Err(_) => {
             warn!("[DnsResolver] Reverse lookup timed out for {}", ip);
+            RESOLVER_BACKOFF.trip(Instant::now());
             None
         }
     }
@@ -305,6 +319,11 @@ pub async fn reverse_lookup(ip: IpAddr) -> Option<(String, Duration)> {
 pub async fn resolve_and_cache(ip: IpAddr, cache: &DnsCache) -> Option<String> {
     if let Some(hostname) = cache.get(&ip) {
         return Some(hostname);
+    }
+
+    // Public resolvers have no PTR records for private addresses.
+    if is_local_ip(&ip) {
+        return None;
     }
 
     if let Some((hostname, ttl)) = reverse_lookup(ip).await {

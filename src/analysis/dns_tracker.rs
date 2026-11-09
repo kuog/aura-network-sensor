@@ -15,8 +15,42 @@
 use dashmap::DashMap;
 use log::{debug, trace};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// How long an address the system resolver has no name for is not asked about again.
+const NO_NAME_TTL: Duration = Duration::from_secs(300);
+
+/// How long lookups are skipped after one timed out.
+const LOOKUP_BACKOFF: Duration = Duration::from_secs(30);
+
+/// A lookup slower than this, even if it ends in "no name", was waiting on an
+/// unreachable server rather than getting an answer.
+const SLOW_LOOKUP: Duration = Duration::from_secs(2);
+
+/// Skips DNS lookups for a while after one timed out. Alerts are processed
+/// one at a time: with DNS unreachable, each would wait for the full timeout.
+pub struct LookupBackoff {
+    until: Mutex<Option<Instant>>,
+}
+
+impl LookupBackoff {
+    pub const fn new() -> Self {
+        Self { until: Mutex::new(None) }
+    }
+
+    pub fn is_active(&self, now: Instant) -> bool {
+        let until = self.until.lock().unwrap_or_else(|e| e.into_inner());
+        until.is_some_and(|until| now < until)
+    }
+
+    pub fn trip(&self, now: Instant) {
+        *self.until.lock().unwrap_or_else(|e| e.into_inner()) = Some(now + LOOKUP_BACKOFF);
+    }
+}
+
+/// Backoff for lookups through the system resolver.
+static SYSTEM_RESOLVER_BACKOFF: LookupBackoff = LookupBackoff::new();
 
 // ── Cache Entry ────────────────────────────────────────────────────────────
 
@@ -60,6 +94,8 @@ impl DnsEntry {
 #[derive(Debug)]
 pub struct DnsTracker {
     cache: DashMap<IpAddr, DnsEntry>,
+    /// Addresses the system resolver has no name for, and when it said so.
+    no_name: DashMap<IpAddr, Instant>,
 }
 
 impl DnsTracker {
@@ -67,6 +103,7 @@ impl DnsTracker {
     pub fn new() -> Self {
         Self {
             cache: DashMap::new(),
+            no_name: DashMap::new(),
         }
     }
 
@@ -95,6 +132,13 @@ impl DnsTracker {
     /// Check if an IP has a cached (non-expired) DNS entry.
     pub fn has_entry(&self, ip: &IpAddr) -> bool {
         self.get_name(ip).is_some()
+    }
+
+    /// Whether the system resolver recently said it has no name for this IP.
+    fn is_known_nameless(&self, ip: &IpAddr, now: Instant) -> bool {
+        self.no_name
+            .get(ip)
+            .is_some_and(|since| now.duration_since(*since) <= NO_NAME_TTL)
     }
 
     /// Return the number of entries currently in the cache (including expired).
@@ -157,6 +201,9 @@ impl DnsTracker {
 
     /// Evict all expired entries. Call periodically from a maintenance task.
     pub fn evict_expired(&self) {
+        let now = Instant::now();
+        self.no_name.retain(|_ip, since| now.duration_since(*since) <= NO_NAME_TTL);
+
         let before = self.cache.len();
         self.cache.retain(|_ip, entry| !entry.is_expired());
         let evicted = before - self.cache.len();
@@ -378,18 +425,44 @@ fn read_dns_name(data: &[u8], start: usize) -> Option<(String, usize)> {
 /// This is intended to be called from the Tokio exporter task when an IP
 /// has no passive DNS entry. Uses the system resolver via `getnameinfo`.
 ///
-/// Returns `Some(domain)` on success, `None` on failure or timeout.
-pub async fn reverse_lookup(ip: IpAddr) -> Option<String> {
-    let result = tokio::task::spawn_blocking(move || reverse_lookup_blocking(ip)).await;
+/// Returns `Some(domain)` on success, `None` on failure or timeout. Addresses
+/// known to have no name are not looked up again for a while, and nothing is
+/// looked up for a while after a lookup timed out.
+pub async fn reverse_lookup(tracker: &DnsTracker, ip: IpAddr) -> Option<String> {
+    let started = Instant::now();
+    if SYSTEM_RESOLVER_BACKOFF.is_active(started) || tracker.is_known_nameless(&ip, started) {
+        return None;
+    }
 
-    match result {
-        Ok(Some(name)) => Some(name),
-        _ => None,
+    let answer = tokio::task::spawn_blocking(move || reverse_lookup_blocking(ip)).await.ok()?;
+    let now = Instant::now();
+    match answer {
+        SystemLookup::Name(name) => Some(name),
+        SystemLookup::NoName if now.duration_since(started) < SLOW_LOOKUP => {
+            tracker.no_name.insert(ip, now);
+            None
+        }
+        SystemLookup::NoName | SystemLookup::Unavailable => {
+            SYSTEM_RESOLVER_BACKOFF.trip(now);
+            None
+        }
+        SystemLookup::Failed => None,
     }
 }
 
+/// Outcome of a lookup through the system resolver.
+enum SystemLookup {
+    Name(String),
+    /// The resolver answered: this address has no name.
+    NoName,
+    /// The resolver could not be reached in time.
+    Unavailable,
+    /// Any other error.
+    Failed,
+}
+
 /// Blocking reverse DNS lookup using libc getnameinfo.
-fn reverse_lookup_blocking(ip: IpAddr) -> Option<String> {
+fn reverse_lookup_blocking(ip: IpAddr) -> SystemLookup {
     use std::ffi::CStr;
 
     let mut host_buf = [0u8; 256];
@@ -413,7 +486,7 @@ fn reverse_lookup_blocking(ip: IpAddr) -> Option<String> {
                     host_buf.len() as libc::socklen_t,
                     std::ptr::null_mut(),
                     0,
-                    0,
+                    libc::NI_NAMEREQD,
                 )
             }
         }
@@ -434,23 +507,26 @@ fn reverse_lookup_blocking(ip: IpAddr) -> Option<String> {
                     host_buf.len() as libc::socklen_t,
                     std::ptr::null_mut(),
                     0,
-                    0,
+                    libc::NI_NAMEREQD,
                 )
             }
         }
     };
 
-    if ret == 0 {
-        let c_str = unsafe { CStr::from_ptr(host_buf.as_ptr() as *const libc::c_char) };
-        let name = c_str.to_string_lossy().to_string();
-        // If getnameinfo just returned the IP as a string, treat as no result
-        if name == ip.to_string() {
-            None
-        } else {
-            Some(name)
+    match ret {
+        0 => {
+            let c_str = unsafe { CStr::from_ptr(host_buf.as_ptr() as *const libc::c_char) };
+            let name = c_str.to_string_lossy().to_string();
+            // If getnameinfo just returned the IP as a string, treat as no result
+            if name == ip.to_string() {
+                SystemLookup::NoName
+            } else {
+                SystemLookup::Name(name)
+            }
         }
-    } else {
-        None
+        libc::EAI_NONAME => SystemLookup::NoName,
+        libc::EAI_AGAIN => SystemLookup::Unavailable,
+        _ => SystemLookup::Failed,
     }
 }
 
@@ -643,6 +719,43 @@ pub fn adjust_confidence(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nameless_addresses_are_remembered_for_a_while() {
+        let tracker = DnsTracker::new();
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        let now = Instant::now();
+        assert!(!tracker.is_known_nameless(&ip, now));
+
+        tracker.no_name.insert(ip, now);
+        assert!(tracker.is_known_nameless(&ip, now + NO_NAME_TTL));
+        assert!(!tracker.is_known_nameless(&ip, now + NO_NAME_TTL + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn evicting_forgets_old_nameless_addresses() {
+        let tracker = DnsTracker::new();
+        let (old, recent): (IpAddr, IpAddr) = ("203.0.113.7".parse().unwrap(), "203.0.113.8".parse().unwrap());
+        let now = Instant::now();
+        let long_ago = now.checked_sub(NO_NAME_TTL + Duration::from_secs(1)).expect("uptime");
+        tracker.no_name.insert(old, long_ago);
+        tracker.no_name.insert(recent, now);
+
+        tracker.evict_expired();
+        assert!(!tracker.no_name.contains_key(&old));
+        assert!(tracker.no_name.contains_key(&recent));
+    }
+
+    #[test]
+    fn backoff_lasts_for_its_period() {
+        let backoff = LookupBackoff::new();
+        let now = Instant::now();
+        assert!(!backoff.is_active(now));
+
+        backoff.trip(now);
+        assert!(backoff.is_active(now + LOOKUP_BACKOFF - Duration::from_secs(1)));
+        assert!(!backoff.is_active(now + LOOKUP_BACKOFF));
+    }
 
     #[test]
     fn test_cache_basic_operations() {
