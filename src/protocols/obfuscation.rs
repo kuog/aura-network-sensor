@@ -27,6 +27,10 @@ pub struct StegContext<'a> {
     pub sni: Option<&'a str>,
     /// Destination IP address (as string) — used for IP-based CDN matching.
     pub dst_ip: &'a str,
+    /// Shannon entropy of the payload.
+    pub entropy: f64,
+    /// Whether the payload looks like TLS 1.3.
+    pub is_tls_1_3: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -101,12 +105,13 @@ pub fn analyze_steganography_with_context(
         return None;
     }
 
-    let entropy = shannon_entropy(payload);
-
     // ── Step 1: TLS 1.3 Protocol Validation ─────────────────────────────
     // Before triggering T1001, check if the protocol is TLS 1.3.
     // TLS 1.3 traffic on port 443 with high entropy is expected behavior.
-    let is_tls_1_3 = context::looks_like_tls_1_3(payload);
+    let (entropy, is_tls_1_3) = match ctx {
+        Some(c) => (c.entropy, c.is_tls_1_3),
+        None => (shannon_entropy(payload), context::looks_like_tls_1_3(payload)),
+    };
     let protocol_feature_tag = if is_tls_1_3 && port == 443 {
         Some("TLS_1.3_Padding".to_string())
     } else if port == 443 {

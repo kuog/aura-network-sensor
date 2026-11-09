@@ -61,6 +61,7 @@ postcard = { version = "1", default-features = false, features = ["use-std"] }
 mimalloc = "0.1.52"
 memchr = "2.8.3"
 foldhash = "0.2.0"
+aho-corasick = "1.1.5"
 
 [features]
 # Linux-only eBPF sensing: process attribution, reverse-shell detection and

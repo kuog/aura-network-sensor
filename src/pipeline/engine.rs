@@ -697,14 +697,19 @@ fn analyze_tcp(
         return;
     };
 
+    // Inputs shared by the detectors below, computed once.
     let entropy = telemetry::shannon_entropy(&session_data);
     let port = alert_dp;
+    let is_tls13 = crate::analysis::context::looks_like_tls_1_3(&session_data);
+    let sni = enrichment::extract_sni(&session_data);
+    let alert_src_str = alert_src.to_string();
+    let alert_dst_str = alert_dst.to_string();
 
     // ── T1059 Interactive Shell ────────────────────────────────────────
     if let Some(shell_result) = shell::detect_interactive_shell(
         &session_data,
-        &alert_src.to_string(),
-        &alert_dst.to_string(),
+        &alert_src_str,
+        &alert_dst_str,
         alert_sp,
         alert_dp,
     ) {
@@ -746,8 +751,8 @@ fn analyze_tcp(
                     "Command and Scripting Interpreter",
                     Severity::Low, // Downgraded to lowest severity
                     suggested_confidence,
-                    alert_src.to_string(),
-                    alert_dst.to_string(),
+                    &alert_src_str,
+                    &alert_dst_str,
                     alert_sp,
                     alert_dp,
                     "tcp",
@@ -800,8 +805,8 @@ fn analyze_tcp(
                     "Command and Scripting Interpreter",
                     severity,
                     confidence,
-                    alert_src.to_string(),
-                    alert_dst.to_string(),
+                    &alert_src_str,
+                    &alert_dst_str,
                     alert_sp,
                     alert_dp,
                     "tcp",
@@ -849,8 +854,8 @@ fn analyze_tcp(
             "Non-Standard Port",
             severity,
             confidence,
-            alert_src.to_string(),
-            alert_dst.to_string(),
+            &alert_src_str,
+            &alert_dst_str,
             alert_sp,
             alert_dp,
             "tcp",
@@ -865,14 +870,11 @@ fn analyze_tcp(
     }
 
     // ── T1001 Obfuscation / Steganography ─────────────────────────────
-    // Build context for TLS-padding CDN heuristic (SNI extracted earlier
-    // in the enrichment path would be ideal, but we extract it here too
-    // to keep the obfuscation module self-contained for the fast path).
-    let sni_for_steg = crate::analysis::enrichment::extract_sni(&session_data);
-    let alert_dst_str = alert_dst.to_string();
     let steg_ctx = protocols::obfuscation::StegContext {
-        sni: sni_for_steg.as_deref(),
+        sni: sni.as_deref(),
         dst_ip: &alert_dst_str,
+        entropy,
+        is_tls_1_3: is_tls13,
     };
     if let Some(steg) = protocols::obfuscation::analyze_steganography_with_context(
         &session_data,
@@ -882,12 +884,11 @@ fn analyze_tcp(
         // ── Reputation Engine: Contextual Scoring ──────────────────────
         // Use the new reputation_engine to compute contextual confidence
         // with cloud provider CIDR matching, TLS 1.3 awareness, and SNI trust.
-        let is_tls13 = crate::analysis::context::looks_like_tls_1_3(&session_data);
         let rep_score = crate::analysis::reputation_engine::compute_contextual_score(
             100,
             &alert_dst_str,
             port,
-            sni_for_steg.as_deref(),
+            sni.as_deref(),
             &steg.pattern_type,
             is_tls13,
         );
@@ -897,10 +898,10 @@ fn analyze_tcp(
             // Use the context module for legacy flow classification, plus
             // the new reputation engine for contextual scoring.
             let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
-                &session_data,
+                is_tls13,
                 &alert_dst_str,
                 port,
-                sni_for_steg.as_deref(),
+                sni.as_deref(),
                 steg.observed_entropy,
             );
 
@@ -911,12 +912,12 @@ fn analyze_tcp(
                 // Fully suppress — log to suppressed.log for audit
                 crate::analysis::context::log_suppressed(
                     &steg.technique_id,
-                    &alert_src.to_string(),
+                    &alert_src_str,
                     &alert_dst_str,
                     port,
                     ctx_verdict.suppression_reason.as_deref().unwrap_or("Known CDN behavior"),
                     steg.cdn_provider.as_deref(),
-                    sni_for_steg.as_deref(),
+                    sni.as_deref(),
                 );
                 debug!(
                     "[Engine] T1001 suppressed: {} ({}:{} → {}:{}) [rep_confidence={}, is_standard_tls={}]",
@@ -941,8 +942,8 @@ fn analyze_tcp(
                     "Data Obfuscation",
                     severity,
                     rep_score.confidence,
-                    alert_src.to_string(),
-                    alert_dst.to_string(),
+                    &alert_src_str,
+                    &alert_dst_str,
                     alert_sp,
                     alert_dp,
                     "tcp",
@@ -973,7 +974,7 @@ fn analyze_tcp(
                 } else if let Some(ref reason) = ctx_verdict.suppression_reason {
                     alert = alert.with_meta("suppression_reason", reason);
                 }
-                if let Some(ref sni) = sni_for_steg {
+                if let Some(ref sni) = sni {
                     alert = alert.with_meta("sni", sni);
                 }
 
@@ -984,10 +985,10 @@ fn analyze_tcp(
             // Even for non-benign detections, run the confidence scoring
             // to see if relief factors should reduce severity.
             let ctx_verdict = crate::analysis::context::evaluate_t1001_context(
-                &session_data,
+                is_tls13,
                 &alert_dst_str,
                 port,
-                sni_for_steg.as_deref(),
+                sni.as_deref(),
                 steg.observed_entropy,
             );
 
@@ -1011,12 +1012,12 @@ fn analyze_tcp(
             if effective_confidence < 30 && rep_score.dst_identity.is_known_provider() {
                 crate::analysis::context::log_suppressed(
                     &steg.technique_id,
-                    &alert_src.to_string(),
+                    &alert_src_str,
                     &alert_dst_str,
                     port,
                     &format!("Reputation-adjusted confidence {} < 30 for {}", effective_confidence, rep_score.provider_name),
                     Some(rep_score.dst_identity.provider),
-                    sni_for_steg.as_deref(),
+                    sni.as_deref(),
                 );
                 debug!(
                     "[Engine] T1001 suppressed (reputation): confidence={} provider={} ({}:{} → {}:{})",
@@ -1032,8 +1033,8 @@ fn analyze_tcp(
                     "Data Obfuscation",
                     severity,
                     confidence,
-                    alert_src.to_string(),
-                    alert_dst.to_string(),
+                    &alert_src_str,
+                    &alert_dst_str,
                     alert_sp,
                     alert_dp,
                     "tcp",
@@ -1066,8 +1067,8 @@ fn analyze_tcp(
     if alert_sp == 445 || alert_dp == 445 {
         let anomalies = smb_tracker.analyze_smb(
             &session_data,
-            &alert_src.to_string(),
-            &alert_dst.to_string(),
+            &alert_src_str,
+            &alert_dst_str,
             alert_sp,
             alert_dp,
         );
@@ -1087,8 +1088,8 @@ fn analyze_tcp(
                 "Data from Network Shared Drive",
                 severity,
                 confidence,
-                alert_src.to_string(),
-                alert_dst.to_string(),
+                &alert_src_str,
+                &alert_dst_str,
                 alert_sp,
                 alert_dp,
                 "tcp",
@@ -1104,8 +1105,8 @@ fn analyze_tcp(
     // ── T1071.001 HTTP Anomaly ────────────────────────────────────────
     if let Some(_http_report) = protocols::http::analyze_http(
         &session_data,
-        &alert_src.to_string(),
-        &alert_dst.to_string(),
+        &alert_src_str,
+        &alert_dst_str,
         alert_sp,
         alert_dp,
     ) {
@@ -1134,8 +1135,8 @@ fn analyze_tcp(
             "Application Layer Protocol: Web Protocols",
             severity,
             confidence,
-            alert_src.to_string(),
-            alert_dst.to_string(),
+            &alert_src_str,
+            &alert_dst_str,
             alert_sp,
             alert_dp,
             "tcp",
@@ -1151,8 +1152,8 @@ fn analyze_tcp(
     // ── T1562.001 SSL Stripping ───────────────────────────────────────
     if let Some(_stripping_alert) = protocols::stripping::analyze(
         &session_data,
-        &alert_src.to_string(),
-        &alert_dst.to_string(),
+        &alert_src_str,
+        &alert_dst_str,
         alert_sp,
         alert_dp,
     ) {
@@ -1180,8 +1181,8 @@ fn analyze_tcp(
             "Impair Defenses: SSL Stripping",
             severity,
             confidence,
-            alert_src.to_string(),
-            alert_dst.to_string(),
+            &alert_src_str,
+            &alert_dst_str,
             alert_sp,
             alert_dp,
             "tcp",
@@ -1208,8 +1209,8 @@ fn analyze_tcp(
                 "Encrypted Channel: Asymmetric Cryptography",
                 Severity::Critical,
                 95,
-                alert_src.to_string(),
-                alert_dst.to_string(),
+                &alert_src_str,
+                &alert_dst_str,
                 alert_sp,
                 alert_dp,
                 "tcp",
@@ -1234,13 +1235,13 @@ fn analyze_tcp(
             is_beaconing,
             session_data: &session_data,
         };
-        let enrichment_result = enrichment::enrich(&scoring_input);
-        let sni_ref = enrichment_result.enriched_context.sni.as_deref();
+        let enrichment_result = enrichment::enrich_with_sni(&scoring_input, sni.as_deref());
+        let sni_ref = sni.as_deref();
 
         // ── Step 1b: IP Reputation Lookup ─────────────────────────────
         let flow_rep = reputation::evaluate_flow(
-            &alert_src.to_string(),
-            &alert_dst.to_string(),
+            &alert_src_str,
+            &alert_dst_str,
             alert_dp,
             sni_ref,
         );
@@ -1249,11 +1250,11 @@ fn analyze_tcp(
         // Also compute reputation engine score for enriched metadata
         let t1573_rep_score = crate::analysis::reputation_engine::compute_contextual_score(
             100,
-            &alert_dst.to_string(),
+            &alert_dst_str,
             alert_dp,
             sni_ref,
             "encrypted_channel",
-            crate::analysis::context::looks_like_tls_1_3(&session_data),
+            is_tls13,
         );
 
         if high_entropy_trigger || (entropy > 7.5 && is_standard_encrypted) {
@@ -1286,8 +1287,8 @@ fn analyze_tcp(
                         "Encrypted Channel",
                         severity,
                         0,
-                        alert_src.to_string(),
-                        alert_dst.to_string(),
+                        &alert_src_str,
+                        &alert_dst_str,
                         alert_sp,
                         alert_dp,
                         "tcp",
@@ -1329,8 +1330,8 @@ fn analyze_tcp(
                         "Encrypted Channel",
                         severity,
                         confidence,
-                        alert_src.to_string(),
-                        alert_dst.to_string(),
+                        &alert_src_str,
+                        &alert_dst_str,
                         alert_sp,
                         alert_dp,
                         "tcp",
@@ -1378,8 +1379,8 @@ fn analyze_tcp(
                         "Encrypted Channel",
                         severity,
                         enrichment_result.confidence_score,
-                        alert_src.to_string(),
-                        alert_dst.to_string(),
+                        &alert_src_str,
+                        &alert_dst_str,
                         alert_sp,
                         alert_dp,
                         "tcp",
@@ -1448,8 +1449,8 @@ fn analyze_tcp(
                 "Exfiltration Over Other Network Medium",
                 severity,
                 effective_confidence,
-                alert_src.to_string(),
-                alert_dst.to_string(),
+                &alert_src_str,
+                &alert_dst_str,
                 alert_sp,
                 alert_dp,
                 "tcp",

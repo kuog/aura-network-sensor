@@ -3,7 +3,9 @@
 //! Provides TLS SNI extraction, domain reputation lookup, and confidence scoring
 //! to reduce false positives from legitimate traffic (e.g., Exchange/O365 beaconing).
 
+use aho_corasick::AhoCorasick;
 use serde::Serialize;
+use std::sync::LazyLock;
 use tls_parser::{
     parse_tls_plaintext, parse_tls_extensions, TlsMessage, TlsMessageHandshake, TlsExtension,
 };
@@ -17,6 +19,11 @@ use tls_parser::{
 /// `data` should be the raw TCP payload starting at the TLS record header.
 /// Returns `Some(hostname)` if a valid SNI extension is found.
 pub fn extract_sni(data: &[u8]) -> Option<String> {
+    // Only a handshake record (content type 22) can hold a Client Hello.
+    if data.first() != Some(&0x16) {
+        return None;
+    }
+
     // Try the tls-parser crate first
     if let Some(sni) = extract_sni_via_parser(data) {
         return Some(sni);
@@ -331,27 +338,32 @@ pub struct EnrichedContext {
 /// (after the main capture loop hands off data) so it does **not** block
 /// the packet capture thread.
 pub fn enrich(input: &ScoringInput) -> EnrichmentResult {
+    enrich_with_sni(input, extract_sni(input.tls_payload).as_deref())
+}
+
+/// [`enrich`] for a caller that has already extracted the SNI.
+pub fn enrich_with_sni(input: &ScoringInput, sni: Option<&str>) -> EnrichmentResult {
     let mut score: i32 = 100;
     let mut notes: Vec<String> = Vec::new();
     let mut ctx = EnrichedContext::default();
 
-    // --- Step 1: Extract SNI ---
-    if let Some(sni) = extract_sni(input.tls_payload) {
-        ctx.sni = Some(sni.clone());
-        ctx.provider = identify_provider(&sni);
+    // --- Step 1: SNI ---
+    if let Some(sni) = sni {
+        ctx.sni = Some(sni.to_string());
+        ctx.provider = identify_provider(sni);
 
         // Rule A: Safe domain → -80
-        if is_safe_domain(&sni) {
+        if is_safe_domain(sni) {
             score -= 80;
             notes.push(format!("Rule A: SNI '{}' matches safe domain list (-80)", sni));
         }
 
         // Rule C: Beaconing to known CDN/Cloud → -40
-        if input.is_beaconing && is_cdn_cloud_provider(&sni) {
+        if input.is_beaconing && is_cdn_cloud_provider(sni) {
             score -= 40;
             notes.push(format!(
                 "Rule C: Beaconing to known CDN/Cloud provider '{}' (-40)",
-                ctx.provider.as_deref().unwrap_or(&sni)
+                ctx.provider.as_deref().unwrap_or(sni)
             ));
         }
     }
@@ -412,20 +424,13 @@ fn looks_like_tls(data: &[u8]) -> bool {
 /// patterns.  This is intentionally a simple heuristic – the real value
 /// comes from the SNI / reputation checks above.
 fn contains_suspicious_strings(data: &[u8]) -> bool {
-    const PATTERNS: &[&[u8]] = &[
-        b"id\n",
-        b"id\r",
-        b"whoami",
-        b"/bin/sh",
-        b"/bin/bash",
-        b"cmd.exe",
-        b"powershell",
-    ];
-    let lower: Vec<u8> = data.iter().map(|b| b.to_ascii_lowercase()).collect();
-    PATTERNS.iter().any(|pat| {
-        let pat_lower: Vec<u8> = pat.iter().map(|b| b.to_ascii_lowercase()).collect();
-        lower.windows(pat_lower.len()).any(|w| w == pat_lower.as_slice())
-    })
+    static PATTERNS: LazyLock<AhoCorasick> = LazyLock::new(|| {
+        AhoCorasick::builder()
+            .ascii_case_insensitive(true)
+            .build(["id\n", "id\r", "whoami", "/bin/sh", "/bin/bash", "cmd.exe", "powershell"])
+            .expect("valid patterns")
+    });
+    PATTERNS.is_match(data)
 }
 
 // ---------------------------------------------------------------------------
@@ -435,6 +440,20 @@ fn contains_suspicious_strings(data: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suspicious_strings_ignore_case() {
+        assert!(contains_suspicious_strings(b"xx WhoAmI xx"));
+        assert!(contains_suspicious_strings(b"id\r"));
+        assert!(contains_suspicious_strings(b"/BIN/BASH"));
+        assert!(!contains_suspicious_strings(b"identity\t cmd exe /bin/s"));
+    }
+
+    #[test]
+    fn only_handshake_records_have_an_sni() {
+        assert_eq!(extract_sni(b""), None);
+        assert_eq!(extract_sni(b"\x17\x03\x03\x00\x10 application data"), None);
+    }
 
     #[test]
     fn test_safe_domain_matching() {

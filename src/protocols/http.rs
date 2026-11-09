@@ -1,5 +1,6 @@
 // src/protocols/http.rs
 use serde::Serialize;
+use crate::protocols::is_header;
 use crate::report::Context;
 
 #[derive(Serialize)]
@@ -29,7 +30,23 @@ fn is_whitelisted(host: &str) -> bool {
     false
 }
 
+/// Whether `payload` can start with an HTTP method. Checked before converting
+/// the payload to text: most sessions are encrypted and fail on the first byte.
+/// The method may follow whitespace, Unicode whitespace included.
+fn may_start_with_http_method(payload: &[u8]) -> bool {
+    payload.first().is_some_and(|byte| {
+        matches!(
+            byte,
+            b'G' | b'P' | b'D' | b'H' | b'O' | b'C' | b'T' | b'\t'..=b'\r' | b' ' | 0xC2 | 0xE1 | 0xE2 | 0xE3
+        )
+    })
+}
+
 pub fn analyze_http(payload: &[u8], src_ip: &str, dst_ip: &str, src_port: u16, dst_port: u16) -> Option<HttpAnomalyReport> {
+    if !may_start_with_http_method(payload) {
+        return None;
+    }
+
     let headers_str = String::from_utf8_lossy(payload);
     let mut lines = headers_str.lines();
     
@@ -44,7 +61,7 @@ pub fn analyze_http(payload: &[u8], src_ip: &str, dst_ip: &str, src_port: u16, d
     }
     
     // 2. Check Host header for whitelist
-    let host_line = headers_str.lines().find(|l| l.to_lowercase().starts_with("host:"));
+    let host_line = headers_str.lines().find(|l| is_header(l, "host:"));
     if let Some(line) = host_line {
         let host = line.splitn(2, ':').nth(1).unwrap_or("").trim();
         if is_whitelisted(host) {
@@ -53,7 +70,7 @@ pub fn analyze_http(payload: &[u8], src_ip: &str, dst_ip: &str, src_port: u16, d
     }
     
     // 3. User-Agent check
-    let ua_line = headers_str.lines().find(|l| l.to_lowercase().starts_with("user-agent:"));
+    let ua_line = headers_str.lines().find(|l| is_header(l, "user-agent:"));
 
     match ua_line {
         Some(line) => {
@@ -173,4 +190,34 @@ fn analyze_http_agent(user_agent: &str) -> Option<(&'static str, String, &'stati
     }
 
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn analyze(payload: &[u8]) -> Option<HttpAnomalyReport> {
+        analyze_http(payload, "10.0.0.1", "10.0.0.2", 40000, 80)
+    }
+
+    #[test]
+    fn encrypted_payloads_are_not_http() {
+        assert!(analyze(b"").is_none());
+        assert!(analyze(b"\x16\x03\x01\x02\x00\x01 record").is_none());
+    }
+
+    #[test]
+    fn a_method_after_whitespace_is_still_a_request() {
+        for prefix in ["\t", " ", "\u{0b}", "\u{85}", "\u{a0}", "\u{1680}", "\u{2003}", "\u{205f}", "\u{3000}"] {
+            let request = format!("{prefix}GET / HTTP/1.1\r\nHost: example.org\r\n\r\n");
+            assert!(analyze(request.as_bytes()).is_some(), "prefix {prefix:?}");
+        }
+    }
+
+    #[test]
+    fn header_names_are_case_insensitive() {
+        assert!(analyze(b"GET / HTTP/1.1\r\nHOST: www.google.com\r\n\r\n").is_none());
+        let report = analyze(b"GET / HTTP/1.1\r\nuSeR-aGeNt: sqlmap/1.7\r\n\r\n").expect("suspicious agent");
+        assert_eq!(report.reason, "T1505: SQL Injection tool");
+    }
 }

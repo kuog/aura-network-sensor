@@ -557,13 +557,12 @@ pub struct ContextVerdict {
 /// 5. If confidence < 30 and flow is TRUSTED_INFRASTRUCTURE, suppress or
 ///    downgrade the alert.
 pub fn evaluate_t1001_context(
-    session_data: &[u8],
+    is_tls_1_3: bool,
     dst_ip: &str,
     dst_port: u16,
     sni: Option<&str>,
     observed_entropy: f64,
 ) -> ContextVerdict {
-    let is_tls_1_3 = looks_like_tls_1_3(session_data);
     let (flow_trust, cdn_result) = classify_flow(dst_ip, dst_port);
     let conf = compute_confidence(dst_ip, dst_port, sni);
 
@@ -752,7 +751,7 @@ mod tests {
     fn test_evaluate_t1001_suppressed() {
         // Cloudflare IP + port 443 + SNI + high entropy → should suppress
         let verdict = evaluate_t1001_context(
-            &[],
+            false,
             "104.16.0.1",
             443,
             Some("cdn.cloudflare.com"),
@@ -767,7 +766,7 @@ mod tests {
     #[test]
     fn test_evaluate_t1001_not_suppressed() {
         // Unknown IP + non-standard port + no SNI → should NOT suppress
-        let verdict = evaluate_t1001_context(&[], "192.168.1.1", 8080, None, 7.95);
+        let verdict = evaluate_t1001_context(false, "192.168.1.1", 8080, None, 7.95);
         assert!(!verdict.suppress);
         assert!(!verdict.downgrade_to_info);
         assert_eq!(verdict.confidence, 100);

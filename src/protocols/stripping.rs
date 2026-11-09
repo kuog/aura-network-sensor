@@ -1,5 +1,16 @@
+use aho_corasick::AhoCorasick;
 use serde::Serialize;
+use std::sync::LazyLock;
+use crate::protocols::is_header;
 use crate::report::Context;
+
+/// Every trigger on a request needs one of these in the payload.
+static REQUEST_MARKERS: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasick::builder()
+        .ascii_case_insensitive(true)
+        .build(["password=", "token=", "auth=", "user=", "login=", "cookie:"])
+        .expect("valid patterns")
+});
 
 #[derive(Serialize)]
 pub struct StrippingAlert {
@@ -21,6 +32,11 @@ fn build_context(src_ip: &str, dst_ip: &str, src_port: u16, dst_port: u16) -> Co
 }
 
 pub fn analyze(payload: &[u8], src_ip: &str, dst_ip: &str, src_port: u16, dst_port: u16) -> Option<StrippingAlert> {
+    // Most sessions are encrypted: settle them before converting to text.
+    if !payload.starts_with(b"HTTP/") && !REQUEST_MARKERS.is_match(payload) {
+        return None;
+    }
+
     let data_str = String::from_utf8_lossy(payload);
     let mut lines = data_str.lines();
     let first_line = lines.next()?;
@@ -51,10 +67,9 @@ fn analyze_response(headers: &str, first_line: &str, src_ip: &str, dst_ip: &str,
     // For Trigger 1, we look at Location header.
     
     for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("location:") {
+        if is_header(line, "location:") {
             location = line.splitn(2, ':').nth(1).map(|s| s.trim());
-        } else if lower.starts_with("set-cookie:") {
+        } else if is_header(line, "set-cookie:") {
             set_cookie = line.splitn(2, ':').nth(1).map(|s| s.trim());
         }
     }
@@ -113,10 +128,9 @@ fn analyze_request(headers: &str, first_line: &str, src_ip: &str, dst_ip: &str, 
     let mut cookie: Option<&str> = None;
     
     for line in headers.lines() {
-        let lower = line.to_lowercase();
-        if lower.starts_with("host:") {
+        if is_header(line, "host:") {
             host = line.splitn(2, ':').nth(1).map(|s| s.trim());
-        } else if lower.starts_with("cookie:") {
+        } else if is_header(line, "cookie:") {
             cookie = line.splitn(2, ':').nth(1).map(|s| s.trim());
         }
     }
@@ -209,4 +223,38 @@ fn extract_domain(url: &str) -> &str {
         return rest;
     }
     url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reason(payload: &[u8]) -> Option<String> {
+        analyze(payload, "10.0.0.1", "10.0.0.2", 40000, 80).map(|alert| alert.reason)
+    }
+
+    #[test]
+    fn payloads_without_markers_are_skipped() {
+        assert_eq!(reason(b"\x17\x03\x03\x10\x00 ciphertext \xff\xfe"), None);
+        assert_eq!(reason(b"GET / HTTP/1.1\r\nHost: example.org\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn a_sensitive_cookie_is_found_in_any_case() {
+        let expected = Some("Sensitive Cookie sent over HTTP".to_string());
+        assert_eq!(reason(b"GET / HTTP/1.1\r\nCOOKIE: session=1\r\n\r\n"), expected);
+        assert_eq!(reason(b"GET / HTTP/1.1\r\ncookie: session=1\r\n\r\n"), expected);
+    }
+
+    #[test]
+    fn markers_count_outside_http_too() {
+        assert_eq!(reason(b"HELLO token=1\r\n\r\n"), Some("Sensitive data in URL over HTTP".to_string()));
+        assert_eq!(reason(b"NOOP\r\n\r\nuser=alice"), Some("Login form data sent over HTTP".to_string()));
+    }
+
+    #[test]
+    fn a_downgrade_redirect_is_found_in_any_case() {
+        let response = b"HTTP/1.1 301 Moved\r\nlOcAtIoN: http://www.paypal.com/\r\n\r\n";
+        assert_eq!(reason(response), Some("Potential SSL Stripping detected (Downgrade Redirect)".to_string()));
+    }
 }

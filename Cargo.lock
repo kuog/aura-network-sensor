@@ -97,6 +97,7 @@ dependencies = [
 name = "aura-network-sensor"
 version = "0.2.0"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "chrono",
  "clap",

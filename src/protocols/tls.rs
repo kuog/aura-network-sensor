@@ -4,6 +4,11 @@ use tls_parser::{
 use md5;
 
 pub fn calculate_ja3(data: &[u8]) -> Option<String> {
+    // Only a handshake record (content type 22) can hold a Client Hello.
+    if data.first() != Some(&0x16) {
+        return None;
+    }
+
     // Parse the TLS record
     // We only care about the first record which should be the Client Hello
     if let Ok((_, record)) = parse_tls_plaintext(data) {
