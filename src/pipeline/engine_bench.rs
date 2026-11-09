@@ -995,6 +995,115 @@ fn random_payloads_do_not_stop_the_engine() {
     run_engine(&frames, 1);
 }
 
+// ── Fragmented traffic is analyzed ───────────────────────────────────────────
+
+const ETHERNET_AND_IPV4: usize = 14 + 20;
+
+/// The IP payload (transport header included) of a frame built without options.
+fn ip_payload(frame: Vec<u8>) -> Vec<u8> {
+    frame[ETHERNET_AND_IPV4..].to_vec()
+}
+
+fn ipv4_fragment(src: [u8; 4], dst: [u8; 4], id: u16, protocol: u8, offset: usize, more: bool, payload: &[u8]) -> RawPacket {
+    let mut frame = Vec::new();
+    frame.extend(MAC_A);
+    frame.extend(MAC_B);
+    frame.extend([0x08, 0x00, 0x45, 0x00]);
+    frame.extend(((20 + payload.len()) as u16).to_be_bytes());
+    frame.extend(id.to_be_bytes());
+    frame.extend((u16::from(more) << 13 | (offset / 8) as u16).to_be_bytes());
+    frame.extend([64, protocol, 0, 0]);
+    frame.extend(src);
+    frame.extend(dst);
+    frame.extend(payload);
+    RawPacket { timestamp: 1_700_000_000.0, data: frame }
+}
+
+/// Split an IP payload into fragments carrying `chunk` bytes each.
+fn fragmented(src: [u8; 4], dst: [u8; 4], id: u16, protocol: u8, datagram: &[u8], chunk: usize) -> Vec<RawPacket> {
+    assert_eq!(chunk % 8, 0);
+    let pieces: Vec<&[u8]> = datagram.chunks(chunk).collect();
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(i, piece)| ipv4_fragment(src, dst, id, protocol, i * chunk, i + 1 < pieces.len(), piece))
+        .collect()
+}
+
+fn normalized(mut alerts: Vec<MitreAlert>) -> Vec<String> {
+    for alert in &mut alerts {
+        alert.timestamp = DateTime::UNIX_EPOCH;
+        // Flow features are tracked per captured packet, so they differ.
+        alert.metadata.retain(|key, _| !key.starts_with("flow_"));
+    }
+    alerts.iter().map(|alert| serde_json::to_string(alert).unwrap()).collect()
+}
+
+#[test]
+fn fragmented_session_raises_the_same_alerts_as_a_whole_one() {
+    let (src, dst) = ([192, 168, 1, 10], [203, 0, 113, 5]);
+    let (client, server) = (ep(CLIENT, 40_000), ep(UNKNOWN, 80));
+    let request = b"GET / HTTP/1.1\r\nHost: example.org\r\nUser-Agent: curl/8.4.0\r\n\r\n";
+
+    let frame = tcp_frame(client, server, Tcp::Data, request);
+    let whole = run_engine(&[RawPacket { timestamp: 1_700_000_000.0, data: frame.clone() }], 1);
+    assert!(!whole.alerts.is_empty());
+
+    let frames = fragmented(src, dst, 7, 6, &ip_payload(frame), 24);
+    assert!(frames.len() > 1);
+    let reassembled = run_engine(&frames, 1);
+
+    assert_eq!(normalized(whole.alerts), normalized(reassembled.alerts));
+}
+
+#[test]
+fn fragmented_syn_scan_is_detected() {
+    let (src, dst) = ([192, 168, 1, 10], [192, 168, 1, 20]);
+    let mut frames = Vec::new();
+    for (id, port) in (1000..1026).enumerate() {
+        let syn = tcp_frame(ep(CLIENT, 50_000), ep(LAN, port), Tcp::Syn, b"");
+        // As `nmap -f`: the TCP header itself is split.
+        frames.extend(fragmented(src, dst, id as u16, 6, &ip_payload(syn), 8));
+    }
+    let outcome = run_engine(&frames, 1);
+    assert!(outcome.alerts.iter().any(|alert| alert.technique_id == "T1046"));
+}
+
+#[test]
+fn fragmented_dns_is_analyzed() {
+    let mut prng = Prng(9);
+    let name = format!("{}.{}.tunnel.example", prng.base62(55), prng.base62(55));
+    let query = udp_frame(ep(CLIENT, 40_000), ep(UNKNOWN, 53), &dns_query(1, &name));
+    let frames = fragmented([192, 168, 1, 10], [203, 0, 113, 5], 9, 17, &ip_payload(query), 32);
+    let outcome = run_engine(&frames, 1);
+    assert!(outcome.alerts.iter().any(|alert| alert.technique_id == "T1071.004"));
+}
+
+#[test]
+fn hostile_fragments_do_not_stop_the_engine() {
+    let (src, dst) = ([192, 168, 1, 10], [203, 0, 113, 5]);
+    let mut frames = vec![
+        // Past the IP limit, with duplicates adding up to the claimed end.
+        ipv4_fragment(src, dst, 1, 6, 65_528, false, &[0; 16]),
+        ipv4_fragment(src, dst, 1, 6, 0, true, &[0; 65_480]),
+        ipv4_fragment(src, dst, 1, 6, 0, true, &[0; 64]),
+        // Reassembles to something too short for a TCP header.
+        ipv4_fragment(src, dst, 2, 6, 0, true, &[0; 8]),
+        ipv4_fragment(src, dst, 2, 6, 8, false, &[0; 4]),
+        // Unknown protocol.
+        ipv4_fragment(src, dst, 3, 47, 0, true, &[0; 8]),
+        ipv4_fragment(src, dst, 3, 47, 8, false, &[0; 8]),
+    ];
+    let mut prng = Prng(11);
+    for id in 100..2000 {
+        let offset = (prng.next() >> 20) as usize % 8192 * 8;
+        let len = (prng.next() >> 20) as usize % 2000;
+        let payload = prng.bytes(len);
+        frames.push(ipv4_fragment(src, dst, id % 8, 6, offset, prng.next() & 1 == 0, &payload));
+    }
+    run_engine(&frames, 1);
+}
+
 #[test]
 #[ignore = "benchmark, run with --release --ignored --nocapture"]
 fn engine_throughput() {

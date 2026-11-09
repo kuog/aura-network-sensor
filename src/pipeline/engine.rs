@@ -9,7 +9,7 @@
 //! CPU-bound packet analysis.
 
 use crossbeam_channel::Receiver;
-use etherparse::{LinkHeader, NetHeaders, PacketHeaders, TransportHeader, VlanHeader};
+use etherparse::{IpNumber, LinkHeader, NetHeaders, PacketHeaders, TcpHeader, TransportHeader, UdpHeader, VlanHeader};
 use log::{debug, info};
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
@@ -26,7 +26,7 @@ use crate::analysis::reputation::{self, ReputationVerdict};
 use crate::anomaly::detector::AnomalyDetector;
 use crate::anomaly::flow_tracker::FlowAccounting;
 use crate::anomaly::types::{FlowKey, Protocol};
-use crate::l3_defrag::Defragmenter;
+use crate::l3_defrag::{Datagram, Defragmenter};
 use crate::l4_reassembly::{self, Reassembler};
 use crate::protocols;
 use crate::protocols::arp::parse_arp;
@@ -317,6 +317,33 @@ pub fn run(
                 );
             }
 
+            // ── IP reassembly ──────────────────────────────────────────────
+            // etherparse's `headers.payload` is the data AFTER all parsed
+            // headers, i.e. the application payload. A fragment has no
+            // transport header of its own, so `headers.transport` is empty
+            // and the payload is the IP fragment. Once a datagram is
+            // complete, its transport header comes from the reassembled
+            // bytes and it is analyzed like any other packet.
+            let datagram = match &headers.net {
+                Some(NetHeaders::Ipv4(ip_hdr, _)) => defrag.process(ip_hdr, headers.payload.slice()),
+                Some(NetHeaders::Ipv6(ip_hdr, exts)) => {
+                    defrag.process_ipv6(ip_hdr, exts.fragment.as_ref(), headers.payload.slice())
+                }
+                _ => Datagram::Incomplete,
+            };
+            let reassembled_transport;
+            let (transport, app_payload) = match &datagram {
+                Datagram::Whole(payload) => (headers.transport.as_ref(), *payload),
+                Datagram::Reassembled { protocol, bytes } => match parse_reassembled(*protocol, bytes) {
+                    Some((header, payload)) => {
+                        reassembled_transport = header;
+                        (Some(&reassembled_transport), payload)
+                    }
+                    None => continue,
+                },
+                Datagram::Incomplete => continue,
+            };
+
             // ── T1046 Scanning Detection (with Connection Tracking) ────────
             //
             // TCP: Only pure SYN packets (connection initiators) are counted.
@@ -332,7 +359,7 @@ pub fn run(
 
             // ── UDP ConnTracker bookkeeping: record ALL UDP flows ────────
             let mut is_udp_return = false;
-            if let Some(TransportHeader::Udp(udp)) = &headers.transport {
+            if let Some(TransportHeader::Udp(udp)) = transport {
                 is_udp_return = conn_tracker.is_return_traffic(
                     scan_src,
                     udp.source_port,
@@ -350,7 +377,7 @@ pub fn run(
 
             if is_local_ip(&scan_src) {
                 let dst_local = is_local_ip(&scan_dst);
-                match &headers.transport {
+                match transport {
                     Some(TransportHeader::Tcp(tcp)) => {
                         // TCP: only pure SYN = connection initiator
                         if tcp.syn && !tcp.ack {
@@ -421,7 +448,7 @@ pub fn run(
             // ── Inbound scan detection (remote → local, unsolicited) ────
             // Detect external hosts scanning our local machine.
             if !is_local_ip(&scan_src) && is_local_ip(&scan_dst) {
-                match &headers.transport {
+                match transport {
                     Some(TransportHeader::Tcp(tcp)) => {
                         // Inbound TCP SYN = someone scanning us
                         if tcp.syn && !tcp.ack {
@@ -474,106 +501,86 @@ pub fn run(
                 }
             }
 
-            // ── Application payload extraction (IPv4/IPv6 defrag) ─────────
-            // etherparse's `headers.payload` is the data AFTER all parsed
-            // headers (link + network + transport), i.e. the application-layer
-            // payload. For fragmented packets, the transport header may be
-            // missing, so `headers.payload` is the IP fragment payload which
-            // must be reassembled.
-            let app_payload: Option<Vec<u8>> = match &headers.net {
-                Some(NetHeaders::Ipv4(ip_hdr, _)) => {
-                    let ip_payload_bytes = headers.payload.slice();
-                    defrag.process(ip_hdr, ip_payload_bytes)
+            let src_ip = scan_src;
+            let dst_ip = scan_dst;
+
+            match transport {
+                Some(TransportHeader::Tcp(tcp)) => {
+                    analyze_tcp(
+                        &mut tcp_reassembler,
+                        &matrix,
+                        &mut smb_tracker,
+                        app_payload,
+                        src_ip,
+                        dst_ip,
+                        tcp,
+                        raw.timestamp,
+                        &emit,
+                        &stats,
+                        &dns_tracker,
+                    );
                 }
-                Some(NetHeaders::Ipv6(ip_hdr, exts)) => {
-                    let ip_payload_bytes = headers.payload.slice();
-                    defrag.process_ipv6(ip_hdr, exts.fragment.as_ref(), ip_payload_bytes)
-                }
-                _ => None,
-            };
+                Some(TransportHeader::Udp(udp)) => {
+                    // DNS analysis (T1071.004) + Passive DNS tracking
+                    if udp.destination_port == 53 || udp.source_port == 53 {
+                        let dns_data = app_payload;
+                        if !dns_data.is_empty() {
 
-            if let Some(app_payload) = app_payload {
-                let src_ip = scan_src;
-                let dst_ip = scan_dst;
+                            // ── Passive DNS: ingest responses into the tracker ──
+                            if udp.source_port == 53 {
+                                dns_tracker::ingest_dns_response(dns_data, &dns_tracker);
+                            }
 
-                match headers.transport {
-                    Some(TransportHeader::Tcp(tcp)) => {
-                        analyze_tcp(
-                            &mut tcp_reassembler,
-                            &matrix,
-                            &mut smb_tracker,
-                            &app_payload,
-                            src_ip,
-                            dst_ip,
-                            &tcp,
-                            raw.timestamp,
-                            &emit,
-                            &stats,
-                            &dns_tracker,
-                        );
-                    }
-                    Some(TransportHeader::Udp(udp)) => {
-                        // DNS analysis (T1071.004) + Passive DNS tracking
-                        if udp.destination_port == 53 || udp.source_port == 53 {
-                            let dns_data = &app_payload;
-                            if !dns_data.is_empty() {
+                            // ── T1071.004: DNS tunneling / anomaly detection ────
+                            if let Some(dns_report) = dns::analyze_dns(dns_data) {
+                                // Normalize direction for alert: local = src, remote = dst
+                                let (alert_src, alert_dst, alert_sp, alert_dp) =
+                                    normalize_alert_direction(
+                                        src_ip, dst_ip,
+                                        udp.source_port, udp.destination_port,
+                                    );
 
-                                // ── Passive DNS: ingest responses into the tracker ──
-                                if udp.source_port == 53 {
-                                    dns_tracker::ingest_dns_response(dns_data, &dns_tracker);
-                                }
+                                // ── Importance-lowering: known DNS resolver ──────
+                                // DNS queries to well-known public resolvers
+                                // (Google, Cloudflare, etc.) on standard port 53
+                                // are far less likely to be tunneling.
+                                let dst_rep = reputation::lookup_ip(&alert_dst);
+                                let is_standard_dns = alert_dp == 53;
+                                let (severity, confidence) = if dst_rep.is_trusted && is_standard_dns {
+                                    // Known resolver on standard port — likely benign
+                                    (Severity::Low, 20u8)
+                                } else if dst_rep.is_trusted {
+                                    // Known resolver on non-standard port — mild suspicion
+                                    (Severity::Medium, 45u8)
+                                } else {
+                                    // Unknown resolver — full severity
+                                    (Severity::High, 80u8)
+                                };
 
-                                // ── T1071.004: DNS tunneling / anomaly detection ────
-                                if let Some(dns_report) = dns::analyze_dns(dns_data) {
-                                    // Normalize direction for alert: local = src, remote = dst
-                                    let (alert_src, alert_dst, alert_sp, alert_dp) =
-                                        normalize_alert_direction(
-                                            src_ip, dst_ip,
-                                            udp.source_port, udp.destination_port,
-                                        );
+                                let mut alert = MitreAlert::new(
+                                    "T1071.004",
+                                    "Application Layer Protocol: DNS",
+                                    severity,
+                                    confidence,
+                                    alert_src.to_string(),
+                                    alert_dst.to_string(),
+                                    alert_sp,
+                                    alert_dp,
+                                    "udp",
+                                    "dns_anomaly",
+                                    serde_json::to_string(&dns_report).unwrap_or_default(),
+                                )
+                                .with_meta("dst_provider", &dst_rep.provider);
 
-                                    // ── Importance-lowering: known DNS resolver ──────
-                                    // DNS queries to well-known public resolvers
-                                    // (Google, Cloudflare, etc.) on standard port 53
-                                    // are far less likely to be tunneling.
-                                    let dst_rep = reputation::lookup_ip(&alert_dst);
-                                    let is_standard_dns = alert_dp == 53;
-                                    let (severity, confidence) = if dst_rep.is_trusted && is_standard_dns {
-                                        // Known resolver on standard port — likely benign
-                                        (Severity::Low, 20u8)
-                                    } else if dst_rep.is_trusted {
-                                        // Known resolver on non-standard port — mild suspicion
-                                        (Severity::Medium, 45u8)
-                                    } else {
-                                        // Unknown resolver — full severity
-                                        (Severity::High, 80u8)
-                                    };
+                                // Enrich with DNS names for src/dst IPs
+                                enrich_alert_with_dns(&dns_tracker, &mut alert, None);
 
-                                    let mut alert = MitreAlert::new(
-                                        "T1071.004",
-                                        "Application Layer Protocol: DNS",
-                                        severity,
-                                        confidence,
-                                        alert_src.to_string(),
-                                        alert_dst.to_string(),
-                                        alert_sp,
-                                        alert_dp,
-                                        "udp",
-                                        "dns_anomaly",
-                                        serde_json::to_string(&dns_report).unwrap_or_default(),
-                                    )
-                                    .with_meta("dst_provider", &dst_rep.provider);
-
-                                    // Enrich with DNS names for src/dst IPs
-                                    enrich_alert_with_dns(&dns_tracker, &mut alert, None);
-
-                                    emit(alert, &stats);
-                                }
+                                emit(alert, &stats);
                             }
                         }
                     }
-                    _ => {}
                 }
+                _ => {}
             }
         }
     }
@@ -584,6 +591,22 @@ pub fn run(
         "[Engine] Stopped. Analyzed: {}, Alerts generated: {}",
         total_analyzed, total_alerts
     );
+}
+
+/// The transport header and application payload of a reassembled datagram.
+fn parse_reassembled(protocol: u8, bytes: &[u8]) -> Option<(TransportHeader, &[u8])> {
+    match IpNumber(protocol) {
+        IpNumber::TCP => {
+            let (header, payload) = TcpHeader::from_slice(bytes).ok()?;
+            Some((TransportHeader::Tcp(header), payload))
+        }
+        IpNumber::UDP => {
+            let (header, rest) = UdpHeader::from_slice(bytes).ok()?;
+            let payload_len = usize::from(header.length).saturating_sub(UdpHeader::LEN).min(rest.len());
+            Some((TransportHeader::Udp(header), &rest[..payload_len]))
+        }
+        _ => None,
+    }
 }
 
 /// Normalize packet direction for alert display.
