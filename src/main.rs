@@ -30,6 +30,7 @@ pub mod pipeline;
 pub mod ebpf;
 
 use log::{error, info, warn};
+use mimalloc::MiMalloc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use clap::Parser;
@@ -43,6 +44,11 @@ use anomaly::flow_tracker::{FlowAccounting, FlowTracker};
 use pipeline::engine::EngineStats;
 use pipeline::exporter::ExporterStats;
 use pipeline::sniffer::{PcapSource, SnifferStats};
+
+// Every packet is allocated on the sniffer thread and freed on the engine
+// thread, the pattern the system allocators handle worst.
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 // ── Ring buffer capacity (packets) ────────────────────────────────────────
 const RING_BUFFER_CAPACITY: usize = 10_000;

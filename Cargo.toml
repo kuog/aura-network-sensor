@@ -58,6 +58,7 @@ rand = "0.10.3"
 
 # Serialization for ML model persistence
 postcard = { version = "1", default-features = false, features = ["use-std"] }
+mimalloc = "0.1.52"
 
 [features]
 # Linux-only eBPF sensing: process attribution, reverse-shell detection and
@@ -71,3 +72,7 @@ libbpf-rs = { version = "0.27", optional = true }
 libbpf-cargo = { version = "0.27", optional = true }
 # Pre-generated vmlinux.h per architecture; CO-RE adapts it to the running kernel.
 vmlinux = { git = "https://github.com/libbpf/vmlinux.h.git", rev = "c32912840154a82205530cd6d498b346ac73a6d1", optional = true }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
