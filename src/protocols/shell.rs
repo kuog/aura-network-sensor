@@ -493,28 +493,19 @@ pub fn detect_interactive_shell(payload: &[u8], src_ip: &str, dst_ip: &str, src_
         return None;
     }
 
-    // Convert payload to string lossily to perform string matching
-    let payload_str = String::from_utf8_lossy(payload);
-
     // ── Early exit: skip well-formed HTTP requests and responses.
     // Shell sessions never start with HTTP method/status lines.  Matching
     // recon-command keywords inside HTTP headers produces false positives
     // (e.g. "Proxy-ID" matching "id", "Set-Cookie" matching "set").
-    {
-        let start = &payload_str[..payload_str.len().min(16)];
-        if start.starts_with("HTTP/")
-            || start.starts_with("GET ")
-            || start.starts_with("POST ")
-            || start.starts_with("PUT ")
-            || start.starts_with("HEAD ")
-            || start.starts_with("DELETE ")
-            || start.starts_with("OPTIONS ")
-            || start.starts_with("PATCH ")
-            || start.starts_with("CONNECT ")
-        {
-            return None;
-        }
+    const HTTP_PREFIXES: &[&[u8]] = &[
+        b"HTTP/", b"GET ", b"POST ", b"PUT ", b"HEAD ", b"DELETE ", b"OPTIONS ", b"PATCH ", b"CONNECT ",
+    ];
+    if HTTP_PREFIXES.iter().any(|prefix| payload.starts_with(prefix)) {
+        return None;
     }
+
+    // Convert payload to string lossily to perform string matching
+    let payload_str = String::from_utf8_lossy(payload);
 
     let mut matched_patterns = Vec::new();
     let mut shell_type = String::new();

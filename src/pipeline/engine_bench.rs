@@ -905,6 +905,96 @@ fn run_engine(frames: &[RawPacket], rounds: usize) -> Outcome {
     }
 }
 
+// ── A packet must never stop the engine ──────────────────────────────────────
+
+/// One frame that completes a session, so deep inspection runs on `payload`.
+fn inspected_frame(src_port: u16, dst_port: u16, payload: &[u8]) -> RawPacket {
+    RawPacket {
+        timestamp: 1_700_000_000.0,
+        data: tcp_frame(ep(CLIENT, src_port), ep(UNKNOWN, dst_port), Tcp::Data, payload),
+    }
+}
+
+#[test]
+fn short_smb_payload_does_not_stop_the_engine() {
+    run_engine(&[inspected_frame(40_000, 445, b"\r\n\r\nX")], 1);
+}
+
+#[test]
+fn odd_smb_name_length_does_not_stop_the_engine() {
+    let mut create = smb_create("password.txt");
+    create[70] = 3;
+    run_engine(&[inspected_frame(40_000, 445, &create)], 1);
+}
+
+#[test]
+fn multibyte_char_across_byte_16_does_not_stop_the_engine() {
+    run_engine(&[inspected_frame(40_000, 4444, b"AAAAAAAAAAAAAAA\xFF\r\n\r\n")], 1);
+    run_engine(&[inspected_frame(40_000, 4444, "AAAAAAAAAAAAAAAЯ text\r\n\r\n".as_bytes())], 1);
+}
+
+#[test]
+fn client_hello_without_handshake_header_does_not_stop_the_engine() {
+    run_engine(&[inspected_frame(40_000, 443, b"\x16\x03\x01\x00\x01\x01\r\n\r\n")], 1);
+}
+
+#[test]
+fn random_payloads_do_not_stop_the_engine() {
+    let mut prng = Prng(0xfeed_beef_cafe_f00d);
+    let mut frames = Vec::new();
+    let mut src_port = 1024u16;
+    for round in 0..4000 {
+        let len = (prng.next() >> 40) as usize % 96;
+        let mut payload = match round % 6 {
+            0 => prng.bytes(len),
+            // TLS record with a short or inconsistent handshake.
+            1 => {
+                let mut record = vec![0x16, 0x03, 0x01, 0x00, (len % 8) as u8, 0x01];
+                record.extend(prng.bytes(len));
+                record
+            }
+            // SMB with attacker-chosen name offset and length.
+            2 => {
+                let mut smb = smb_header(5, 0);
+                smb.resize(72 + len, 0);
+                let tail = prng.bytes(8);
+                smb[68..72].copy_from_slice(&tail[..4]);
+                smb[71] = 0;
+                smb[69] = 0;
+                smb
+            }
+            3 => {
+                let mut smb = vec![0, 0, 0, 0];
+                smb.extend(b"\xFESMB");
+                smb.truncate(4 + len % 5);
+                smb
+            }
+            // Multibyte text at every alignment.
+            4 => {
+                let mut text = "A".repeat(len % 32).into_bytes();
+                text.extend("ЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯЯ".as_bytes());
+                text.extend(b"ascii tail so the payload is not binary, ascii tail");
+                text
+            }
+            _ => {
+                let mut text = b"GET ".to_vec();
+                text.extend(prng.bytes(len));
+                text
+            }
+        };
+        payload.extend(b"\r\n\r\n");
+
+        for dst_port in [445, 443, 80, 4444] {
+            src_port = if src_port == u16::MAX { 1024 } else { src_port + 1 };
+            frames.push(inspected_frame(src_port, dst_port, &payload));
+        }
+        let client = ep(CLIENT, src_port);
+        frames.push(RawPacket { timestamp: 1_700_000_000.0, data: udp_frame(client, ep(UNKNOWN, 53), &payload) });
+        frames.push(RawPacket { timestamp: 1_700_000_000.0, data: udp_frame(ep(UNKNOWN, 53), client, &payload) });
+    }
+    run_engine(&frames, 1);
+}
+
 #[test]
 #[ignore = "benchmark, run with --release --ignored --nocapture"]
 fn engine_throughput() {

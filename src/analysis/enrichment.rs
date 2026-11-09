@@ -68,8 +68,8 @@ fn extract_sni_manual(data: &[u8]) -> Option<String> {
     }
     let hs = &data[5..5 + record_len];
 
-    // Handshake type 1 = Client Hello
-    if hs.is_empty() || hs[0] != 0x01 {
+    // Handshake header: type 1 (Client Hello) + 24-bit length
+    if hs.len() < 4 || hs[0] != 0x01 {
         return None;
     }
     let hs_len = u32::from_be_bytes([0, hs[1], hs[2], hs[3]]) as usize;

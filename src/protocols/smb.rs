@@ -38,7 +38,7 @@ impl SmbTracker {
         let mut anomalies = Vec::new();
 
         // Check for NetBIOS header (4 bytes) + SMB2 Header
-        let smb_start = if payload.len() > 4 && &payload[4..8] == b"\xFESMB" {
+        let smb_start = if payload.len() >= 8 && &payload[4..8] == b"\xFESMB" {
             4
         } else if payload.len() >= 4 && &payload[0..4] == b"\xFESMB" {
             0
@@ -150,7 +150,7 @@ impl SmbTracker {
         // SMB2 names are UTF-16LE
         let name_string = String::from_utf16_lossy(
             &name_bytes
-                .chunks(2)
+                .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect::<Vec<u16>>(),
         );
