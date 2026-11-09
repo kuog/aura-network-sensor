@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libpcap-dev clang libelf-dev zlib1g-dev
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Test with eBPF
+        run: cargo test --locked --features ebpf
