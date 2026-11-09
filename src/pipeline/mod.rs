@@ -18,6 +18,8 @@
 pub mod alert;
 pub mod console_fmt;
 pub mod engine;
+#[cfg(test)]
+mod engine_bench;
 pub mod event_export;
 pub mod exporter;
 pub mod ocsf;
