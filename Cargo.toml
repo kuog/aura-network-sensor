@@ -59,6 +59,8 @@ rand = "0.10.3"
 # Serialization for ML model persistence
 postcard = { version = "1", default-features = false, features = ["use-std"] }
 mimalloc = "0.1.52"
+memchr = "2.8.3"
+foldhash = "0.2.0"
 
 [features]
 # Linux-only eBPF sensing: process attribution, reverse-shell detection and

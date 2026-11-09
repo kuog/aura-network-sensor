@@ -136,32 +136,42 @@ pub fn run(
     // reassembler can never reach the threshold.
     let mut exfil_alerted: HashSet<l4_reassembly::FlowKey> = HashSet::new();
     let mut last_exfil_check = Instant::now();
+    let mut check_exfil_totals = |now: Instant| {
+        if now.duration_since(last_exfil_check) < EXFIL_CHECK_INTERVAL {
+            return;
+        }
+        last_exfil_check = now;
+        if let Some(totals) = flow_tracker.take_tcp_payload_totals() {
+            for alert in exfil_alerts_from_totals(totals, &mut exfil_alerted, &dns_tracker) {
+                emit(alert, &stats);
+            }
+        }
+    };
 
     // ── Main analysis loop ────────────────────────────────────────────
     loop {
-        if last_exfil_check.elapsed() >= EXFIL_CHECK_INTERVAL {
-            last_exfil_check = Instant::now();
-            if let Some(totals) = flow_tracker.take_tcp_payload_totals() {
-                for alert in exfil_alerts_from_totals(totals, &mut exfil_alerted, &dns_tracker) {
-                    emit(alert, &stats);
-                }
-            }
-        }
-
-        // Use recv_timeout so we can periodically check the shutdown flag
-        let raw = match rx.recv_timeout(Duration::from_millis(100)) {
+        // While packets are queued there is no need for a receive deadline.
+        let raw = match rx.try_recv() {
             Ok(pkt) => pkt,
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                if !running.load(Ordering::Relaxed) {
+            Err(_) => match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(pkt) => pkt,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    check_exfil_totals(Instant::now());
+                    continue;
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                    debug!("[Engine] Sniffer channel disconnected");
                     break;
                 }
-                continue;
-            }
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                debug!("[Engine] Sniffer channel disconnected");
-                break;
-            }
+            },
         };
+
+        // The one clock read per packet: every timer below uses this value.
+        let now = Instant::now();
+        check_exfil_totals(now);
 
         stats.analyzed.fetch_add(1, Ordering::Relaxed);
 
@@ -314,6 +324,7 @@ pub fn run(
                     raw.timestamp,
                     tcp_fin,
                     tcp_rst,
+                    now,
                 );
             }
 
@@ -365,6 +376,7 @@ pub fn run(
                     udp.source_port,
                     scan_dst,
                     udp.destination_port,
+                    now,
                 );
                 // Always record the flow so the reverse direction is seen as return traffic
                 conn_tracker.record_flow(
@@ -372,6 +384,7 @@ pub fn run(
                     udp.source_port,
                     scan_dst,
                     udp.destination_port,
+                    now,
                 );
             }
 
@@ -381,7 +394,7 @@ pub fn run(
                     Some(TransportHeader::Tcp(tcp)) => {
                         // TCP: only pure SYN = connection initiator
                         if tcp.syn && !tcp.ack {
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true, dst_local) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true, dst_local, now) {
                                 // ── Importance-lowering: local-to-local scanning ────
                                 let (severity, confidence) = if dst_local {
                                     // Internal network discovery — routine IT activity
@@ -414,7 +427,7 @@ pub fn run(
                         // UDP: check ConnTracker — is this an unsolicited packet?
                         if !is_udp_return {
                             let is_initiator = true;
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, is_initiator, dst_local) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, is_initiator, dst_local, now) {
                                 // ── Importance-lowering: local-to-local scanning ────
                                 let (severity, confidence) = if dst_local {
                                     (Severity::Low, 30u8)
@@ -452,7 +465,7 @@ pub fn run(
                     Some(TransportHeader::Tcp(tcp)) => {
                         // Inbound TCP SYN = someone scanning us
                         if tcp.syn && !tcp.ack {
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true, true) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, tcp.destination_port, true, true, now) {
                                 let mut alert = MitreAlert::new(
                                     "T1046",
                                     "Network Service Discovery",
@@ -476,7 +489,7 @@ pub fn run(
                         // Inbound UDP: only count if NOT return traffic
                         if !is_udp_return {
                             // Unsolicited inbound UDP — potential scan
-                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, true, true) {
+                            if let Some(scan_alert) = scanner_tracker.update(scan_src, scan_dst, udp.destination_port, true, true, now) {
                                 let mut alert = MitreAlert::new(
                                     "T1046",
                                     "Network Service Discovery",
@@ -641,13 +654,12 @@ fn analyze_tcp(
     src_ip: IpAddr,
     dst_ip: IpAddr,
     tcp: &etherparse::TcpHeader,
-    _timestamp: f64,
+    timestamp: f64,
     emit: &impl Fn(MitreAlert, &Arc<EngineStats>),
     stats: &Arc<EngineStats>,
     dns_tracker: &DnsTracker,
 ) {
     let is_upload = is_local_ip(&src_ip);
-    let packet_len = app_payload.len() as u64;
 
     // ── Normalized direction for alerts ─────────────────────────────────
     // The raw `src_ip`/`dst_ip` and `tcp.source_port`/`tcp.destination_port`
@@ -656,42 +668,33 @@ fn analyze_tcp(
     let (alert_src, alert_dst, alert_sp, alert_dp) =
         normalize_alert_direction(src_ip, dst_ip, tcp.source_port, tcp.destination_port);
 
-    // ── Exfiltration detection (T1041) ────────────────────────────────
-    // Per-packet byte counting; with kernel flow accounting the engine only
-    // sees the DPI window and T1041 comes from `exfil_alerts_from_totals`.
-    if let Some((up, down, ratio)) = tcp_reassembler.update_stats(
+    // ── TCP reassembly ────────────────────────────────────────────────
+    // NOTE: `app_payload` is already the application-layer data
+    // (etherparse's `headers.payload` excludes link/net/transport headers),
+    // so we must NOT skip tcp.header_len() again.
+    let segment = tcp_reassembler.add_segment(
         src_ip,
         dst_ip,
         tcp.source_port,
         tcp.destination_port,
-        packet_len,
+        app_payload,
         is_upload,
-    ) {
+        timestamp,
+    );
+
+    // ── Exfiltration detection (T1041) ────────────────────────────────
+    // Per-packet byte counting; with kernel flow accounting the engine only
+    // sees the DPI window and T1041 comes from `exfil_alerts_from_totals`.
+    if let Some((up, down, ratio)) = segment.exfil {
         emit(
             exfil_alert(alert_src, alert_dst, alert_sp, alert_dp, up, down, ratio, dns_tracker),
             stats,
         );
     }
 
-    // ── TCP reassembly + deep inspection ──────────────────────────────
-    // NOTE: `full_ip_payload` is already the application-layer data
-    // (etherparse's `headers.payload` excludes link/net/transport headers),
-    // so we must NOT skip tcp.header_len() again.
-    let app_data = app_payload;
-    if app_data.is_empty() {
+    // ── Deep inspection ───────────────────────────────────────────────
+    let Some((session_data, b_score)) = segment.session else {
         return;
-    }
-
-    let (session_data, b_score) = match tcp_reassembler.add_segment(
-        src_ip,
-        dst_ip,
-        tcp.source_port,
-        tcp.destination_port,
-        app_data,
-        _timestamp,
-    ) {
-        Some(result) => result,
-        None => return,
     };
 
     let entropy = telemetry::shannon_entropy(&session_data);

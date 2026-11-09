@@ -11,9 +11,11 @@ use std::mem::MaybeUninit;
 use std::net::IpAddr;
 use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Mutex;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use dashmap::DashMap;
+use foldhash::fast::RandomState;
 use libbpf_rs::skel::{OpenSkel, SkelBuilder};
 use libbpf_rs::{MapCore, MapFlags, MapHandle};
 use log::debug;
@@ -71,7 +73,7 @@ pub fn load() -> Result<FlowFilter> {
 pub struct KernelFlowTracker {
     flows: MapHandle,
     /// Entropy input: payload delivered to userspace, per directional flow.
-    payload: DashMap<FlowKey, ByteHistogram>,
+    payload: DashMap<FlowKey, ByteHistogram, RandomState>,
     /// Frames the kernel does not account (non-TCP/UDP, IP fragments) always
     /// reach userspace whole, so the userspace tracker counts them exactly.
     fallback: FlowTracker,
@@ -95,7 +97,7 @@ impl KernelFlowTracker {
     fn new(flows: MapHandle) -> Self {
         Self {
             flows,
-            payload: DashMap::new(),
+            payload: DashMap::default(),
             fallback: FlowTracker::new(),
             tcp_totals: Mutex::new(TcpTotals::default()),
         }
@@ -176,11 +178,12 @@ impl FlowAccounting for KernelFlowTracker {
         timestamp: f64,
         tcp_fin: bool,
         tcp_rst: bool,
+        now: Instant,
     ) -> bool {
         if !matches!(protocol, Protocol::Tcp | Protocol::Udp) {
             return self.fallback.record_packet(
                 src_ip, dst_ip, src_port, dst_port, protocol, payload_len, payload, timestamp,
-                tcp_fin, tcp_rst,
+                tcp_fin, tcp_rst, now,
             );
         }
         // Counters live in the kernel; userspace only samples payload bytes.

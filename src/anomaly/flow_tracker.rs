@@ -7,6 +7,7 @@
 //! - A TCP FIN or RST flag is observed
 
 use dashmap::DashMap;
+use foldhash::fast::RandomState;
 use log::debug;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -60,7 +61,8 @@ struct FlowState {
     /// Total payload bytes transferred (excluding headers).
     payload_bytes: u64,
     /// Byte histogram of the first `MAX_PAYLOAD_SAMPLE` payload bytes (entropy).
-    payload_hist: ByteHistogram,
+    /// Absent until the flow carries payload: many flows never do.
+    payload_hist: Option<Box<ByteHistogram>>,
     /// Packet sizes (bytes), over every packet of the flow.
     sizes: RunningStats,
     /// Inter-arrival times between consecutive packets (milliseconds).
@@ -75,15 +77,15 @@ struct FlowState {
 const MAX_PAYLOAD_SAMPLE: usize = 65_536;
 
 impl FlowState {
-    fn new(timestamp: f64) -> Self {
+    fn new(timestamp: f64, now: Instant) -> Self {
         Self {
-            last_seen: Instant::now(),
+            last_seen: now,
             first_timestamp: timestamp,
             last_timestamp: timestamp,
             packet_count: 0,
             bytes_count: 0,
             payload_bytes: 0,
-            payload_hist: ByteHistogram::default(),
+            payload_hist: None,
             sizes: RunningStats::default(),
             iats: RunningStats::default(),
             fin_seen: false,
@@ -92,7 +94,7 @@ impl FlowState {
     }
 
     /// Update the flow state with a new packet captured at `timestamp`.
-    fn update(&mut self, payload_len: u64, payload: Option<&[u8]>, timestamp: f64) {
+    fn update(&mut self, payload_len: u64, payload: Option<&[u8]>, timestamp: f64, now: Instant) {
         // Inter-arrival time from capture timestamps, not processing time, so
         // queueing inside the pipeline does not distort it. Timestamps from
         // different CPUs can be slightly out of order: never go negative.
@@ -101,15 +103,15 @@ impl FlowState {
             self.iats.push(iat_ms);
         }
         self.last_timestamp = self.last_timestamp.max(timestamp);
-        self.last_seen = Instant::now();
+        self.last_seen = now;
 
         self.packet_count = self.packet_count.saturating_add(1);
         self.bytes_count += payload_len;
         self.sizes.push(payload_len as f64);
 
-        if let Some(data) = payload {
+        if let Some(data) = payload.filter(|data| !data.is_empty()) {
             self.payload_bytes += data.len() as u64;
-            self.payload_hist.add(data, MAX_PAYLOAD_SAMPLE);
+            self.payload_hist.get_or_insert_default().add(data, MAX_PAYLOAD_SAMPLE);
         }
     }
 
@@ -151,7 +153,7 @@ impl FlowState {
 
     /// Convert to FlowMetrics for persistence and ML inference.
     fn to_metrics(&self, key: &FlowKey) -> FlowMetrics {
-        let entropy = self.payload_hist.entropy();
+        let entropy = self.payload_hist.as_deref().map_or(0.0, ByteHistogram::entropy);
 
         FlowMetrics {
             timestamp: self.first_timestamp,
@@ -195,6 +197,7 @@ pub trait FlowAccounting: Send + Sync {
         timestamp: f64,
         tcp_fin: bool,
         tcp_rst: bool,
+        now: Instant,
     ) -> bool;
 
     /// Current metrics of a live flow, without removing it.
@@ -238,10 +241,11 @@ impl FlowAccounting for FlowTracker {
         timestamp: f64,
         tcp_fin: bool,
         tcp_rst: bool,
+        now: Instant,
     ) -> bool {
         FlowTracker::record_packet(
             self, src_ip, dst_ip, src_port, dst_port, protocol, payload_len, payload, timestamp,
-            tcp_fin, tcp_rst,
+            tcp_fin, tcp_rst, now,
         )
     }
 
@@ -275,8 +279,9 @@ impl FlowAccounting for FlowTracker {
 /// Completed flows (by timeout or TCP FIN/RST) are flushed and returned
 /// as [`FlowMetrics`] for persistence and ML inference.
 pub struct FlowTracker {
-    /// Active flows indexed by 5-tuple.
-    flows: DashMap<FlowKey, FlowState>,
+    /// Active flows indexed by 5-tuple. The keys are attacker-controlled: the
+    /// hasher is fast but seeded per process.
+    flows: DashMap<FlowKey, FlowState, RandomState>,
     /// Flow timeout duration.
     timeout: Duration,
 }
@@ -285,7 +290,7 @@ impl FlowTracker {
     /// Create a new FlowTracker with the default timeout.
     pub fn new() -> Self {
         Self {
-            flows: DashMap::new(),
+            flows: DashMap::default(),
             timeout: Duration::from_secs(DEFAULT_FLOW_TIMEOUT_SECS),
         }
     }
@@ -293,7 +298,7 @@ impl FlowTracker {
     /// Create a new FlowTracker with a custom timeout.
     pub fn with_timeout(timeout_secs: u64) -> Self {
         Self {
-            flows: DashMap::new(),
+            flows: DashMap::default(),
             timeout: Duration::from_secs(timeout_secs),
         }
     }
@@ -316,6 +321,7 @@ impl FlowTracker {
     /// * `timestamp` — Packet timestamp (epoch seconds from pcap)
     /// * `tcp_fin` — Whether TCP FIN flag is set
     /// * `tcp_rst` — Whether TCP RST flag is set
+    /// * `now` — Current time, for idle timeouts
     #[allow(clippy::too_many_arguments)]
     pub fn record_packet(
         &self,
@@ -329,6 +335,7 @@ impl FlowTracker {
         timestamp: f64,
         tcp_fin: bool,
         tcp_rst: bool,
+        now: Instant,
     ) -> bool {
         let key = FlowKey {
             src_ip,
@@ -344,10 +351,10 @@ impl FlowTracker {
             .entry(key)
             .or_insert_with(|| {
                 is_new_flow = true;
-                FlowState::new(timestamp)
+                FlowState::new(timestamp, now)
             });
 
-        entry.update(payload_len, payload, timestamp);
+        entry.update(payload_len, payload, timestamp, now);
 
         if tcp_fin {
             entry.fin_seen = true;
@@ -365,29 +372,28 @@ impl FlowTracker {
     /// This should be called periodically (e.g., every few seconds).
     pub fn flush_completed(&self) -> Vec<FlowMetrics> {
         let now = Instant::now();
+
+        // Identify completed flows. The metrics are computed after removal,
+        // so the engine does not wait on a shard lock for them.
+        let finished: Vec<FlowKey> = self
+            .flows
+            .iter()
+            .filter(|entry| {
+                let state = entry.value();
+                let is_timed_out = now.duration_since(state.last_seen) > self.timeout;
+                is_timed_out || state.fin_seen || state.rst_seen
+            })
+            .map(|entry| entry.key().clone())
+            .collect();
+
         let mut completed = Vec::new();
-        let mut keys_to_remove = Vec::new();
-
-        // Identify completed flows
-        for entry in self.flows.iter() {
-            let key = entry.key();
-            let state = entry.value();
-
-            let is_timed_out = now.duration_since(state.last_seen) > self.timeout;
-            let is_tcp_closed = state.fin_seen || state.rst_seen;
-
-            if is_timed_out || is_tcp_closed {
+        for key in finished {
+            if let Some((key, state)) = self.flows.remove(&key) {
                 // Only include flows with at least 2 packets (meaningful sessions)
                 if state.packet_count >= 2 {
-                    completed.push(state.to_metrics(key));
+                    completed.push(state.to_metrics(&key));
                 }
-                keys_to_remove.push(key.clone());
             }
-        }
-
-        // Remove completed flows
-        for key in &keys_to_remove {
-            self.flows.remove(key);
         }
 
         if !completed.is_empty() {
@@ -464,7 +470,7 @@ mod tests {
     }
 
     fn record(t: &FlowTracker, size: u64, payload: &[u8], ts: f64) {
-        t.record_packet(ip(1), ip(2), 40000, 443, Protocol::Tcp, size, Some(payload), ts, false, false);
+        t.record_packet(ip(1), ip(2), 40000, 443, Protocol::Tcp, size, Some(payload), ts, false, false, Instant::now());
     }
 
     fn metrics(t: &FlowTracker) -> FlowMetrics {
@@ -497,6 +503,39 @@ mod tests {
         let m = metrics(&t);
         assert!((m.iat_mean - 500.0).abs() < 1e-3, "iat_mean = {}", m.iat_mean);
         assert_eq!(m.duration_ms, 1000);
+    }
+
+    #[test]
+    fn flows_without_payload_have_no_histogram() {
+        let t = FlowTracker::new();
+        record(&t, 60, b"", BASE);
+        record(&t, 60, b"", BASE + 1.0);
+        let key = FlowKey { src_ip: ip(1), dst_ip: ip(2), src_port: 40000, dst_port: 443, protocol: Protocol::Tcp };
+        assert!(t.flows.get(&key).unwrap().payload_hist.is_none());
+        assert_eq!(metrics(&t).entropy, 0.0);
+    }
+
+    #[test]
+    fn closed_and_idle_flows_are_flushed_with_their_metrics() {
+        let t = FlowTracker::with_timeout(60);
+        let now = Instant::now();
+        let long_ago = now.checked_sub(Duration::from_secs(120)).expect("uptime");
+        let packet = |src_port, fin, seen| {
+            t.record_packet(ip(1), ip(2), src_port, 443, Protocol::Tcp, 100, Some(b"x"), BASE, fin, false, seen)
+        };
+        // Closed, idle, idle but a single packet, and still active.
+        packet(1, false, now);
+        packet(1, true, now);
+        packet(2, false, long_ago);
+        packet(2, false, long_ago);
+        packet(3, false, long_ago);
+        packet(4, false, now);
+        packet(4, false, now);
+
+        let mut flushed: Vec<u16> = t.flush_completed().iter().map(|m| m.src_port).collect();
+        flushed.sort_unstable();
+        assert_eq!(flushed, [1, 2]);
+        assert_eq!(t.active_count(), 1);
     }
 
     #[test]
